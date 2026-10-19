@@ -51,6 +51,10 @@ console.log(await js(`(function(){
 
   L.push('=== 黑 A2 四邻 ===');
   for (const [nx, ny] of neighbors(a2.x, a2.y)) L.push('  (' + nx + ',' + ny + ') = ' + b[ny*N+nx] + '（' + (b[ny*N+nx]===1?'黑':b[ny*N+nx]===2?'白':'空') + '）');
-  return L.join('\n');
+  /* ★ 2026-10-16 修：原来是 return L.join('反斜杠n') —— 本表达式整段在**模板串**里，
+     那个转义会在求值前就变成真实换行，字符串字面量当场跨行 →
+     node --check 报 Invalid or unexpected token（_precheck 第 ⓪/② 步一直是红的）。
+     直接返回数组，由 Node 侧 JSON 打印。 */
+  return L;
 })()`));
 ws.close();

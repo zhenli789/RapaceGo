@@ -13,6 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import vm from 'vm';
+import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 /* ★ 2026-10-07：脚本搬进 dev\ 之后，被检查的测试脚本也都在 dev\ 里 ——
@@ -22,10 +23,31 @@ let bad = 0;
 
 for (const f of fs.readdirSync(dir).filter(x => x.endsWith('.mjs') && !x.startsWith('_precheck') && !x.startsWith('_dump'))) {
   const src = fs.readFileSync(path.join(dir, f), 'utf8');
+  /* ---------- ⓪ 先检查**文件本身**的语法（2026-10-14 加的）----------
+     ★ 为什么需要这一步：这些脚本的被测代码写在**模板字符串**里，所以正文注释里
+       多写一个反引号就会把模板串截断 → 整个文件 `SyntaxError`。
+       这种错已经踩过 5 次（每次都是"改完没马上 node --check"）。
+       先用 node --check 整体过一遍，把它变成一次就能报出来的错 ——
+       而且这一步还能顺带抓别的语法笔误（少个括号之类）。 */
+  const chk = spawnSync(process.execPath, ['--check', path.join(dir, f)], { encoding: 'utf8' });
+  if (chk.status !== 0) {
+    bad++;
+    const line = String(chk.stderr || '').split('\n').find(l => /SyntaxError/.test(l)) || '语法错';
+    console.log('  ★ ' + f + '  **整个文件**语法就不对（先修这个，多半是模板串被反引号截断）：' + line.trim());
+    continue;
+  }
   /* ⚠️ 先剥掉块注释再找模板串 —— 否则注释里写一句示例 js(`...`) 也会被当成真代码，
      报出莫名其妙的「Unexpected end of input」（本文件就踩过：注释里举例写了 js(`...`)，body 变成 "..."）。 */
   const srcNC = src.replace(/\/\*[\s\S]*?\*\//g, '');
-  const all = [...srcNC.matchAll(/js\(`([\s\S]*?)`\)/g)];
+  /* ★ 2026-10-16 修：结尾不能只认 `) —— `js(HOOK, 15000)` / `js(`...`, 200000)` 这种
+     **带超时参数**的调用，反引号后面跟的是 `,` 而不是 `)`，原来那个 /js\(`([\s\S]*?)`\)/g
+     匹配不上它，就会一路往后吃、把**后面好几段模板串连同中间代码**截成一段 →
+     报出莫名其妙的 "Unexpected token ')'"（实测有 6 个脚本被这样误报：
+     _cdp_gate / _cdp_diag3 / _cdp_kodiag / _cdp_recsdir / _cdp_engcheck / _cdp_engcheck3）。
+     本文件顶上的注释其实早就点过这个坑（"遇到结尾不是 `);` 的调用会一直匹配到后面某个
+     `);`"），只是当时只把写法从 /`);/ 改成 /`)/ —— 没修到位。
+     现在：反引号结尾允许后面跟 `)` 或 `,`（并可带空格）。 */
+  const all = [...srcNC.matchAll(/js\(`([\s\S]*?)`\s*[,)]/g)];
   if (!all.length) { console.log('  ' + f + '  没有模板串'); continue; }
 
   let failed = false;
@@ -33,8 +55,11 @@ for (const f of fs.readdirSync(dir).filter(x => x.endsWith('.mjs') && !x.startsW
     const body = all[i][1];
     const where = all.length > 1 ? ('模板串#' + (i + 1) + ' ') : '';
 
-    /* ① 转义方括号：会被模板串吃掉，改用 indexOf/slice */
-    if (/\\\[|\\\]/.test(body)) {
+    /* ① 转义方括号：会被模板串吃掉，改用 indexOf/slice
+       ★ 2026-10-16 修：先把「转义的反斜杠」（源码里成对的 \\ ）剥掉再判 ——
+         不然 `/RapaceGo[/\\\\]records$/` 这种**正确**写法（字符类里放 / 和反斜杠）
+         会被当成"转义方括号"误报（_cdp_recsdir.mjs 就一直挂在这条上）。 */
+    if (/\\\[|\\\]/.test(body.replace(/\\\\/g, ''))) {
       bad++; failed = true;
       console.log('  ★ ' + f + '  ' + where + '有转义方括号 —— 会被吃掉，改用 indexOf/slice');
       continue;

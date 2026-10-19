@@ -11,7 +11,19 @@ import { fileURLToPath } from 'url';
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const HTML = fs.readFileSync(path.join(ROOT, 'renderer/index.html'), 'utf8');
-const CSS = fs.readFileSync(path.join(ROOT, 'renderer/style.css'), 'utf8');
+/* ★★ 2026-10-12 修正：**必须先剥注释、再按 `{ }` 切规则**。
+   原来的写法是「先切规则、再对选择器剥注释」，于是**注释里出现的 `{...}`
+   会被当成真的规则边界**：
+     · 反例写法是 `.verdict 的 display:flex 优先级更高` —— 没有花括号，没暴露问题；
+     · 但一旦注释里写成 `.card.col{display:flex}` / `[hidden]{display:none}`（带花括号），
+       规则就被从中间切开，紧跟其后的那几条规则的**选择器会被算歪**，
+       于是它们匹配不上、全部误报「缺 [hidden] 覆盖」。
+   实测（2026-10-12 加习题练习卡时）：我在注释里写了那两种带括号的写法，
+   结果明明写了 `.card[hidden]{display:none}`，lint 却报 #ts-card 缺覆盖。
+   → 判据错会造假警报，和漏报一样贵（本项目记过三条同类教训）。
+   ⚠️ 注意：`m[1].replace(...)` 那一步保留着（双保险），但真正管用的是下面这行。 */
+const CSS_RAW = fs.readFileSync(path.join(ROOT, 'renderer/style.css'), 'utf8');
+const CSS = CSS_RAW.replace(/\/\*[\s\S]*?\*\//g, ' ');
 /* ★ 必须先剥掉注释再扫：注释里常把「不要这样写」的反例代码原样写上
    （比如 `$('clock-card').hidden = ...`），不剥就会当成真代码误报。
    第一版没剥 → clock-card 那条修完之后仍在报。 */

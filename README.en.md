@@ -35,15 +35,47 @@ invents a justification for them. So it never gets to judge — only to explain.
 ## Features
 
 **Play** — human-style opponents rated by amateur rank (20k–9d, plus "pre-AI era" and
-"pro style by year"); handicap done the standard way; free-placement / two-player mode;
+"pro style by year"); **KATAGO vs KATAGO** (tick it in the new-game panel and both colours
+are played automatically at the same rank, with a pause/resume button — it never resigns,
+so you get to see the endgame); **per-move analysis** — while playing, the "commentary" box
+shows the move's score, win rate, **points lost**, best move with its expected lead, PV and
+**policy ("intuition") ranking**, for whichever move you are looking at; exported records
+**keep that analysis as SGF comments** (reopening one shows it again), are named
+`P1 vs AI(3d)-202610190823.sgf` (players joined by "vs", the rank in brackets after the AI; both
+sides get it in AI-vs-AI), and the record library lists the
+filename only; handicap done the
+standard way; free-placement / two-player mode;
+tsumego practice (set up a problem, or **import an SGF puzzle collection** — one file may
+hold hundreds of problems, paged through with ‹ ›; **reopening a collection jumps straight
+back to the problem you were last on**; fixed local frame and a "show the solution" button —
+KATAGO takes either colour, and the opponent has **three settings**: **follow the solution**
+(default for imported collections — it replays the SGF's main line, never tenukis; if you
+deviate it falls back to KATAGO; **SGF variations are now parsed too**, so an alternative
+correct branch is followed instead of being treated as a deviation), **KATAGO** (search
+restricted to **within 2 lines of a stone**, so it no longer wanders off to the frame corner),
+and **play both sides** (you alternate colours yourself));
 scratch-play ("what if") board; 9/13/19 lines; Chinese / Japanese / Korean / Ming-Qing rules;
 5 time-control presets with byo-yomi beeps and **loss on time**.
+The **mode button** in the top bar (it shows the current mode; click it for a drop-down:
+human-vs-AI / free placement / tsumego practice) always opens the **New Game** dialog with that
+type pre-selected; pressing Cancel changes nothing. Tick **"continue from this position"** in that
+dialog to switch mode while keeping the current board and move history.
 
 **Numbers** — winrate bar & score, recommended moves, move previews, ownership map
 (fog or blocks), winrate/score graph, per-move loss list, and a **review report**
 (black/white split: average loss, blunder counts, agreement with AI's top choice).
 Per-move numbers appear **only once the search has settled** (a "…" placeholder shows
 while it is still computing), so a number never changes after you have seen it.
+
+**Variations** — when a record contains SGF variations, the move-list card draws them as a
+**tree of stone circles**: each move is a black/white circle with its number inside (no
+coordinates — hover for them), the main line runs straight down, and an alternative moves
+**one column to the right**, joined to the branch point by an **elbow** (down → across → down);
+a branch of a branch goes one more column right. **Clicking a circle** jumps to that move
+(switching lines when needed). **Alt+←/→** cycles through siblings too. Exporting a record
+keeps the branches instead of flattening them to one line. You can also **play while
+reviewing** — a move played on an earlier position starts a **new branch**, and the old
+continuation stays in the tree.
 
 **Recovery** — a **Refresh** button next to the engine lamps in the top bar. If the
 recommended moves stop appearing, or the "computing… N" line above the board freezes,
@@ -142,6 +174,17 @@ Click the indicator in the top bar when you want AI:
 > npm install
 > npm run dist:mac        # produces dist/RapaceGo-mac-arm64.zip (Intel: -x64)
 > ```
+>
+> ★ **The app bundle does not contain KataGo, the weights, or the LoGos model** —
+> `build.files` is an allowlist of app code only (318 MB unpacked, 122 MB zipped).
+> Engines and models are installed in step 1 and pointed at from inside the app.
+> Build just your own arch (faster): `node_modules/.bin/electron-builder --mac --arm64`.
+>
+> ★ **Your data does not live inside the .app**: settings, records, puzzles, engines and
+> models all go to `~/Library/Application Support/RapaceGo/` (`settings.json`, `KataGo/`,
+> `LoGos/`, `records/`, `puzzles/`). Replacing the .app on upgrade therefore keeps
+> everything; do not put engines under `Contents/MacOS/` — they survive only until the
+> next upgrade.
 >
 > #### Step 3 — get past Gatekeeper once
 >
@@ -416,6 +459,7 @@ The archive contains **only the application** — none of your data:
 | Yours | In the archive? | After updating |
 |---|---|---|
 | `records\` — your SGF files, review reports, move-by-move commentary | ❌ no | **kept as-is** |
+| `puzzles\` — imported SGF puzzle collections | ❌ no | **kept as-is** |
 | `settings.json` — the engine paths you configured | ❌ no | **kept as-is** |
 | `KataGo\`, `LoGos\` — the engines and the commentary model | ❌ no | **kept as-is** |
 | `userdata\` — app cache | ❌ no | kept (safe to delete, it gets rebuilt) |

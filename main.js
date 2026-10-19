@@ -63,6 +63,82 @@ const LLAMA_LABEL  = LLAMA_BIN;
    process.execPath 任何时候都能读，打包后它就是 exe 本身。 */
 const BASE_DIR = IS_PACKAGED ? path.dirname(process.execPath) : __dirname;
 
+/* ---------- 可写数据的目录（2026-10-19：mac 上必须搬出 .app） ----------
+   ★ 用户报的问题：在 `Contents/MacOS/` 里建了 `KataGo/weights` 和 `LoGos`，
+     **一更新软件就全没了** —— 因为 mac 上"更新"就是把整个 RapaceGo.app 换掉，
+     包里的一切（settings.json / records / puzzles / 引擎 / 模型）都会被新包替换。
+   所以 mac 打包版把可写数据统一放到 `~/Library/Application Support/RapaceGo/`：
+     · 替换 .app 完全不动它 → 升级不丢配置、棋谱、引擎和模型；
+     · 第一次运行新版本时，包里如果还留着旧数据，**自动搬出来**（migrateMacData）；
+     · settings.json 里指向老 bundle 的绝对路径同步改写。
+   Windows 保持原样（"整个文件夹拷走"的便携式，数据就在 exe 旁边）。 */
+const IS_MAC = process.platform === 'darwin';
+const MAC_DATA_DIR = (() => {
+  let base = '';
+  try { base = app.getPath('appData'); } catch (e) { base = ''; }
+  if (!base) base = path.join(process.env.HOME || '', 'Library', 'Application Support');
+  return base ? path.join(base, 'RapaceGo') : '';
+})();
+/* DATA_DIR = 可写数据（settings.json / 棋谱 / 题集 / 引擎与模型 / 日志 / userdata）的家。
+   ★ 开发模式与 Windows 打包版仍然等于 BASE_DIR，行为一点不变。 */
+let DATA_DIR = (IS_PACKAGED && IS_MAC && MAC_DATA_DIR) ? MAC_DATA_DIR : BASE_DIR;
+
+/* 把"还留在 .app 里"的旧数据搬到 DATA_DIR。
+   ★ 只搬不删；同盘 rename 是瞬时的，跨盘退回复制。
+   ★ 新位置已经有同名东西就不动（以用户新放的为准，绝不覆盖模型）。 */
+const MAC_MOVE = ['settings.json', 'records', 'puzzles', 'KataGo', 'LoGos', 'engine-logs', 'userdata'];
+function migrateMacData() {
+  if (DATA_DIR === BASE_DIR) return;
+  let moved = 0;
+  for (const name of MAC_MOVE) {
+    const src = path.join(BASE_DIR, name);
+    const dst = path.join(DATA_DIR, name);
+    try {
+      if (!fs.existsSync(src)) continue;
+      if (fs.existsSync(dst)) continue;
+      try { fs.renameSync(src, dst); }
+      catch (e) { fs.cpSync(src, dst, { recursive: true }); }
+      moved++;
+    } catch (e) { /* 这一项搬不动就算了，别拦启动 */ }
+  }
+  /* settings.json 里的绝对路径要跟着改 —— 否则引擎还指着已经没了的旧 bundle */
+  try {
+    const cfg = path.join(DATA_DIR, 'settings.json');
+    if (fs.existsSync(cfg)) {
+      let changed = false;
+      /* ★ 必须**大小写不敏感**地匹配：mac 的文件系统不区分大小写，
+         同一个目录可能一会儿写成 WorkBuddy、一会儿写成 Workbuddy ——
+         直接 indexOf 会因为这一个字母的差别匹配不上，路径就改不掉（实测踩到）。 */
+      const pat = new RegExp(BASE_DIR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      const fix = v => {
+        if (typeof v === 'string') {
+          if (v.search(pat) < 0) return v;
+          changed = true;
+          return v.replace(pat, DATA_DIR);
+        }
+        if (Array.isArray(v)) return v.map(fix);
+        if (v && typeof v === 'object') {
+          const out = {};
+          for (const k of Object.keys(v)) out[k] = fix(v[k]);
+          return out;
+        }
+        return v;
+      };
+      const obj = JSON.parse(fs.readFileSync(cfg, 'utf8'));
+      const next = fix(obj);
+      if (changed) fs.writeFileSync(cfg, JSON.stringify(next, null, 2), 'utf8');
+    }
+  } catch (e) { /* 配置读写失败不拦启动 */ }
+  if (moved) console.log('[数据] 已把 app 包内的旧数据搬到 ' + DATA_DIR + '（' + moved + ' 项）');
+}
+
+try {
+  if (DATA_DIR !== BASE_DIR) fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (e) {
+  DATA_DIR = BASE_DIR;      // 建不出来（权限不够）就退回包里 —— 总比起不来强
+}
+try { migrateMacData(); } catch (e) { console.log('[数据] 迁移失败：' + e); }
+
 /* ★★ 便携式的关键一步：把 **Electron 自己的用户数据**也拉进程序文件夹。
    它默认写在 `%APPDATA%\RapaceGo`（C 盘的"应用数据"里），里面有页面缓存、
    GPU 缓存、Local Storage 等。不改的话：
@@ -78,7 +154,7 @@ const BASE_DIR = IS_PACKAGED ? path.dirname(process.execPath) : __dirname;
      ② 必须在 app ready 之前调用 setPath。 */
 if (IS_PACKAGED) {
   try {
-    const ud = path.join(BASE_DIR, 'userdata');
+    const ud = path.join(DATA_DIR, 'userdata');
     app.setPath('userData', ud);
     app.setPath('sessionData', ud);
   } catch (e) { /* 极端情况失败就算了，不影响主功能 */ }
@@ -88,12 +164,12 @@ if (IS_PACKAGED) {
    ★ 2026-10-04 起**可在界面里改**（左上角「设置」→ 选 katago.exe 和两个权重），
      配置存在软件目录的 settings.json，启动时读它；读不到（首次运行 / 文件坏了）
      就用下面的默认值。环境变量 RAPACEGO_KATAGO 仍然认（临时覆盖用）。 */
-const CFG_FILE = path.join(BASE_DIR, 'settings.json');
+const CFG_FILE = path.join(DATA_DIR, 'settings.json');
 /* 用 RapaceGo 自己的配置（复制自 KataGo 的 analysis.cfg，改了两处：
    reportAnalysisWinratesAs → SIDETOMOVE、logDir 由启动参数传），不动公共配置。
    ★ engine.cfg 是**程序自带的**文件，所以跟代码走（__dirname），不跟数据走。 */
 const CFG = path.join(__dirname, 'engine.cfg');
-const LOG_DIR = path.join(BASE_DIR, 'engine-logs');
+const LOG_DIR = path.join(DATA_DIR, 'engine-logs');
 
 /* LoGos（讲解模型）的默认目录 —— 2026-10-05 新增第三个「引擎」。
    它和 KataGo 长得不像：KataGo 是「stdin 喂 JSON / stdout 出 JSON」的长驻进程，
@@ -227,13 +303,15 @@ let gpuBrandCache;
 function defaultPaths() {
   /* ★ 已经**改正**的过时说明（2026-10-08）：原文写"引擎放在软件目录上一级"，
      那是**开发态**（`up = path.join(__dirname,'..')`）的行为。
-     **打包版用的是软件目录本身**（`up = BASE_DIR`，即 exe 所在目录）——
+     **打包版用的是数据目录**（`up = DATA_DIR`）——Windows 就是 exe 所在目录，
+     macOS 是 `~/Library/Application Support/RapaceGo/`（见文件开头那段说明，
+     2026-10-19 起 mac 的数据不再放 .app 里面，否则一更新就被替换包时删掉）。
      也就是"KataGo\ 和 RapaceGo.exe 平级"。懒人包就是按这个放的。
      想放别处有两个办法（优先级从高到低）：
        ① 设置面板里改 → 存进 settings.json，下次打开就用你的；
        ② 环境变量 RAPACEGO_KATAGO / RAPACEGO_LOGOS。
      ★ 这里**不写死盘符** —— 那是本机耦合，换台电脑 / 换个盘就全废。 */
-  const up = IS_PACKAGED ? BASE_DIR : path.join(__dirname, '..');
+  const up = IS_PACKAGED ? DATA_DIR : path.join(__dirname, '..');
   const root  = process.env.RAPACEGO_KATAGO || path.join(up, 'KataGo');
   const logos = process.env.RAPACEGO_LOGOS  || path.join(up, 'LoGos');
   /* 权重走 resolveWeightPath：找不到写死的那两个名字时，自动认同目录里的 .bin / 改名过的权重 */
@@ -1160,6 +1238,57 @@ function analyze(e, req) {
     /* ⚠️ 别加 maxMoves / includeMoves / focusMoves —— 实测前两个是**无效字段**
        （引擎回 warning: "Unexpected or unused field, do you have a typo?"），
        加了只会刷警告，不会有任何作用。 */
+
+    /* ★★ 习题练习：谁先走（2026-10-12 新增）。
+       为什么必须有这个字段：死活题 / 手筋题的初始局面是用 initialStones 摆出来的、
+       **moves 是空的**，而「一手没下」的局面引擎得自己猜谁先 —— 猜的依据是
+       **「这堆摆子像不像让子局」，跟「这道题该谁先走」毫无关系**。
+
+       ★ 实测（2026-10-12，KataGo + kata1-b18c384nbt，同一份角上摆子）：
+         · 黑 10 子 + 白 4 子、**不传** initialPlayer → currentPlayer = **B**
+         · 同上、传 "W"                        → currentPlayer = **W**  ← 字段生效
+         · 4 个黑星位（纯黑）、不传            → currentPlayer = **W**  ← 被当成让子局
+         · 黑 2 子 + 白 5 子、不传             → currentPlayer = **B**
+         结论：**不传就是不可控**。白先的题（混合摆子）会被当成黑先；
+         而"黑先"的题如果摆子恰好是纯黑，又会被当成白先 —— 两个方向都会错。
+         （⚠️ 别写成"initialStones 非空就默认白先" —— 那是某些第三方 API 服务器的
+          默认值，不是 KataGo 的；本项目实测见上表。）
+       官方 Analysis_Engine.md 写明该字段用途：
+         「initialPlayer ... which can be useful if moves is an empty list」。
+       ⚠️ 只在明确传了 B/W 时才带：不传时保持引擎原有推断，
+          免得影响现有对局与复盘的行为（它们都带 moves，本来就不需要这个字段）。 */
+    if (req.initialPlayer === 'B' || req.initialPlayer === 'W') q.initialPlayer = req.initialPlayer;
+
+    /* ★★ 习题练习：把分析限制在局部（2026-10-12 新增）。
+       来龙去脉：死活题只占盘角一小块，其余地方是空的 —— 不加约束的话，
+       引擎会把「脱先走大场」当成好手，推荐点全落在框架外，题就没法做了。
+       avoidMoves / allowMoves 是引擎**自带的**限制机制（不是我们自己过滤结果）：
+         · allowMoves：只允许在这些点里找（配对「框架」用法）
+         · avoidMoves：排除这些点（比如禁着点、或者「这道题不该走的地方」）
+       两个都是数组，每项 { player: 'B'|'W', moves: ['Q16', ...], untilDepth: N }，
+       untilDepth 是限制生效的搜索深度（给大值 ≈ 永久生效）。
+       ⚠️ 官方文档里这两个字段标注为「experimental」；本项目实测确认能生效
+          （见 dev/_cdp_tsumego.mjs 的断言），不生效时表现为「推荐点没被框住」，
+          界面不会崩 —— 属于可接受的降级。
+       ⚠️ 只做形状校验后原样透传，不在这里拼合法点 —— 渲染端才知道框架算在哪。 */
+    const passMoveLimit = (key) => {
+      const v = req[key];
+      if (!Array.isArray(v) || !v.length) return;
+      const out = [];
+      for (const it of v) {
+        if (!it || (it.player !== 'B' && it.player !== 'W')) continue;
+        if (!Array.isArray(it.moves) || !it.moves.length) continue;
+        const untilDepth = Number(it.untilDepth);
+        out.push({
+          player: it.player,
+          moves: it.moves.slice(),
+          untilDepth: Number.isFinite(untilDepth) && untilDepth >= 1 ? Math.round(untilDepth) : 1000,
+        });
+      }
+      if (out.length) q[key] = out;
+    };
+    passMoveLimit('allowMoves');
+    passMoveLimit('avoidMoves');
     /* ★ 真实段位：只有对弈引擎（human 权重）认这个设置；逐请求覆盖即可，
        不必为每个段位重启引擎（实测验证过）。
        ⚠️ 对弈引擎**必须**带档位（漏了会让引擎 FATAL 退出）—— 这里兜底，
@@ -1322,7 +1451,7 @@ ipcMain.handle('engine:cancel', () => cancel(ENGINES.analyze));
    ★ 存放位置选**软件自己的目录**，不去动用户的「我的棋谱」——那是他自己的文件。
    ★ 删除走**系统回收站**（shell.trashItem），不 fs.unlink：万一误删还能捞回来。
    ★ 文件名统一过 safeRecName()：剥掉路径部分、替换非法字符，防止爬到目录外面去。 */
-let RECORDS_DIR = path.join(BASE_DIR, 'records');
+let RECORDS_DIR = path.join(DATA_DIR, 'records');
 
 /* 棋谱库位置可以改（设置面板 / 棋谱库弹窗里都有入口）。
    用「可变常量」而不是每次现算，是为了让其余十几处引用（reviewPath / coachPath /
@@ -1330,7 +1459,7 @@ let RECORDS_DIR = path.join(BASE_DIR, 'records');
    传 dir 就切到 dir（空串 = 回到默认的 程序目录\records）。 */
 function refreshRecordsDir(dir) {
   const want = (dir !== undefined ? dir : (PATHS && PATHS.recordsDir) || '').trim();
-  RECORDS_DIR = want || path.join(BASE_DIR, 'records');
+  RECORDS_DIR = want || path.join(DATA_DIR, 'records');
   /* ★★ 2026-10-08 加：环境变量 RAPACEGO_RECORDS 可以**强制**把棋谱库指到别处。
      为什么需要它（血的教训）：自动化测试要拿真实棋谱当夹具，于是往 records\ 里拷文件、
      跑完再删。有一次清理写宽了，把用户自己下的一盘棋连同一份职业棋谱**一起删掉了**
@@ -1634,6 +1763,128 @@ ipcMain.handle('records:import', async () => {
   } catch (e) {
     return { error: String((e && e.message) || e) };
   }
+});
+
+/* ==================== 习题题集（2026-10-14，软件目录下的 puzzles/）====================
+   和棋谱库是**两个目录、两套语义**，不能混：
+     records/  = 「一局棋」（有手数、能复盘、能逐手讲解）
+     puzzles/  = 「一套题」（一份 SGF 里可能**并列串着几百道题**，只用来练）
+   ★ 为什么必须分开（而不是把题集塞进 records/）：
+     ① 棋谱库列表会把一份 347 题的 SGF 当成"一局棋"显示（手数、复盘按钮全是错的）；
+     ② 练题不该往用户的棋谱库里写东西（那是他自己的资料）。
+   ★ 删除走系统回收站（shell.trashItem），文件名统一过 safePuzName（防路径穿越）。
+   ★ 环境变量 RAPACEGO_PUZZLES 可**强制**指向别处 —— 自动化测试专用。
+     血的教训见 refreshRecordsDir 上面那段：测试与用户数据共用一个目录，
+     有一次清理写宽了，把用户自己的棋谱删掉了。这里一开始就分开。
+   ★ 题数（一份题集里有几道题）**故意不由主进程数** ——
+     "怎么把 SGF 切成一道道题"只允许在渲染进程有一处实现（splitSgfGames），
+     两处各写一遍迟早会分叉。界面打开题集面板时自己读文件数。 */
+let PUZZLES_DIR = path.join(DATA_DIR, 'puzzles');
+function refreshPuzzlesDir() {
+  PUZZLES_DIR = path.join(DATA_DIR, 'puzzles');
+  const forced = String(process.env.RAPACEGO_PUZZLES || '').trim();
+  if (forced) PUZZLES_DIR = forced;
+  try { fs.mkdirSync(PUZZLES_DIR, { recursive: true }); } catch (e) { /* 已存在就算了 */ }
+}
+refreshPuzzlesDir();
+
+function safePuzName(n) {
+  const base = path.basename(String(n || ''));
+  const cleaned = base.replace(/[\\/:*?"<>|]/g, '_').trim() || '未命名题集.sgf';
+  return cleaned.toLowerCase().endsWith('.sgf') ? cleaned : cleaned + '.sgf';
+}
+
+/* 同名的自动加 (2)(3)… —— **绝不覆盖**已有题集。 */
+function uniquePuzName(name) {
+  if (!fs.existsSync(path.join(PUZZLES_DIR, name))) return name;
+  const stem = name.replace(/\.sgf$/i, '');
+  let i = 2;
+  while (fs.existsSync(path.join(PUZZLES_DIR, stem + ' (' + i + ').sgf'))) i += 1;
+  return stem + ' (' + i + ').sgf';
+}
+
+/* 题集列表。**只报文件本身的信息**（名字 / 大小 / 时间）—— 题数由界面数（见上面注释）。 */
+ipcMain.handle('puzzles:list', () => {
+  try {
+    return fs.readdirSync(PUZZLES_DIR)
+      .filter(f => f.toLowerCase().endsWith('.sgf') && !/\.bak$/i.test(f))
+      .map(f => {
+        const st = fs.statSync(path.join(PUZZLES_DIR, f));
+        return { name: f, size: st.size, mtime: st.mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+  } catch (e) { return []; }
+});
+
+ipcMain.handle('puzzles:read', (_e, name) => {
+  try { return { ok: true, text: readTextSmart(path.join(PUZZLES_DIR, safePuzName(name))) }; }
+  catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+ipcMain.handle('puzzles:dir', () => PUZZLES_DIR);
+ipcMain.handle('puzzles:openDir', () => { shell.openPath(PUZZLES_DIR); return { ok: true }; });
+
+/* 导入题集：从电脑里挑一份 SGF → **复制**进 puzzles/（原文件不动）。
+   和 records:import 同一套三道关：① 得像 SGF ② 文件名过 safePuzName ③ 重名加 (2) 不覆盖。
+   ★ 单选：题集是一份一份的（一份里已经串着很多道题了，多选没意义）。 */
+ipcMain.handle('puzzles:import', async () => {
+  try {
+    const r = await dialog.showOpenDialog(win, {
+      title: '导入习题集',
+      filters: [{ name: '围棋题集（SGF）', extensions: ['sgf'] }],
+      properties: ['openFile'],
+    });
+    if (!r || r.canceled || !r.filePaths || !r.filePaths.length) return { canceled: true };
+    const src = r.filePaths[0];
+    const text = readTextSmart(src);
+    if (!/\(\s*;/.test(text)) return { error: '这个文件不像 SGF（找不到棋局节点）' };
+    const name = uniquePuzName(safePuzName(path.basename(src)));
+    fs.writeFileSync(path.join(PUZZLES_DIR, name), text, 'utf8');
+    return { ok: true, name };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+/* 把棋谱库里的一份棋谱**复制**成题集（棋谱库那行的「当题练」走这条）。
+   ★ 复制而不是移动：棋谱库那份要留着（用户可能还要复盘/讲解）。
+   ★★ 去重（2026-10-16 用户报的 bug）：原来这里无条件走 uniquePuzName ——
+      于是同一份棋谱每点一次「当题练」，puzzles/ 里就多一份 `xxx.sgf` /
+      `xxx (2).sgf` / `xxx (3).sgf`…（实测连点三次就出现三份）。
+      现在：**同名且内容相同 → 直接复用已有那份**（不写盘，返回 reused:true），
+      只有"同名但内容不一样"（棋谱后来改过）才走加序号那条路。
+      ⚠️ 比对的是**文本内容**，不是文件名 —— 用户改了棋谱再点「当题练」，
+         应该得到新的那份，而不是悄悄用旧的。 */
+ipcMain.handle('puzzles:importRecord', (_e, recName) => {
+  try {
+    const src = path.join(RECORDS_DIR, safeRecName(recName));
+    if (!fs.existsSync(src)) return { error: '棋谱库里找不到这份棋谱' };
+    const text = readTextSmart(src);
+    if (!/\(\s*;/.test(text)) return { error: '这个文件不像 SGF' };
+    const want = safePuzName(path.basename(recName));
+    try {
+      const dest = path.join(PUZZLES_DIR, want);
+      if (fs.existsSync(dest) && readTextSmart(dest) === text) {
+        return { ok: true, name: want, reused: true };
+      }
+    } catch (e) { /* 老那份读不出来（被删/没权限）→ 当它不存在，走下面的复制 */ }
+    const name = uniquePuzName(want);
+    fs.writeFileSync(path.join(PUZZLES_DIR, name), text, 'utf8');
+    return { ok: true, name };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+ipcMain.handle('puzzles:rename', (_e, oldName, newName) => {
+  try {
+    const to = uniquePuzName(safePuzName(newName));
+    fs.renameSync(path.join(PUZZLES_DIR, safePuzName(oldName)), path.join(PUZZLES_DIR, to));
+    return { ok: true, name: to };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+ipcMain.handle('puzzles:delete', async (_e, name) => {
+  try {
+    await shell.trashItem(path.join(PUZZLES_DIR, safePuzName(name)));   // 进回收站，可恢复
+    return { ok: true };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
 });
 
 /* 在桌面创建 / 刷新快捷方式（设置面板里的按钮用） */

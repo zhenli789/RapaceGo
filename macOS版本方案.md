@@ -188,3 +188,129 @@ xattr -cr /Applications/RapaceGo.app
 | `.github/workflows/build-macos.yml` | macOS 打包工作流 |
 | `README.md` / `README.en.md` | Mac 章节（🍎 macOS 用户请看这里） |
 | `dev/_rtest.py` | 回归测试入口（支持 `RAPACEGO_EXE` 指定打包版 exe） |
+
+---
+
+## 五、打包成 Mac 应用（2026-10-19 补充）
+
+### 5.1 一条命令
+
+```bash
+npm install
+npm run dist:mac          # = electron-builder --mac
+```
+
+产物（`dist/`）：
+
+| 文件 | 说明 |
+|---|---|
+| `RapaceGo-mac-arm64.zip` | Apple Silicon（M 系列） |
+| `RapaceGo-mac-x64.zip` | Intel |
+| `mac-arm64/RapaceGo.app` / `mac-x64/…` | 解压前的 .app（zip 里就是它） |
+
+只要本机架构那一份，可以：
+
+```bash
+node_modules/.bin/electron-builder --mac --arm64        # 只出 arm64
+node_modules/.bin/electron-builder --mac --arm64 --dir  # 只出 .app、不压 zip（调试用，快）
+```
+
+### 5.2 ★ 引擎和模型**不进包** —— 靠的是 `build.files` 白名单
+
+`package.json` 里 `build.files` 是**白名单**（不是 `!排除`），只收：
+
+```
+main.js  preload.js  renderer/**  engine.cfg  assets/(图标+音效)  package.json
+```
+
+于是：
+
+- **KataGo**（`/opt/homebrew/bin/katago`）、**KataGo 权重**（`.bin.gz` / `.bin`）、
+  **llama-server**、**LoGos 的 .gguf**（4.4 GB）**全都不在项目目录里**，自然打不进去；
+- `node_modules/`（含 electron 本体）也不会进 —— electron-builder 只会把 `files` 列出的东西放进
+  `RapaceGo.app/Contents/Resources/app/`；
+- **`settings.json` 也不打包**：里面是开发者本机的绝对路径，打了就是错的路。首次运行由用户自己选。
+
+验证一句命令就够（应该**什么都不输出**）：
+
+```bash
+find dist/mac-arm64/RapaceGo.app \( -name "*.gguf" -o -name "*.bin*" -o -name "katago*" -o -name "llama-server*" \)
+```
+
+包体积参考：应用本体约 **250 MB**（Electron 运行时占大头），压缩后约 100 MB 出头。
+如果哪天它突然变成 5 GB，那就是模型被带进去了 —— 先查 `build.files` 和 `extraFiles`。
+
+### 5.3 已经踩过的一个坑：Windows 的 .bat 被塞进 Mac 包
+
+原来 `build.extraFiles` 写在**顶层**（全平台生效），里面是 `下载讲解模型.bat` ——
+Mac 包里也会多一份没用的 .bat（`RapaceGo.app/Contents/` 下）。
+2026-10-19 已把它挪到 `build.win.extraFiles`，只给 Windows。
+
+### 5.4 签名与 Gatekeeper
+
+`build.mac.identity = null` —— 明确**不签名**（没有 Apple 开发者证书；
+不显式写 null 的话 electron-builder 会去找证书，找不到会报错/警告）。
+
+所以拿到包的人第一次打开会被 Gatekeeper 拦（"is damaged…"）。二选一：
+
+```bash
+xattr -cr /Applications/RapaceGo.app      # 推荐：去掉隔离标记
+# 或者：右键 → 打开 → 打开（只需一次）
+```
+
+如果 `xattr` 之后仍然提示"已损坏"，多半是包的签名不完整（不是隔离标记的问题），
+自己补一个 ad-hoc 签名即可：
+
+```bash
+codesign --force --deep --sign - /Applications/RapaceGo.app
+```
+
+（要正式分发就得买 $99/年 的证书 + 公证，本项目不做。）
+
+### 5.5 数据写在哪儿（2026-10-19 改了，务必看）
+
+**问题**：原来数据（`settings.json` / `records` / `puzzles` / `KataGo` / `LoGos`）都在
+`RapaceGo.app/Contents/MacOS/` 里。mac 上"更新软件"就是把**整个 .app 换掉** ——
+于是用户放的权重、模型、棋谱、配置全被新包替换没了（用户实测报过）。
+
+**现在**：mac 打包版把可写数据统一放到
+
+```
+~/Library/Application Support/RapaceGo/
+├─ settings.json      ← 引擎/权重路径、界面设置
+├─ KataGo/            ← 引擎 + weights/（和 Windows 版一样的目录约定）
+├─ LoGos/             ← llama-server + .gguf
+├─ records/           ← 棋谱
+├─ puzzles/           ← 题集
+├─ engine-logs/
+└─ userdata/          ← Chromium 的缓存
+```
+
+替换 `.app` 完全不动这个目录 → **升级不再丢数据**。
+
+实现（`main.js` 开头）：
+
+- `DATA_DIR` = mac 打包版取 `app.getPath('appData')/RapaceGo`，其它情况仍等于
+  `BASE_DIR`（Windows 保持"整个文件夹拷走"的便携式，行为不变）；
+- `BASE_DIR` 还是 exe 所在目录，只用来读**程序自带**的文件（`engine.cfg` 走 `__dirname`）；
+- **一次性迁移**：第一次运行新版本时，如果发现包里还留着旧数据
+  （`settings.json` / `records` / `puzzles` / `KataGo` / `LoGos` / `engine-logs` / `userdata`），
+  自动搬到新目录；新位置已有同名东西就不动（以用户新放的为准）；
+- 迁移时把 `settings.json` 里指向老 bundle 的绝对路径**同步改写**成新位置
+  （大小写不敏感匹配 —— mac 文件系统不区分大小写，直接 `indexOf` 会因一个字母的大小写匹配不上）。
+
+⚠️ 所以**别再把引擎/模型放进 .app 里**了：放进去也能用（首次运行会被搬出来），
+但每次升级都得重来一次，没必要。直接放到
+`~/Library/Application Support/RapaceGo/KataGo/`、`.../LoGos/` 即可。
+
+### 5.6 如果 `zip` 那一步失败
+
+在个别环境（比如受管目录 / 云盘同步目录）里，electron-builder 调用系统 `zip` 会报
+`Archive write preflight unavailable`（退出码 13）。改用 mac 自带的方式压就行：
+
+```bash
+node_modules/.bin/electron-builder --mac --arm64 --dir   # 先只出 .app
+ditto -c -k --sequesterRsrc --keepParent dist/mac-arm64/RapaceGo.app dist/RapaceGo-mac-arm64.zip
+```
+
+`ditto` 是 mac 原生的、会正确保留符号链接和扩展属性，比 `zip` 更适合打 .app。

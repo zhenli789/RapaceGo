@@ -71,8 +71,10 @@ const out = await js(`(async function(){
   state.soundOn = true;
 
   /* 顺带确认 tryPlay 里音效是**排在重绘之后**
-     ⚠️ 别用正则：本文件是模板字符串，`\(` 会被 JS 先吃掉反斜杠变成 `(`，
-     正则就成了一个「分组」→ 匹配不上（这里踩过一次，白报了一个假警）。 */
+     ⚠️ 别用正则：本文件被测代码整段包在模板字符串里，正则里的转义反斜杠会被 JS
+     先吃掉、正则就退化成一个「分组」→ 永远匹配不上（这里踩过一次，白报了一个假警）。
+     ★ 2026-10-16 修：这段注释原来**真的写了反引号**，直接把模板串截断成语法错误 ——
+       正是 dev/README.md 纪律 3 说的那件事（_precheck.mjs 的第 ⓪ 步就是抓它的）。 */
   R['⑨ 起播排在重绘后'] = String(tryPlay).indexOf('setTimeout(playStoneSound, 0)') >= 0
     ? '✓ 源码里是 setTimeout(playStoneSound, 0)'
     : '★ 没找到（音效可能又挪回重绘之前了）';

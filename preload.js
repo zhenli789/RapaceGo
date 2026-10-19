@@ -103,6 +103,27 @@ contextBridge.exposeInMainWorld('api', {
     readCoach: name => ipcRenderer.invoke('records:readCoach', name),
   },
 
+  /* ★ 习题题集（2026-10-14）：软件目录下的 puzzles/，只放 sgf。
+     和棋谱库是**两个目录**：records/ 是「一局棋」，puzzles/ 是「一套题」
+     （一份 SGF 里可能并列串着几百道题）。分开的理由见 main.js 的 puzzles 段注释。
+       list   → [{ name, size, mtime }]（**不含题数** —— 题数由界面自己数，
+                保证"怎么把 SGF 切成一道道题"只有一处实现）
+       read   → { ok, text } | { error }
+       import → 弹系统文件框（单选）→ 复制进 puzzles/（重名加 (2)，**不覆盖**）
+                → { canceled:true } | { ok:true, name } | { error }
+       importRecord → 把棋谱库里某一份棋谱复制成题集（「当题练」用，原棋谱不动）
+       rename / remove / dir / openDir → 同棋谱库那套 */
+  puzzles: {
+    list:   ()            => ipcRenderer.invoke('puzzles:list'),
+    read:   name          => ipcRenderer.invoke('puzzles:read', name),
+    import: ()            => ipcRenderer.invoke('puzzles:import'),
+    importRecord: name    => ipcRenderer.invoke('puzzles:importRecord', name),
+    rename: (a, b)        => ipcRenderer.invoke('puzzles:rename', a, b),
+    remove: name          => ipcRenderer.invoke('puzzles:delete', name),
+    dir:    ()            => ipcRenderer.invoke('puzzles:dir'),
+    openDir: ()           => ipcRenderer.invoke('puzzles:openDir'),
+  },
+
   /* 关于与更新（2026-10-08 用户要求，放在设置面板里）
      info()         → { version, downloadUrl, lastCheck }
      checkUpdate()  → { ok:true, current, latest, upToDate, ... } | { ok:false, error }

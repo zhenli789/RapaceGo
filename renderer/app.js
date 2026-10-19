@@ -22,7 +22,12 @@ const idx = (x, y) => y * N + x;
 const settings = {
   color: 'b',        // 我执：b / w / r(随机)
   size: 19,
-  mode: 'play',      // play = 人机对弈（只能下自己那方）；free = 摆棋（两边随便下）
+  /* play = 人机对弈（只能下自己那方）；free = 摆棋（两边随便下）；
+     ★ 2026-10-12 新增第三个值 tsumego = 习题练习（摆题 → 解题两阶段，见 state.tsumego）。
+     ⚠️ 凡是判 `=== 'play'` 的地方都要想一下 tsumego 该怎么走 ——
+        例如「只能下自己那方」这条，习题练习里要看的是 state.tsumego.defend，
+        不能直接复用 play 的判断（两者的"对方"含义不同：play 是段位对手，这里是防守方）。 */
+  mode: 'play',
   rules: 'chinese',  // 默认中国规则
   level: 'rank_3d',  // 对手棋力 = KataGo 人类棋风模型的真实段位档位（见 RANKS）
   handicap: 0,
@@ -34,7 +39,43 @@ const settings = {
      值不值得调深应当由用户在点的那一刻决定（会弹面板让他选）。 */
   reviewVisits: 500,
   humanLike: false,  // 拟人落子：按「该段位人类会下哪」的概率抽样，而不是取最优（见 pickAIMove）
+  /* ★ 双方都由 KATAGO 走（2026-10-18 用户要求）——AI 对弈模式下的「自我对弈」。
+     打开后你不落子，两个颜色都交给 KATAGO（用的还是「对手棋力」那一档），
+     底栏会出现「暂停 / 继续」按钮。 */
+  autoBoth: false,
+
+  /* ---------- 习题练习专用设置（2026-10-12 起）----------
+     大部分在「新对局 → 对局类型 = 习题练习」里设；**解题过程中要改的**
+     （KATAGO 执哪方 / 应对方式 / 提示 / 框架与框距）放在左栏的练习卡上。
+     ★ 框架与框距两处都有（面板 + 练习卡），写的是同一对值，走 syncFrameUI 同步 ——
+       因为面板点「开始」会把题目重置，做题中途想调框只有练习卡能改。 */
+  tmode: 'free',       // 摆子方式：'free' 自由摆棋（先选颜色）/ 'alt' 交替摆棋（黑白自动轮换）
+  tfirst: 'b',         // 先手：'b' 黑先 / 'w' 白先。★ 这道题该谁先走（发给引擎的 initialPlayer）
+  /* KATAGO 执哪一方（2026-10-14 用户要求）：'b' / 'w'。
+     你执的是**另一方**（state.myColor = 它的对方）。
+     默认值跟着「先手」走（改先手时自动翻到对方）→ 默认就是"你来解题、KATAGO 防守"；
+     想练**防守**（让 KATAGO 先动手、你来守）就把它改成先手那一方。
+     注意它与「先手」是两个独立概念：先手是**题目的属性**（黑先/白先），
+     这个是**谁坐哪一边**。两者相同 = KATAGO 先动手。 */
+  taicolor: 'w',
+  tframe: 'auto',      // 死活框架：'auto' 自动框 / 'off' 不加框架
+  tdist: 4,            // 框架距离：框边比题目棋子最外沿再多留几路（角上典型小题 → 约 9×9）
 };
+
+/* ★★ 习题练习的**规则与贴目是固定值**（2026-10-14 用户提出「是不是不需要规则和贴目」）。
+   依据：死活/手筋题要判的是"这块棋死没死"，用的是引擎的 ownership（归属），
+   跟数子还是数目、贴几目都无关；贴目只在**绝对目差**上平移一个常数，不影响"哪一点最好"。
+   所以：① 面板里那两行在习题模式下藏起来（`syncNewGameRows`），
+        ② 发给引擎的一律用下面这两个值（`tsAnalyzeExtras` 里覆盖），
+        ③ 状态栏也照它们显示 —— 三处口径一致，不会出现"界面上设了却不生效"。 */
+const TS_RULE = 'chinese';   // 数子制：与 ownership / 归属判定最直接
+const TS_KOMI = 0;           // 不贴目：题目的胜负由这一角的死活决定，贴目只会干扰绝对目差
+
+/* KATAGO 执一方 → **你执另一方**（习题练习里"谁是哪一方"的唯一换算口）。
+   进练习、开始解题、显示双方名字都要用，写成函数免得某处写反。 */
+const otherColor = c => (c === 'b' ? 'w' : 'b');
+const tsAIColor = () => (settings.taicolor === 'b' ? 'b' : 'w');   // KATAGO 那方
+const tsMyColor = () => otherColor(tsAIColor());                    // 你那一方
 
 /* 分析搜索量档位（用户要求可调，并指出「500 和 1600 之间缺得有点多」）。
    ★ 怎么定的：实测（19 路，同一局面重复跑）——
@@ -100,6 +141,11 @@ const state = {
   recName: '',
   /* 棋谱自带的解说词（SGF 的 C[]，只取主分支）：下标 = 第几手（0 = 开局前）。
      只在「打谱」（state.fromRecord）时有内容；新开局的棋谱没有解说词。 */
+  /* 棋谱的整棵变化树（2026-10-17）。null = 没有分支（新对局 / 自己摆的棋）。
+     有了它：手数列表能标出分支点，Alt+←/→ 在同一层的兄弟变体间切换。
+     ★ state.moves 永远是**当前这一条线**（分析 / 复盘 / 数子 / 导出都只认它），
+       树只负责"换线"——切分支时把 moves 整条重建成那一条。 */
+  varRoot: null,
   sgfComments: [],
   /* 棋谱根节点的说明文字（题集出处、这是第几图、谁整理的），**不属于任何一手**。
      ★ 为什么单独一个字段：原来它和「第 0 手」共用 comments[0] 这个键，
@@ -133,7 +179,7 @@ const state = {
      或打开一份棋谱（applyRecord，它会切摆棋模式）。 */
   noGame: true,
   showHints: (() => { try { return localStorage.getItem('rapacego.showHints') === 'true'; } catch { return false; } })(), // 首次默认关，之后沿用用户选择
-  showCoords: false, // 棋盘边缘显示 A–T / 1–19（默认关）
+  showCoords: true,  // 棋盘边缘显示 A–T / 1–19（2026-10-19 用户要求：默认显示）
   soundOn: true,     // 落子音效（默认开）
   clock: { on: false },   // 对局计时（applyNewGame 里按 settings.clock 填充）
   candidates: [],
@@ -171,6 +217,15 @@ const state = {
   history: [],
   leads: [],
   histVisits: [],        // 每一手胜率的「精度」伴随数组（见 state.histVisits 的注释）
+  /* ★ 每个局面的分析快照（2026-10-18）：下标 = 第几手（0 = 开局前）。
+     用途：右侧「解说词」卡按手显示 —— 分数 / 胜率 / 目数损失 / 推荐选点 / PV / 直觉排名。
+     形状 { at, side, blackWin, lead, visits, moves: [{gtp, prior, order, win, lead, pv}], best }。
+     ⚠️ 里面的 win / lead **一律是黑方视角**（applyAnalysis 里换算过）——
+        引擎原值是「轮到走棋那一方」，轮到白走时符号会反（纪律 11）。 */
+  anaAt: {},
+  /* 双方都由 KATAGO 走（自我对弈）。autoPaused = 暂停中（人按了「暂停」） */
+  autoBoth: false,
+  autoPaused: false,
   curveMode: 'win',  // 走势图纵轴：'win' 黑方胜率 / 'lead' 黑方领先目数
   draft: null,       // 试下（打草稿）：null = 不在试下；否则见 enterDraft()
   result: null,      // 终局结果 { winner, lead, unit, resign, by, terminal }；null = 尚未结束
@@ -179,6 +234,15 @@ const state = {
      { losses: [每手目损], stats: {...}, name: 棋谱文件名, at: 手数 }
      null = 当前局面没有复盘数据（手数列表/走势图就不画目损） */
   review: null,
+  /* ★ 习题练习的运行时状态（2026-10-12）。settings.mode !== 'tsumego' 时是 null。
+     由 makeTsumego() 建、exitTsumego() 清。字段含义见 makeTsumego 的注释。 */
+  tsumego: null,
+  /* ★ 当前打开的**题集**（2026-10-14 导入 SGF 习题时加）。null = 手摆的题（没有题集）。
+     { name: 文件名, list: [每道题], idx: 当前第几道(0 起), skipped: 跳过几棵树 }
+     为什么和 state.tsumego 分开放：题集是「一整本练习册」，tsumego 是「当前这一页」——
+     换一页（翻题）不该重建题集，退出习题模式也不该把书丢掉（再进来还能接着翻）。
+     ⚠️ 但 exitTsumego 会清 state.tsumego —— 读题集信息一律先判 tsSet() 有没有。 */
+  tsumegoSet: null,
 };
 
 let hover = null;    // 鼠标悬停的交叉点 {x, y}
@@ -356,6 +420,10 @@ function draw() {
      「KaTrain 就没有这个，所有选点都是一下就算好的」（2026-10-04）。
      代价是换局面后有一段约 1~2 秒的空白 —— 用下面那句「计算中…」补上反馈。 */
   const hintsFresh = state.candAt === state.viewAt;
+  /* ★ 习题练习：**不主动画选点** —— 一进题就把 AI 的首选画在盘上，等于直接把答案给了。
+     ⚠️ 但仍然尊重「显示」菜单里那个「实时推荐落点」开关：它是用户自己明确打开的，
+        再强行盖掉反而更让人困惑（用户定的：两处重复要能说清谁说了算）。
+     （2026-10-17：原来还有一条"提示③"能强制显示，随分级提示一起删了。） */
   const hintsVisible = state.showHints && hintsFresh
     && (settings.mode !== 'play' || isMyTurn());
   if (hintsVisible && state.candidates.length) {
@@ -493,6 +561,12 @@ function draw() {
       ctx.stroke();
     }
   }
+
+  /* ★ 习题练习的两层覆盖（画在最后 = 压在所有元素之上）：
+       · 死活框架（框线）—— 棋子会盖住它，所以必须后画。
+     自带"不是习题模式就什么都不画"的判断，放在这里不影响别的模式。
+     （2026-10-17：原来还有一层「目标棋块标记」（提示①），随提示功能删了。） */
+  drawFrame();
 }
 
 /* ---------------- 规则 ---------------- */
@@ -554,7 +628,48 @@ function tryPlay(x, y, byAI) {
     if (!byAI) flash('还没开局 —— 点棋盘中间的「新建对局」开始');
     return false;
   }
-  if (state.viewAt !== state.moves.length) { flash('回看中不能落子，先跳到最新'); return false; }
+  /* ★★ 回看中落子（2026-10-19 用户要求）：在历史局面上下一手 = **开一条新分支**。
+     原来这里一律挡掉（「回看中不能落子，先跳到最新」），想改一手只能悔棋；
+     现在把后面的手留在变化树上当变体 → 手数卡画成分支树、导出也带着分支。
+     ⚠️ 习题练习与试下不掺和：它们有自己的规则（答案 / 草稿），照旧挡住。 */
+  if (state.viewAt !== state.moves.length) {
+    if (tsOn() || state.draft) { flash('回看中不能落子，先跳到最新'); return false; }
+    cutForBranch();
+  }
+
+  /* ★ 习题练习 · 摆题阶段：落子由画布上的分流交给 placeSetupStone（写 state.setup）。
+     万一有别的路径调到这里，直接挡掉 —— 绝不能把"摆子"记成手顺。 */
+  if (tsOn() && tsPhase() === 'setup') return false;
+
+  /* ★ 习题练习 · 正在展示参考答案（「正解」按钮）：不许落子。
+     盘上那串手顺是**答案**，不是用户走的 —— 让人往后接一手，答案就毁了，
+     而且 KATAGO 的应手判据也会跟着乱。要落子就先收起答案（或按「重来」）。 */
+  if (tsOn() && tsPhase() === 'solve' && state.tsumego.showAnswer) {
+    if (!byAI) flash('正在展示参考答案 —— 先按「重来」或再按一次「正解」收起');
+    return false;
+  }
+
+  /* ★ 习题练习 · 解题阶段 · KATAGO 应对：只能下自己那一方（tsMyColor()），另一方由 KATAGO 走。
+     设成「我下两边」时不受限（那时是自己在推演变化）。
+     ⚠️ 不复用下面 play 那条判断：play 的"对方"是段位对手，这里的"对方"是防守方，语义不同。 */
+  if (!byAI && !state.draft && tsOn() && tsPhase() === 'solve'
+      && state.tsumego.defend !== 'both' && !isMyTurn()) {
+    flash('轮到对手（它执' + (tsAIColor() === 'b' ? '黑' : '白') + '）—— 想自己走两边，把「对手」切成「我下两边」');
+    return false;
+  }
+
+  /* ★ 习题练习 · 解题阶段：**人也只能在框架内落子**（2026-10-12 用户要求）。
+     为什么必须挡：框架就是"这道题的范围"。AI 那边已经用 allowMoves 锁在框内了，
+     人这一侧不挡的话，一手走到框外就等于"脱先"——题也就不成题了
+     （而且引擎被锁在框内、只能继续在框里应你，看着像答非所问）。
+     给了出路：① 练习卡上的「框架 / 框距」可以随手调大 ② 把框架关掉 ③ 「重摆」改题。 */
+  if (!byAI && tsOn() && tsPhase() === 'solve') {
+    const fr = frameRect();
+    if (fr && (x < fr.x0 || x > fr.x1 || y < fr.y0 || y > fr.y1)) {
+      flash('这一手在题目范围外 —— 要扩大范围就把练习卡上的「框距」调大，或把「框架」关掉');
+      return false;
+    }
+  }
 
   /* 人机对弈模式下，只能下自己那一方（AI 自己落子时用 byAI 跳过这个检查）
      试下（打草稿）时不受限制 —— 试下就是要两边都摆一摆 */
@@ -620,6 +735,7 @@ function tryPlay(x, y, byAI) {
   state.koPoint = (captured === 1 && capAt) ? { x: capAt.x, y: capAt.y } : null;
 
   state.moves.push({ x, y, color: state.toMove, captured, capAt: capAt || undefined });
+  noteTreeMove();                        // 树存在时把它挂上（新分支挂在最右边）
   clearCoachAt(state.moves.length);      // 这个手号上的旧讲解作废（悔棋换了别的棋，见函数注释）
   clockSwitch();                         // 结算本手用时，换对方
   state.toMove = state.toMove === 'b' ? 'w' : 'b';
@@ -693,7 +809,28 @@ canvas.addEventListener('click', e => {
   if (x < 0 || x >= N || y < 0 || y >= N) return;
   const [cx, cy] = pxOf(x, y);
   if (Math.hypot(mx - cx, my - cy) > gap * 0.48) return;
+  /* ★ 习题练习的**摆题阶段**：落子要进 state.setup（初始局面），不能当手顺记 ——
+     所以在这里就分流走 placeSetupStone，不进 tryPlay（tryPlay 写的是 state.moves）。 */
+  if (tsOn() && tsPhase() === 'setup') { placeSetupStone(x, y, false); return; }
   tryPlay(x, y);
+});
+
+/* 右键：习题**摆题阶段**直接擦子（比"先切到橡皮工具再点"快得多，是摆棋最常用的动作）；
+   ⚠️ 必须 preventDefault，否则会弹出浏览器/系统的右键菜单。
+   别的模式右键保持原样（不改动既有行为）。
+   ★ 2026-10-17：「解题阶段右键 = 手动指定目标」随判定功能一起删了。 */
+canvas.addEventListener('contextmenu', e => {
+  if (!(tsOn() && tsPhase() === 'setup')) return;
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const x = Math.round((mx - pad) / gap);
+  const y = Math.round((my - pad) / gap);
+  if (x < 0 || x >= N || y < 0 || y >= N) return;
+  const [cx, cy] = pxOf(x, y);
+  if (Math.hypot(mx - cx, my - cy) > gap * 0.48) return;
+  placeSetupStone(x, y, true);
 });
 
 /* 悬停：吸附到最近的交叉点（只记坐标，是否空点在 draw 里判） */
@@ -737,8 +874,14 @@ function syncUI() {
 
   const R = RULES[settings.rules] || RULES.chinese;
   const sizeTxt = N === 19 ? '' : `${N} 路 · `;
-  const hcTxt = R.seats ? '座子 · ' : (state.setup.length ? `让 ${state.setup.length} 子 · ` : '');
-  const koTxt = `贴目 ${settings.komi}`;
+  /* ★ 习题练习里这两个数要按**实际发给引擎的值**显示（2026-10-14）：
+     · 「让 N 子」——习题模式下的摆子是**题目初始局面**，不是让子，写成"让 13 子"会误导；
+     · 「贴目」——习题模式固定 0（TS_KOMI），显示 settings.komi 就会跟实际不符。
+     状态栏是用户唯一能看到这两个数的地方，不能跟引擎实际收到的不一致。 */
+  const tsMode = tsOn();
+  const hcTxt = R.seats ? '座子 · '
+    : (state.setup.length && !tsMode ? `让 ${state.setup.length} 子 · ` : '');
+  const koTxt = `贴目 ${tsMode ? TS_KOMI : settings.komi}`;
 
   /* 两个引擎各自的就绪状态 —— 分析引擎挂了胜率不出来，对弈引擎挂了 AI 不落子，
      必须分开提示，否则用户只会看到「AI 不动」而不知道卡在哪。
@@ -760,6 +903,11 @@ function syncUI() {
      会觉得它怎么突然变弱、或下了怪手。 */
   const humanTxt = settings.humanLike ? '拟人落子' : '';
   $('status').textContent = [head, engTxt, draftTxt, humanTxt].filter(Boolean).join(' · ');
+
+  /* ★ 顶栏那个模式按钮的文字 + 菜单高亮。放在 syncUI 里 = **唯一出口**：
+     模式在好几处被改（applyNewGame / continueCurrentGame / enterTsumego / cancelNewGame），
+     挨个加一句迟早漏掉一处；这里每帧幂等拉一次，永远跟 settings.mode 一致。 */
+  syncModeBtn();
 
   /* 讲解框跟着**当前手数**刷新（切手数 / 讲解完成 / 开新局都会走到这里）。
      它自己会挡掉重复调用（同一手不重画），所以放 syncUI 里开销很小。 */
@@ -810,6 +958,18 @@ function syncUI() {
   $('btn-save').disabled = total === 0;
   $('btn-score').disabled = total === 0;
   $('btn-resign').disabled = total === 0 || !!state.result;
+  /* 「暂停 / 继续」：只有「双方都由 KATAGO 走」时才露出来（2026-10-18）。
+     ★ 暂停时按钮显示「继续」并且点亮 —— 一眼看出"现在是我自己按停的"。 */
+  {
+    const ba = $('btn-auto');
+    const showAuto = state.autoBoth && settings.mode === 'play' && !state.noGame;
+    ba.hidden = !showAuto;
+    ba.textContent = state.autoPaused ? '继续' : '暂停';
+    ba.classList.toggle('on', state.autoPaused);
+    ba.title = state.autoPaused
+      ? '继续自动对弈（两边都由 KATAGO 走）'
+      : '暂停自动对弈（暂停后不会再落子；按「继续」接着下）';
+  }
   /* 未开局时「停一手 / 试下」也要置灰 —— 没有对局，这两个动作没有意义
      （disable 之后连快捷键调 .click() 也点不动，不用另加判断）。 */
   $('btn-pass').disabled = state.noGame;
@@ -848,12 +1008,20 @@ function syncUI() {
   if (state.noGame) {
     for (const id of ['info-rules', 'info-clock', 'info-hc', 'info-komi']) $(id).textContent = '未定';
   } else {
-    $('info-rules').textContent = short(R.label);
+    /* ★ 习题练习：这三项要按"实际发给引擎的值"显示（2026-10-14）。
+       · 规则：固定 TS_RULE（面板里那一行也藏了）
+       · 贴目：固定 TS_KOMI —— 显示 settings.komi 就与实际不符
+       · 让子：习题模式下的摆子是**题目初始局面**，不是让子 ——
+         原来这里写出「让 13 子」（截图上看到的），纯属误导，改成「题目摆子 N 子」。
+       （同样的口径在底栏状态行也有一份，见 syncUI 里 hcTxt / koTxt 那段。） */
+    const tsMode = tsOn();
+    $('info-rules').textContent = short((RULES[tsMode ? TS_RULE : settings.rules] || RULES.chinese).label);
     $('info-clock').textContent = (CLOCK_PRESETS[settings.clock] || CLOCK_PRESETS.none).label;
-    $('info-komi').textContent = String(settings.komi);
-    $('info-hc').textContent = R.seats
-      ? '座子 4 子'
-      : (state.setup.length ? '让 ' + state.setup.length + ' 子' : '不让');
+    $('info-komi').textContent = String(tsMode ? TS_KOMI : settings.komi);
+    $('info-hc').textContent = tsMode
+      ? (state.setup.length ? '题目摆子 ' + state.setup.length + ' 子' : '还没摆')
+      : (R.seats ? '座子 4 子'
+        : (state.setup.length ? '让 ' + state.setup.length + ' 子' : '不让'));
   }
 
   /* 数子结果随局面变化：悔棋 / 续下之后若不再终局，就收起结果条。
@@ -865,7 +1033,15 @@ function syncUI() {
        · 终局数子 → 悔棋 / 续下 → at ≠ viewAt → 收起 ✓
        · 手动数子 → 局面没动 → 留着 ✓；一旦落子 → at ≠ viewAt → 收起 ✓
      认输是终局，不动它 —— 认了就是认了。 */
-  if (state.result && !state.result.resign && state.result.at !== state.viewAt) state.result = null;
+  /* ★★ 2026-10-18 改判据：比的是**手数**，不是"正在看哪一手"。
+     原来的写法（`at !== state.viewAt`）在回看时会把结果**清掉** ——
+     再跳回最后那一手，isTerminal() 又成立、`!state.result` 又为真 →
+     数子**再跑一遍**、结论条**又冒出来**。用户看到的就是"回看时胜负信息反复出现"。
+     现在：只有**局面真的变了**（落子 / 悔棋）才清；回看不影响它。
+     认输也记 at（见 doResign），所以认输后接着下也不会一直挂着那句"认输"。 */
+  if (state.result && typeof state.result.at === 'number' && state.result.at !== state.moves.length) {
+    state.result = null;
+  }
   renderVerdict();
 
   draw();
@@ -875,6 +1051,7 @@ function syncUI() {
   renderMoveList();
   renderCommentBox();    // 右下角「解说词」框跟着当前手数走（棋谱自带的那种）
   renderClocks();        // 名字（PLAYER / KATAGO / PLAYER1 / PLAYER2）随模式变
+  syncTsumegoUI();       // 习题练习的左栏练习卡（不是习题模式时它会把自己藏起来）
 
   /* ★ 人机对弈：AI 该下就让它下；**同时也发一次分析** ——
      分析走 strong 引擎、AI 落子走 human 引擎，是两个独立进程，互不干扰。
@@ -883,6 +1060,14 @@ function syncUI() {
      ⚠️ 以前这里是 `if / else` 二选一，理由写着「两个查询会互相打断」——
         那是**单引擎时代**的限制，2026-10-03 拆成双引擎后已经不成立了。 */
   if (needAIMove()) scheduleAIMove();
+  /* ★ 习题练习：解题阶段轮到 KATAGO 时，由**分析引擎**（强权重）出应手 ——
+     题的正解是以「最强应对」为前提的，用段位引擎防守会把错着放过去。
+     ⚠️ 判据用 `stillNeedDefend()`（不含 `!defendBusy`），**不能**用 `needDefendMove()`：
+        上一条应手请求还在飞的时候，needDefendMove() 会是 false →
+        这一次"需要应手"就**根本不会被记下来**，而 syncUI 是它的主要入口之一，
+        于是 KATAGO 会一直不动（2026-10-14 实测的偶发就是这么来的）。
+        武装定时器之后由 maybeDefendMove 负责"占着就稍后再排"，不会丢。 */
+  if (stillNeedDefend()) scheduleDefendMove();
   scheduleAnalysis();
 
   /* 双方都停一手 → 自动判终局（约 4~5 秒出结果）
@@ -1096,6 +1281,9 @@ function doResign(loser, by) {
     resign: true,
     by: by || 'user',
     terminal: true,
+    /* ★ 记下是第几手认输的（2026-10-18）：syncUI 靠它判断"局面变过没有" ——
+       认输后接着下（或悔棋）就该把这条结论收起来，否则它会一直挂在棋盘上。 */
+    at: state.moves.length,
   };
 }
 
@@ -1111,8 +1299,17 @@ function aiWantsResign() {
 
 function renderVerdict() {
   const box = $('verdict');
+
+  /* ★ 2026-10-17：习题练习的判定结论已按用户要求删掉 —— 这条结果条回到"只装对局结论"
+     （数子 / 认输 / 超时）。当时把判定挪到这里是为了让练习卡高度恒定，沿革见 daily log。 */
+  $('verdict-close').title = '收起（不影响对局，可随时按「数子」再看）';
+
   const r = state.result;
   if (!r) { box.hidden = true; return; }
+  /* ★★ 只在**最后那一手**才显示结论（2026-10-18 用户报的：「回看时棋盘上反复出现胜负信息」）。
+     回看历史手时这条结论属于"另一个局面"，挂着只会挡棋盘、还让人以为这一手就结束了。
+     ⚠️ 注意是**隐藏**而不是把 state.result 清掉 —— 导出棋谱要用它写 RE[]。 */
+  if (state.viewAt !== state.moves.length) { box.hidden = true; return; }
   /* ★ 用户手动按过叉 → 尊重它，别再自己冒出来（2026-10-06 审查发现）。
      新的一次数子 / 认输会整个替换 state.result，那时没有 dismissed 标记，照常显示。 */
   if (r.dismissed) { box.hidden = true; return; }
@@ -1158,8 +1355,22 @@ $('verdict-close').onclick = () => {
 
 $('btn-draft').onclick = toggleDraft;
 
-$('btn-undo').onclick = () => {
-  /* ★ 正在回看历史手时不许悔棋（2026-10-06 审查发现）。
+/* 「暂停 / 继续」自动对弈（只有"双方都由 KATAGO 走"时才出现）——
+   ★ 暂停后**还要 clearTimeout**：定时器可能已经武装好了，光靠 needAIMove 里那道
+     判断也行（它查 state.autoPaused），但清掉更干脆，不会有一次"多下出来"的落子。 */
+$('btn-auto').onclick = () => {
+  if (!state.autoBoth) return;
+  state.autoPaused = !state.autoPaused;
+  if (state.autoPaused) {
+    clearTimeout(aiTimer);
+    flash('自动对弈已暂停 —— 按「继续」接着下');
+  } else {
+    flash('继续自动对弈');
+  }
+  syncUI();
+};
+
+$('btn-undo').onclick = () => {  /* ★ 正在回看历史手时不许悔棋（2026-10-06 审查发现）。
      落子 / 停一手 / 试下都有这条约定（「回看中不能落子，先跳到最新」），**只有悔棋漏了** ——
      于是「看着第 50 手点悔棋」撤掉的是**最后一手**、画面还跳到 99 手，
      用户会以为软件撤错了手（他心里的"这一手"就是眼前看着的那一手）。 */
@@ -1174,7 +1385,7 @@ $('btn-undo').onclick = () => {
   state.moves.pop();
   /* 人机对弈模式：撤到「又轮到自己」为止 —— 否则 AI 会立刻把这一手补回来，看着像没撤。
      试下时不做这个联动：草稿里你想退几手就退几手。 */
-  if (!state.draft) {
+  if (!state.draft && !state.autoBoth) {
     while (settings.mode === 'play' && state.moves.length &&
            sideToMove(state.moves.length) !== state.myColor) {
       state.moves.pop();
@@ -1208,8 +1419,13 @@ $('btn-undo').onclick = () => {
 };
 
 $('btn-pass').onclick = () => {
-  if (state.viewAt !== state.moves.length) { flash('回看中不能落子，先跳到最新'); return; }
+  /* ★ 回看中停一手也走"开分支"（2026-10-19）—— 和落子一致；习题 / 试下照旧挡住 */
+  if (state.viewAt !== state.moves.length) {
+    if (tsOn() || state.draft) { flash('回看中不能落子，先跳到最新'); return; }
+    cutForBranch();
+  }
   state.moves.push({ pass: true, color: state.toMove });
+  noteTreeMove();
   clearCoachAt(state.moves.length);      // 该手号上的旧讲解作废
   state.toMove = state.toMove === 'b' ? 'w' : 'b';
   state.koPoint = null;          // 脱先一手，劫自然消解
@@ -1300,10 +1516,12 @@ function buildSGF() {
   let s = `(;GM[1]FF[4]SZ[${N}]CA[UTF-8]AP[RapaceGo:0.3]KM[${settings.komi}]RU[${R.sgf}]`
     + `PB[${sgfn(clockName('b'))}]PW[${sgfn(clockName('w'))}]`;
   if (R.seats) s += 'GC[明清规则：座子制 · 还棋头]';
-  if (R.seats || settings.handicap) {
+  /* ★ 2026-10-17：条件里加了 `state.setup.length` —— 打开**带摆子的棋谱**（死活题、古谱）
+     再导出时，原来这几颗子会被整个丢掉（旧条件只认座子/让子）。 */
+  if (R.seats || settings.handicap || state.setup.length) {
     const bs = state.setup.filter(p => p.color === 'b').map(p => `[${SGF_COLS[p.x]}${SGF_COLS[p.y]}]`).join('');
     const ws = state.setup.filter(p => p.color === 'w').map(p => `[${SGF_COLS[p.x]}${SGF_COLS[p.y]}]`).join('');
-    if (!R.seats) s += `HA[${settings.handicap}]`;   // 座子不是让子，不写 HA
+    if (!R.seats && settings.handicap) s += `HA[${settings.handicap}]`;   // 座子不是让子，不写 HA
     if (bs) s += `AB${bs}`;
     if (ws) s += `AW${ws}`;
   }
@@ -1318,10 +1536,73 @@ function buildSGF() {
       ? (r.by === 'user' ? '认输' : 'AI 认输')
       : (r.winner === 'b' ? '黑方胜' : '白方胜') + r.lead.toFixed(1) + r.unit) + ']';
   }
-  for (const m of state.moves.slice(0, upto)) {
+  /* ★★ 有变化树（打开的棋谱带变体）→ 按**树**序列化，分支要保住（2026-10-17）。
+     以前这里只写一条线：用户看过的变体，一导出就没了。
+     ★ 只写手顺，不写每手的 C[]（与以前一致 —— 解说词走"存回原文件"那条路）。 */
+  if (state.varRoot) {
+    /* ★ 2026-10-19：分成「手顺」和「备注」两件事 ——
+       · 手顺：树上每个节点一手；
+       · 备注：① 树上本来就有的解说（打开棋谱再导出别丢）② 这一局算出来的分析
+         （analysisNoteFor 只给"当前线上"的手算，而且有原生解说时自己会返回空）。
+       原来这里一律不写 C[]，于是导出的棋谱再打开，解说词卡是一片空白。 */
+    const path = varPath();
+    const noteOf = new Map();
+    path.forEach((nd, i) => {
+      const t = analysisNoteFor(i + 1);
+      if (t) noteOf.set(nd, t);
+    });
+    const mvSGF = nd => {
+      const m = nd.move;
+      let out = ';' + (m.color === 'b' ? 'B' : 'W')
+        + (m.pass ? '[]' : '[' + SGF_COLS[m.x] + SGF_COLS[m.y] + ']');
+      const c = noteOf.get(nd) || nd.comment || '';
+      if (c) out += 'C[' + sgfValue(c) + ']';
+      return out;
+    };
+    /* 树上没匹配上的尾巴 = 用户自己接着下的手（草稿之前的部分），没有备注 */
+    const tail = state.moves.slice(path.length, upto)
+      .map(m => mvSGF({ move: m, comment: '' })).join('');
+    const tailNode = path.length ? path[path.length - 1] : state.varRoot;
+    const walk = nd => {
+      let out = nd.move ? mvSGF(nd) : '';
+      const kids = nd.children.filter(c => c.move || c.children.length);
+      if (nd === tailNode && tail) {
+        /* 续下的手：这条线没分支就顺着接，已经有分支就当作又一条分支
+           （SGF 里节点后面只能跟子树，不能再跟并列节点 —— 所以必须包起来）。 */
+        if (!kids.length) return out + tail;
+        return out + '(' + tail + ')' + kids.map(k => '(' + walk(k) + ')').join('');
+      }
+      if (kids.length === 1) out += walk(kids[0]);
+      else if (kids.length > 1) out += kids.map(k => '(' + walk(k) + ')').join('');
+      return out;
+    };
+    s += walk(state.varRoot);
+    return s + ')';
+  }
+  for (let i = 0; i < upto; i++) {
+    const m = state.moves[i];
     s += ';' + (m.color === 'b' ? 'B' : 'W') + (m.pass ? '[]' : `[${SGF_COLS[m.x]}${SGF_COLS[m.y]}]`);
+    /* ★ 把这一手的分析写进 C[]（2026-10-18 用户要求）：
+       导出的棋谱再打开时，右侧「解说词」卡要能显示当时的分析（手数/分数/胜率/目损/
+       推荐选点/PV/直觉排名）。原来只写手顺，于是重新打开那张卡是空的。
+       ★ 两个条件：① 这一手**前后两个局面**都分析过（否则存进去是一串"还在算…"）；
+                   ② 这份棋谱在这个手号上**没有原生解说词**（不能把人家的解说盖掉）。 */
+    const note = analysisNoteFor(i + 1);
+    if (note) s += 'C[' + sgfValue(note) + ']';
   }
   return s + ')';
+}
+
+/* SGF 属性值转义：`\` 和 `]` 是保留字符（换行可以原样留着，SGF 允许） */
+function sgfValue(v) {
+  return String(v || '').replace(/\\/g, '\\\\').replace(/\]/g, '\\]');
+}
+
+/* 第 k 手要写进棋谱的「分析备注」。条件见 buildSGF 里那段注释。 */
+function analysisNoteFor(k) {
+  if (!state.anaAt[k] || !state.anaAt[k - 1]) return '';
+  if ((state.sgfComments || [])[k]) return '';          // 有原生解说 → 不动它
+  return moveAnalysisText(k);
 }
 
 /* ---------------- 棋谱库（打开 / 存进来 / 备注 / 删除） ----------------
@@ -1418,34 +1699,46 @@ function parseSGF(text) {
        最惨的一份原 305 手只剩 3 手；AlphaGo 对李世石那局原 280 手只剩 15 手。
      （旧写法当初是为了解决「注释里的括号被当成分支」而写的 —— 那个问题现在由
        第 1 步的 tokenizer 自然解决了：括号在属性值里根本不会被当成 token。） */
-  const nodes = [];                                      // 主分支上的属性节点（按出现顺序）
-  const skipTree = k => {                                // 跳过一整棵子树
-    let d = 0;
-    while (k < toks.length) {
-      if (toks[k] === '(') d++;
-      else if (toks[k] === ')') { d--; if (d === 0) return k + 1; }
+  /* ★★ 2026-10-17：旧写法是「顺着括号往下走，遇到第二棵子树就整块跳过」——
+     它只留主分支，**变体全丢**（《玄玄棋经》347 题里就有 77 个变体子树读不到）。
+     现在改成：**先建整棵树**，再从树里取主分支（每个节点取第一个孩子，语义与旧 walk
+     一模一样）→ 树和主分支永远同源，不会各说一套。
+     ⚠️ 变体挂在**当前最后一个节点**下面：`(;A;B(;C)(;D))` 里 C/D 都是 B 的孩子。
+     ⚠️ 一个文件里可能有**多棵并列树**（题集），这里只取第一棵（旧行为不变），
+        分段由 splitSgfGames 负责。 */
+  const mkNode = t => ({ props: t.props, at: t.at, end: t.end, children: [] });
+  let tree = null;
+  {
+    let k = toks.indexOf('(');
+    const gameTree = () => {                             // k 指向 '('
+      if (toks[k] !== '(') return null;
       k++;
-    }
-    return k;
-  };
-  const walk = k => {                                    // k 指向 '('
-    if (toks[k] !== '(') return k;
-    k++;
-    while (k < toks.length) {
-      const t = toks[k];
-      if (t === ')') return k + 1;
-      if (t === '(') {
-        k = walk(k);                                     // 第一个子 = 主分支，继续往下走
-        while (toks[k] === '(') k = skipTree(k);          // 其余兄弟整块跳过
-        continue;
+      let root = null, cur = null;
+      while (k < toks.length) {
+        const t = toks[k];
+        if (t === ')') { k++; break; }
+        if (t === '(') {                                 // 变体
+          const sub = gameTree();
+          if (sub) {
+            if (cur) cur.children.push(sub);
+            else if (!root) root = sub;                  // 异常形态：子树写在节点之前
+          }
+          continue;
+        }
+        if (t && t.props) {
+          const nd = mkNode(t);
+          k++;
+          if (!root) { root = nd; cur = nd; }
+          else { cur.children.push(nd); cur = nd; }
+        } else k++;
       }
-      nodes.push(t);
-      k++;
-    }
-    return k;
-  };
-  const head = toks.indexOf('(');
-  if (head >= 0) walk(head);                             // 只解析第一棵树（一个文件可能串着好几局）
+      return root;
+    };
+    tree = gameTree();
+  }
+  /* 主分支 = 从根开始，每个节点都取**第一个**孩子，一直走到底 */
+  const nodes = [];                                      // 主分支上的属性节点（按出现顺序）
+  for (let cur = tree, guard = 0; cur && guard < 50000; cur = cur.children[0], guard++) nodes.push(cur);
 
   /* ---------- 3) 取出棋谱自带的东西 ----------
      C[] = 这个节点上的**解说词**（很多棋谱有，实测抽查 600 份里 353 份带 —— 见开发记录）。
@@ -1479,6 +1772,37 @@ function parseSGF(text) {
      避免把节点当成属性后永远回退到 19 路。 */
   const declaredSize = parseInt(firstProp('SZ'), 10);
   const boardSize = declaredSize >= 2 && declaredSize <= 52 ? declaredSize : 19;
+
+  /* 给树上的每个节点补两样消费方要用的东西：`move`（这一手）与 `comment`（这一节点的解说）。
+     · 空 [] = 停一手 → { color, pass: true }
+     · 坐标越界（`;W[zz]` 这种题集分隔标记）→ move = null（**不是棋**，别当 pass）
+     · 同一节点多个 B/W 只认第一个（SGF 不允许，真出现就按第一个算） */
+  const attachMove = nd => {
+    let mv = null, cm = '';
+    for (const p of nd.props) {
+      if (p.id === 'B' || p.id === 'W') {
+        const color = p.id === 'B' ? 'b' : 'w';
+        const v = p.vals.length ? p.vals[0] : '';
+        if (!v) mv = { color, pass: true };
+        else if (v.length === 2) {
+          const x = v.charCodeAt(0) - 97, y = v.charCodeAt(1) - 97;
+          if (x >= 0 && y >= 0 && x < boardSize && y < boardSize) mv = { color, x, y };
+        }
+      } else if (p.id === 'C' && p.vals.length && !cm) {
+        cm = unsgf(p.vals[0]);
+      }
+    }
+    nd.move = mv;
+    nd.comment = cm;
+    for (const c of nd.children) attachMove(c);
+  };
+  if (tree) attachMove(tree);
+  /* ★ 根节点自己带一手的情况（`(;B[pd];W[dp])` 这种写法）→ 套一层"空根"，
+     让消费方可以无脑假设「根节点没有棋、第一手是某个孩子」。
+     只动 tree，不动 nodes（主分支输出一个字节都没变，有基线快照比对）。 */
+  if (tree && tree.move) {
+    tree = { props: [], at: -1, end: -1, move: null, comment: '', children: [tree] };
+  }
 
   const moves = [], comments = [], mainLine = [], seps = [];
   /* 根节点（棋谱开头那个节点）的说明文字 —— 单独存，不占「第 0 手」那个键。
@@ -1567,14 +1891,103 @@ function parseSGF(text) {
   }
   /* 双方名字（别的软件导出的棋谱大多有；没有就是 null） */
   const pb = firstProp('PB'), pw = firstProp('PW');
+  /* ★ 先手（2026-10-14 加，给习题练习用）：SGF 的 PL 属性。
+     为什么必须单独取出来：题集里"这道题该谁先走"就写在 PL 上，而主变化第一手的颜色
+     通常与之相同、但**不是必须**（实测 347 题的题集里就有 2 处对不上：一题完全没写 PL）。
+     所以两处都要留：调用方优先用 firstPlayer，没有时退回「第一手的颜色」。
+     不写进返回值的话，导入题集就只能靠猜。 */
+  const plRaw = String(firstProp('PL') || '').toUpperCase();
+  const firstPlayer = plRaw === 'B' ? 'b' : (plRaw === 'W' ? 'w' : null);
   return {
     ok: moves.length > 0 || ab.length > 0, size, komi, rules, ab, aw, moves, pb, pw,
+    firstPlayer,
     comments, rootComment, mainLine,
+    /* ★ 2026-10-17 新增：整棵变化树（含变体）。节点形如
+         { props, at, end, move: {color,x,y,pass}|null, comment, children: [] }
+       根节点通常只有 AB/AW（move=null），主线是「一路取 children[0]」。
+       题集用它实现「按正解」的多分支应对；棋谱浏览暂未接（见 README 的说明）。 */
+    tree,
     /* 「换了一道题」的位置（题集里 `zz` 分隔标记所在的手数）。
-       我们**不做分支树、也不做多题分段显示**（用户定的：只显示主干），
+       我们**不做多题分段显示**（用户定的：只显示主干），
        但保留这个信息 —— 将来若要做「第 3 题」这类提示，不用再改解析器。 */
     seps
   };
+}
+
+/* ---------- 把一份 SGF 切成「一道道题」（2026-10-14，导入习题用）----------
+   ★ 为什么需要它：棋谱是「一个文件 = 一局棋」，而**题集不是** ——
+     实测用户那份《玄玄棋经》（xxqj.sgf）是 `(…)(…)(…` **347 棵并列的顶层树**
+     串在一个文件里，一道题一棵树。而 parseSGF 只解析**第一棵**（那是为棋谱写的：
+     一个文件里可能串着好几局，只取第一局）。所以导入题集必须先把顶层树切开，
+     再一棵一棵交给 parseSGF —— 这样 AB/AW/AE/zz 越界这些坑全都复用同一套已验证的代码，
+     不用再写第二份解析器。
+   ★ 扫描必须**认属性值**：SGF 的值可以跨行、里面能有括号和分号
+     （`C[第 1 图（黑先）…]`），所以遇到 `[` 要一直跳到配对的 `]`（并处理 `\` 转义），
+     否则括号数一错，整份文件就被切歪。
+   ★ 只认**真的含节点**的段（`(;…)`）—— 挡掉空树 `()`。 */
+function splitSgfGames(text) {
+  const s = String(text || '');
+  const n = s.length;
+  const out = [];
+  let i = 0;
+  /* 从 '[' 跳到配对的 ']'（含 `\]` 转义） */
+  const skipVal = () => {
+    i++;
+    while (i < n) {
+      if (s[i] === '\\') { i += 2; continue; }
+      if (s[i] === ']') { i++; return; }
+      i++;
+    }
+  };
+  while (i < n) {
+    if (s[i] === '[') { skipVal(); continue; }     // 顶层不该出现值，保险起见
+    if (s[i] !== '(') { i++; continue; }
+    const start = i;
+    let depth = 0;
+    while (i < n) {
+      if (s[i] === '[') { skipVal(); continue; }
+      if (s[i] === '(') { depth++; i++; continue; }
+      if (s[i] === ')') { depth--; i++; if (!depth) break; continue; }
+      i++;
+    }
+    const piece = s.slice(start, i);
+    if (/\(\s*;/.test(piece)) out.push(piece);      // 必须真含节点
+  }
+  return out;
+}
+
+/* 把一份题集 SGF 解析成「一道道的题」。返回 { list, skipped }：
+     list 里每项 = { size, setup:[{x,y,color}], first, answer:[{color,x,y}], ok }
+       setup  初始局面（AB/AW 摆子）
+       first  这道题该谁先走（PL 优先；没写 PL 就退回「正解第一手的颜色」；都没有 = 黑）
+       answer 正解顺序（= SGF 的主变化。题集里"主变化"就是做者写进去的正解）
+   ★ `skipped` 要报出来：题集里偶尔有一棵解析不出东西的树（空树 / 只有元数据），
+     静默丢掉会让"第 N 题"的编号对不上用户手里的书 —— 所以数字要能对上，就靠它不算进 list。
+   ★ 坐标一律经 parseSGF（它已经处理了「SGF 含 i、GTP 跳 I」和越界坐标），
+     这里不自己解析坐标。 */
+function parseProblemSet(text) {
+  const pieces = splitSgfGames(text);
+  const list = [];
+  let skipped = 0;
+  for (const piece of pieces) {
+    let p = null;
+    try { p = parseSGF(piece); } catch (e) { p = null; }
+    if (!p || !p.ok || (!p.ab.length && !p.aw.length && !p.moves.length)) { skipped++; continue; }
+    const setup = [];
+    for (const s of p.ab) setup.push({ x: s.x, y: s.y, color: 'b' });
+    for (const s of p.aw) setup.push({ x: s.x, y: s.y, color: 'w' });
+    const answer = (p.moves || []).map(m => ({ color: m.color, x: m.x, y: m.y, pass: !!m.pass }));
+    const first = p.firstPlayer
+      || (answer.length ? answer[0].color : null)
+      || 'b';
+    /* 尺寸：题目自己声明的（题集偶尔混着小盘题）；没声明就是 19 */
+    list.push({ size: p.size || 19, setup, first, answer, ok: true,
+                rootComment: p.rootComment || '',
+                /* ★ 2026-10-17：整棵正解树（含变体）。「按正解」那一档用它——
+                   一道题有几条正确分支时，走到哪条就跟哪条；只读主变化会把它当"走偏"。 */
+                tree: p.tree || null });
+  }
+  return { list, skipped };
 }
 
 /* ---------- 换行符归一（2026-10-06）----------
@@ -1682,6 +2095,9 @@ function applyRecord(rec, srcName) {
     ...rec.aw.map(p => ({ x: p.x, y: p.y, color: 'w' })),
   ];
   state.moves = rec.moves.slice();
+  /* ★ 变化树（2026-10-17）：只有棋谱会带它。手数列表的分支标记、Alt+←/→ 切换都靠它；
+     没有分支的棋谱是 null，行为与以前完全一样。 */
+  state.varRoot = rec.tree || null;
   /* ★ 棋谱自带的解说词（SGF 的 C[]，主分支逐手）—— 右下角那个「解说词」框就是显示它。
      没有就是空数组（多数自己导出的棋谱没有）。 */
   state.sgfComments = Array.isArray(rec.comments) ? rec.comments.slice() : [];
@@ -1714,6 +2130,9 @@ function applyRecord(rec, srcName) {
   state.lastEval = null;
   state.review = null;          // 换了棋谱 → 上一次的复盘数据作废
   state.pv = null;              // 变化图也收掉（候选点马上就变了）
+  state.anaAt = {};             // 逐手分析快照：换了一份棋，旧的张冠李戴
+  state.autoBoth = false;       // 打谱没有"双方自动"这回事（模式固定成双人摆棋）
+  state.autoPaused = false;
   setSeg('seg-mode', 'free');
   clockReset();
   resize();
@@ -1725,12 +2144,53 @@ function applyRecord(rec, srcName) {
 }
 
 /* 存进棋谱库 */
-async function saveToRecords() {
+/* 存进棋谱库的文件名（2026-10-18 加；10-19 改成 "A vs B" 且段位挂在 AI 名字后）：
+   「黑 vs 白-时间」，例如 `P1 vs AI(3段)-202610190015.sgf`；时间到分钟（YYYYMMDDHHmm）。
+   · PLAYER1 → P1、PLAYER2 → P2、KATAGO → AI（用户指定的缩写）；
+   · **段位挂在 AI 那一方的名字后面**（括号里）；**双方都是 AI（自动对弈）就两边都挂**：
+     `AI(3段) vs AI(3段)-202610190015.sgf`；
+   · 双人摆棋没有 AI，也就没有段位：`P1 vs P2-202610190015.sgf`；
+   · 名字里可能带空格 / 斜杠 / 冒号（用户改过名），**只清洗名字本身** ——
+     不能把 " vs " 两边那两个空格也洗掉（所以先清洗、后拼接）。 */
+function recordFileName() {
+  const short = raw => {
+    const s = String(raw || '').trim();
+    if (/^PLAYER1$/i.test(s)) return 'P1';
+    if (/^PLAYER2$/i.test(s)) return 'P2';
+    if (/^PLAYER$/i.test(s)) return 'P1';
+    if (/^KATAGO$/i.test(s)) return 'AI';
+    return s;
+  };
   const d = new Date();
   const p = n => String(n).padStart(2, '0');
-  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  const realMoves = state.draft ? state.draft.from : state.moves.length;   // 草稿不进棋谱
-  const name = `${stamp}-${realMoves}手.sgf`;
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}`;
+  const lvLabel = settings.mode === 'play'
+    ? String(((RANK_MAP.get(settings.level) || {}).label) || '').replace(/\s+/g, '')
+    : '';
+  /* AI 那一方 = 自动对弈时两边都是；否则人机对弈里「不是我执的那一边」 */
+  const isAI = color => settings.mode === 'play'
+    && (state.autoBoth || color !== state.myColor);
+  const side = color => {
+    const nm = short(clockName(color)).replace(/[\\/:*?"<>|\s]/g, '');
+    return nm + (lvLabel && isAI(color) ? '(' + lvLabel + ')' : '');
+  };
+  return side('b') + ' vs ' + side('w') + '-' + stamp + '.sgf';
+}
+
+async function saveToRecords() {
+  let name = recordFileName();
+  /* ★ 2026-10-19：文件名只到**分钟**，同一分钟内连存两局就会撞名 ——
+     而 records:save 撞名是**覆盖**（只留一份 .bak）。所以先看一眼棋谱库，
+     撞上了就加 ` (2)`、` (3)`…（老命名带秒，几乎撞不上，改成分钟后这是必须的）。 */
+  try {
+    const all = (await window.api.records.list()) || [];
+    const stem = name.replace(/\.sgf$/i, '');
+    if (all.some(it => it.name === name)) {
+      let i = 2;
+      while (all.some(it => it.name === stem + ' (' + i + ').sgf')) i++;
+      name = stem + ' (' + i + ').sgf';
+    }
+  } catch (e) { /* 拿不到列表就按原名存（覆盖时主进程会留 .bak 兜底） */ }
   const r = await window.api.records.save(name, buildSGF());
   if (!r || r.error) { flash('保存失败：' + ((r && r.error) || '未知')); return null; }
   flash('已存进棋谱库 · ' + r.name + '（顶栏「棋谱库」里能看到）');
@@ -1780,6 +2240,13 @@ async function refreshRecords() {
   }
   for (const it of list) {
     const li = document.createElement('li');
+    const mk = (label, title, fn) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      b.onclick = fn;
+      return b;
+    };
     /* 两行显示（用户要求「显示备注名和文件名」）：
        上行 = 备注名（存在 SGF 的 GN 字段里）；下行 = **真实文件名**（灰色小字）。
        没写过备注时就只显示文件名一行，免得两行是同一串东西。 */
@@ -1797,37 +2264,58 @@ async function refreshRecords() {
       fn.textContent = it.name;
       info.appendChild(fn);
     }
-    const meta = document.createElement('span');
-    meta.className = 'rec-meta';
-    meta.textContent = Math.max(1, Math.round(it.size / 1024)) + ' KB · ' + fmtRecTime(it.mtime)
-      + (it.hasReview ? ' · 已复盘' : '')
-      + (it.hasCoach ? ' · 带讲解' : '');
-    const mk = (label, title, fn) => {
-      const b = document.createElement('button');
-      b.textContent = label;
-      b.title = title;
-      b.onclick = fn;
-      return b;
-    };
-    li.append(info, meta,
+    /* ★ 2026-10-18 用户要求：这一行**只留文件名**（原来看大小 / 时间 / 已复盘）。
+       理由：文件名现在带上了双方名字+棋力+时间（recordFileName），信息已经够；
+       那一串元信息占掉半行，把文件名挤成省略号，反倒看不见了。
+       「带讲解」保留 —— 它不看文件名看不出来，而且是"这份棋谱还多一份讲解"的入口提示。 */
+    if (it.hasCoach) {
+      const meta = document.createElement('span');
+      meta.className = 'rec-meta';
+      meta.textContent = '带讲解';
+      li.append(info, meta);
+    } else {
+      li.append(info);
+    }
+    li.append(
       mk('打开', '载入这份棋谱', () => openRecord(it.name)),
-      /* AI 复盘：整盘逐手重算 → 出报告 + 在手数列表/走势图上标失误。
-         叫「AI 复盘」而不是「复盘」，免得和棋谱软件里那个「一步一步翻」的meaning 混。
-         ★ 2026-10-04 用户要求：点完之后**先手动选搜索量**（默认 500），所以这里
-           只负责开选档面板，真正开跑在 openReviewSetup 里。 */
+      /* 「当题练」（2026-10-14）：把这份棋谱当成习题练。
+         ★ 先**读一遍判它像不像题**（有没有 AB/AW 摆子），判过了才复制进题集 ——
+           普通对局棋谱复制过去只会得到一张空盘，白占一份题集、还让人以为坏了。
+           这一步的判断用的是 records:read（棋谱库那份），不写盘。 */
+      mk('当题练', '把这份棋谱当习题练（会复制一份到题集里，原棋谱不动）', async () => {
+        const rd = await window.api.records.read(it.name);
+        if (!rd || rd.error || !rd.text) { flash('读不出来：' + ((rd && rd.error) || '未知')); return; }
+        const { list } = parseProblemSet(rd.text);
+        const stones = list.reduce((a, p) => a + p.setup.length, 0);
+        if (!list.length || !stones) {
+          flash('这份棋谱里没有摆子（不像习题集）—— 习题的初始局面是用摆子写出来的，普通对局没有');
+          return;
+        }
+        const r = await window.api.puzzles.importRecord(it.name);
+        if (!r || r.error) { flash('当题练失败：' + ((r && r.error) || '未知')); return; }
+        REC_MASK.classList.remove('open');
+        /* ★ r.reused = 题集里已经有一份**内容相同**的（见 main.js 的注释，2026-10-16）→
+           直接打开它，不再生成 xxx (2).sgf。提示要写明是"复用"，
+           否则用户以为还是老行为、又去题集面板里找重复项。 */
+        await openPuzzleSet(r.name, r.reused ? '这份棋谱早就在题集里了（没重复复制）' : '');
+      }),
+      /* 复盘：**只留一个按钮**（2026-10-18 用户要求 —— 原来「AI 复盘」「复盘报告」并排，
+         没复盘过时后者是灰的，纯占地方）。
+         · 没复盘过 → 「AI 复盘」：开选档面板，点下去才真的算（2026-10-04 用户要求）；
+         · 复盘过   → 「复盘报告」：直接打开 records/<棋谱名>.review.json 里那一份（最新）。
+         两者是同一件事的两端，用一个按钮表达"现在该做哪一步"最清楚。 */
       (() => {
-        const b = mk('AI 复盘', '整盘逐手重算，出一份报告（点开会先让你选搜索量）', () => openReviewSetup(it));
-        b.classList.add('primary');
-        return b;
-      })(),
-      /* 复盘报告：打开**上一次复盘存下来的报告**（records/<棋谱名>.review.json）。
-         ★ 用户要求：没有报告时置灰点不了；新报告生成时会覆盖旧的 —— 所以这里永远是「最新那一份」。 */
-      (() => {
-        const b = mk('复盘报告',
-          it.hasReview ? '打开已存的复盘报告（最新的那一份 · 会载入这份棋谱）'
-            : '这份棋谱还没复盘过 —— 先点「AI 复盘」',
-          () => openSavedReview(it.name, it.note));
-        if (!it.hasReview) b.disabled = true;
+        const b = it.hasReview
+          ? mk('复盘报告', '打开已存的复盘报告（最新的那一份 · 会载入这份棋谱）',
+            () => openSavedReview(it.name, it.note))
+          : mk('AI 复盘', '整盘逐手重算，出一份报告（点开会先让你选搜索量）',
+            () => openReviewSetup(it));
+        /* ★ 2026-10-19 用户要求：两个标签长度不一样（「AI 复盘」中间有空格），
+           按钮就一宽一窄地跳；「复盘报告」又太扎眼。所以：
+           ① 固定最小宽度 → 两种状态一样宽；② 「复盘报告」用**白底**（不加 primary），
+           「AI 复盘」仍是主题绿（那是"该做这一步"的引导）。 */
+        b.classList.add('rec-review');
+        if (!it.hasReview) b.classList.add('primary');
         return b;
       })(),
       /* 备注：写在 SGF 的 GN 字段里，**不改文件名**。
@@ -2519,104 +3007,322 @@ initSeg('seg-handicap', v => {
 });
 initSeg('seg-komi', v => { settings.komi = +v; });
 
-/* 对局类型（AI 对弈 / 摆棋·双人）—— 2026-10-04 用户要求「新对局面板分两块」：
-   「我执」这个词只在**有 AI 的时候**才成立，摆棋/双人没有「我方」，
+/* 对局类型（AI 对弈 / 双人摆棋）—— 2026-10-04 用户要求「新对局面板分两块」：
+   「我执」这个词只在**有 AI 的时候**才成立，双人摆棋没有「我方」，
    所以那两行直接收起来（原来摆棋时还让人挑「我执」，纯属自找歧义）。
    ★ 这里直接改 settings.mode（跟面板里其它项一样是即时生效的设置），
      并把顶栏那个模式开关一起点亮，免得两处显示不一致。
-   ★ 这里**不弹**「AI 执哪一方」的确认框（那个只在从顶栏切换时才弹）——
-     面板里同屏就摆着「我执」那一行，比弹窗说得更清楚。 */
+     ⚠️ 点「取消」时会把它还原（cancelNewGame）—— 因为面板里的其它项只在点「开始」时才
+        起作用，而模式是"当前正在用的工作台"，顶栏还亮着它，不能就这么留着。 */
 initSeg('seg-ntype', v => {
   settings.mode = v;
   setSeg('seg-mode', v);
   syncNewGameRows();
 });
 
+/* 「双方都由 KATAGO 走」（2026-10-18 用户要求）—— 只在 AI 对弈里出现。
+   勾上后「我执」那一行藏起来（没有"你执哪边"这回事）；真正生效是点「开始」时
+   （applyNewGame 把它落到 state.autoBoth 上，中途不开新局也能用「接着当前局面下」）。
+   ⚠️ 取消勾选时同样要把 row-color 放回来 —— 由 syncNewGameRows 统一处理。 */
+$('chk-autoboth').onchange = e => {
+  settings.autoBoth = e.target.checked;
+  syncNewGameRows();
+};
+
 /* 按对局类型显隐面板里的行。注意 CSS 里有一条 `.mrow[hidden]{display:none}` ——
    .mrow 是 flex，不显式写就会被 display:flex 压过去（本项目踩过好几次）。 */
 function syncNewGameRows() {
   const play = settings.mode === 'play';
-  $('row-color').hidden = !play;      // 我执
+  const ts = settings.mode === 'tsumego';
+  /* 三块互斥的专用设置：
+     · 人机对弈才需要「我执 / 对手棋力 / 档位说明」
+     · 习题练习不需要「让子 / 计时 / 规则 / 贴目」——
+       让子会和"用户自己摆"打架；做题不计时；
+       死活题与规则、贴目都无关（判死活用归属，不看数子/数目、也不看贴几目），
+       留着反而让人以为"改了有用"。发给引擎的固定是中国规则 · 贴 0 目（见 TS_RULE / TS_KOMI）。 */
+  $('row-color').hidden = !play || !!settings.autoBoth;   // 我执（双方都自动时没有"我执"）
+  $('row-autoboth').hidden = !play;   // 双方都由 KATAGO 走（只有 AI 对弈有）
   $('row-level').hidden = !play;      // 对手棋力
   $('level-note').hidden = !play;     // 档位说明（跟着对手棋力走）
+  $('row-handicap').hidden = ts;
+  $('row-clock').hidden = ts;
+  $('row-rules').hidden = ts;
+  $('row-komi').hidden = ts;
+  ['row-tsplace', 'row-tsfirst', 'row-tsframe', 'row-tsaicolor'].forEach(id => {
+    const el = $(id);
+    if (el) el.hidden = !ts;
+  });
+  const fn = $('ts-frame-note');
+  if (fn) { fn.hidden = !ts; if (ts) updateFrameNote(); }
+  const rn = $('ts-role-note');
+  if (rn) { rn.hidden = !ts; if (ts) updateRoleNote(); }
+  /* ★ 「接着当前局面下」只在这三个条件都满足时出现（2026-10-14）：
+     ① 已经在下棋（有盘面或手顺），② 目标是 人机对弈 / 双人摆棋，
+     ③ **当前不是在习题练习里**（`state.tsumego` 还在 = 盘上那道题的摆子/手顺）。
+     理由：① 习题练习永远从空盘开始摆题，没有"接着"这回事；
+     ② 别把一道做完的题"接着"成人机对弈 —— 题目的摆子在 play 模式下会被当成让子局
+      （先手判据按"有没有摆子"走），轮次显示会跟手顺对不上。
+     那一项收起来时也顺手取消勾选，免得"看不见却已经勾上"。 */
+  const hasGame = !state.noGame && (state.setup.length > 0 || state.moves.length > 0);
+  const keepable = hasGame && settings.mode !== 'tsumego' && !state.tsumego;
+  $('row-keep').hidden = !keepable;
+  const kn = $('keep-note');
+  if (kn) kn.hidden = !keepable;
+  if (!keepable) $('chk-keep').checked = false;
   const hint = $('m-hint');
   if (hint) {
     hint.textContent = play
       ? '提示：学棋用「人类棋风」对手 + 让子，最容易看出「正常该往哪下」。'
-      : '提示：两边都由你下，方便接着研究变化。让 N 子＝黑方开局先摆 N 个黑子，摆完由白方先走（让子局按标准不贴目）。';
+      : ts
+        ? '提示：先摆出题目的初始局面（或导入 SGF 习题）→ 点「开始解题」。判定按「题目目标」给结论；手筋 / 对杀 / 官子这类没有统一死活的题，目标选「只看提示」。（规则与贴目在这一模式下固定为「中国规则 · 不贴目」—— 死活判定与它们无关，所以这两行先收起来了。）'
+        : '提示：两边都由你下，方便接着研究变化。让 N 子＝黑方开局先摆 N 个黑子，摆完由白方先走（让子局按标准不贴目）。';
   }
 }
 
-/* 模式切换：人机对弈 / 摆棋。切过去若正好轮到 AI，syncUI 会自动让它落子 */
-initSeg('seg-mode', v => {
-  if (state.draft) exitDraft();     // 切模式前先退出试下，免得「草稿」和「摆棋」语义打架
-  /* ★ 摆棋 → AI 对弈：**先问一句 AI 执哪一方**（用户要求，见 openTakeover）。
-     此刻 settings.mode 还是 'free' —— 用户点「取消」就等于什么都没发生；
-     但 initSeg 已经把顶栏按钮点亮了，所以要先把它还原。 */
-  if (v === 'play' && settings.mode === 'free') {
-    setSeg('seg-mode', settings.mode);
-    openTakeover();
+/* ---------------- 顶栏「对局模式」：单按钮 + 下拉菜单（2026-10-14 用户要求）----------------
+   原来并排三个按钮（人机对弈 / 双人摆棋 / 习题练习），现在合成一个：
+   **按钮上写当前模式**，点开是那三个选项。
+   ★ 选中任一项 = **打开「新对局」设置面板**并把类型预选成它（2026-10-14 用户要求的老行为）——
+     模式要等面板里点「开始」才真的切，点「取消」什么都不变（见 cancelNewGame）。
+     所以**不要**把被点的那一项点亮：菜单高亮一律跟着 `settings.mode`（真实模式）走，
+     这个唯一出口就是 `syncModeBtn()`（由 syncUI 每帧调用）。
+   ★ 菜单容器仍叫 `#seg-mode`、项仍带 `data-v` → `setSeg('seg-mode', …)`、`lit('seg-mode')`、
+     测试脚本的 `seg('seg-mode', …)` 全部照旧可用（这也是没给它改名换 id 的原因）。
+   ★ 定位照抄底栏「显示 ▾」：父级 .modepick 是 position:relative，菜单绝对定位右对齐。 */
+const MODE_TEXT = { play: '人机对弈', free: '双人摆棋', tsumego: '习题练习' };
+const MODE_MENU = $('seg-mode');
+function closeModeMenu() {
+  MODE_MENU.hidden = true;
+  $('modepick').classList.remove('open');
+}
+/* 按钮文字 + 菜单高亮：**只认 settings.mode**。放在 syncUI 里每帧调（幂等、开销可忽略）。 */
+function syncModeBtn() {
+  const el = $('mode-cur');
+  const txt = MODE_TEXT[settings.mode] || '对局模式';
+  if (el && el.textContent !== txt) el.textContent = txt;
+  setSeg('seg-mode', settings.mode);
+}
+
+$('btn-mode').onclick = e => {
+  e.stopPropagation();   // 别让下面那个「点外面关闭」在同一趟点击里又把它关掉
+  if (MODE_MENU.hidden) {
+    syncModeBtn();       // 保证高亮/文字是最新的再展开
+    MODE_MENU.hidden = false;
+    $('modepick').classList.add('open');
+  } else closeModeMenu();
+};
+MODE_MENU.querySelectorAll('button').forEach(b => {
+  b.onclick = () => { closeModeMenu(); openNewGame(b.dataset.v); };
+});
+document.addEventListener('click', e => {
+  if (!MODE_MENU.hidden && !$('modepick').contains(e.target)) closeModeMenu();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !MODE_MENU.hidden) closeModeMenu();
+});
+
+/* ---------------- （已退役）「摆棋 → AI 对弈：先问 AI 执哪一方」----------------
+   2026-10-04 用户要求加的确认弹窗；2026-10-14 用户改成"顶栏点模式按钮 = 打开新对局面板"，
+   于是它的职责被**面板里的「我执」那一行**接过去了（同屏就能看到，还不用叠两个弹窗）。
+   代码与 HTML/CSS 一并删掉，不留死代码。
+   ⚠️ 代价要说清楚：原来从「摆棋」切到「人机对弈」是**保留当前盘面**的（只是换谁执子），
+      现在走「新对局 → 开始」，会开一盘新棋。要"接着当前局面下"的需求如果回来了，
+      就在面板里加一个「保留当前盘面」的勾选，而不是把弹窗搬回来。 */
+
+/* ==================== 习题练习 · 控件接线（2026-10-12）==================== */
+
+/* 框架说明（跟着「框架 / 框架距离」实时变，写在面板下方那行小字里）。
+   为什么要有它：光一个数字框「4」看不出是"4 什么" —— 这里把它换算成"框大约多大"，
+   用户才知道该调大还是调小。 */
+function updateFrameNote() {
+  const el = $('ts-frame-note');
+  if (!el) return;
+  if (settings.tframe === 'off') {
+    el.textContent = '不加框架：引擎会在全盘找点 —— 空盘上的小题会推荐「脱先走大场」那种对做题没用的点。';
     return;
   }
-  settings.mode = v;
+  const side = 5 + settings.tdist * 2;
+  el.textContent = '框架距离 ' + settings.tdist + ' 路：框边比题目棋子最外沿多留 ' + settings.tdist
+    + ' 路。角上一道小题的棋子约占 5×5 → 框约 ' + side + '×' + side + '。';
+}
+
+/* ---- 框架 / 框距：**同一个值有两个地方能改**（「新对局」面板 + 练习卡），
+     所以显示与副作用都各自只有一个出口，免得出现"一处亮了、另一处还是旧值"。
+     ★ 为什么练习卡上也要有一份：「新对局」面板点「开始」会把题目重置 ——
+     做题中途发现框太小（想在框外落子）时，只有练习卡能当场调大。
+     框同时决定引擎的 allowMoves 范围，所以改完要重画 + 重发一次分析。 */
+const TDIST_MIN = 0, TDIST_MAX = 10;
+
+/* 值 → 显示（两处开关 + 框距数字 + 面板下方说明文字）。只拉显示，不重画、不发分析。 */
+function syncFrameUI() {
+  setSeg('seg-tframe', settings.tframe);      // 「新对局」面板
+  setSeg('seg-tsframe', settings.tframe);     // 练习卡
+  const inp = $('inp-tdist'); if (inp) inp.value = settings.tdist;
+  const txt = $('ts-dist-txt'); if (txt) txt.textContent = settings.tdist;
+  updateFrameNote();
+}
+
+/* 用户改了框架设置 → 拉齐显示，并让棋盘与引擎跟上（框变了 = allowMoves 的范围变了）。 */
+function applyFrameChange() {
+  syncFrameUI();
+  if (tsOn()) { draw(); scheduleAnalysis(120); }
+}
+
+/* 改框距（唯一的入口：面板的数字框、练习卡的两个加减按钮都走它） */
+function setFrameDist(v) {
+  const n = parseInt(v, 10);
+  settings.tdist = Math.max(TDIST_MIN, Math.min(TDIST_MAX, Number.isFinite(n) ? n : 4));
+  applyFrameChange();
+}
+
+/* KATAGO 执哪一方（'b'/'w'）—— 「新对局」面板与练习卡**两处控件写的是同一个值**，
+   所以显示只走这一个出口（跟 syncFrameUI 一个道理：分开写就会出现"一处变了另一处没变"）。
+   同时更新那行小字：光看"KATAGO 执白"看不出你是解题还是防守，得把"谁先动手"讲明白。 */
+function updateRoleNote() {
+  const el = $('ts-role-note');
+  if (!el) return;
+  const first = settings.tfirst === 'b' ? '黑先' : '白先';
+  const ai = tsAIColor() === 'b' ? '黑' : '白';
+  const mine = tsMyColor() === 'b' ? '黑' : '白';
+  el.textContent = (tsAIColor() === settings.tfirst)
+    ? 'KATAGO 执' + ai + '（' + first + '）：由它先动手，你执' + mine + '防守。'
+    : 'KATAGO 执' + ai + '，你执' + mine + '（' + first + '）：你先动手、你解题（默认）。';
+}
+
+function syncTkaicolorUI() {
+  setSeg('seg-tkaicolor', tsAIColor());   // 「新对局」面板
+  setSeg('seg-tsaicolor', tsAIColor());   // 练习卡
+  updateRoleNote();
+}
+
+/* 改了 KATAGO 的颜色（两个控件共用）：拉齐显示；我执跟着换，然后 syncUI 决定要不要让它动手。
+   中途改不会推翻已走的手顺：谁执哪方只影响"下一手该谁点"。
+   （2026-10-17：原来还要"把上一次的判定作废"，判定删了。） */
+function applyRoleChange() {
+  syncTkaicolorUI();
+  if (!tsOn() || !state.tsumego) return;
+  state.myColor = tsMyColor();
+  syncTsumegoUI();
+  draw();
   syncUI();
+}
+
+/* ---------- 先手（黑先 / 白先）----------
+   ★ 2026-10-16 用户要求：练习卡上要能一眼看到"这道题谁先走"。它是**题目的属性**
+     （同时是发给引擎的 initialPlayer），所以做成常驻行、摆题阶段也看得见、也改得了。
+   ★ 两处控件写同一个值（练习卡 + 「新对局」面板）→ 显示只有一个出口，跟框架/KATAGO 一个道理。 */
+function syncFirstUI() {
+  setSeg('seg-tsfirst', settings.tfirst);   // 练习卡（常驻行）
+  setSeg('seg-tfirst', settings.tfirst);    // 「新对局」面板
+}
+
+/* 练习卡上**当场**改先手。
+   ★ 与「新对局」面板里那个 seg-tfirst 不是一回事：面板是"改预设置、点开始才建题"，
+     这里是"当场改这道题"，所以要顺手把手顺清掉 —— 先手一变，第一手的颜色就变了，
+     旧手顺是按旧先手记的，留着会串（黑先的题改成白先，盘上第 1 手却还是黑）。
+   ★ 顺手把 KATAGO 翻到对方（与面板同一条默认语义：它执先手的对方 = 你来解题）。 */
+function applyFirstChange(v) {
+  settings.tfirst = (v === 'w' ? 'w' : 'b');
+  settings.taicolor = (settings.tfirst === 'b' ? 'w' : 'b');
+  syncFirstUI();
+  const t = state.tsumego;
+  if (!t) { syncTkaicolorUI(); return; }
+  t.nextColor = settings.tfirst;
+  state.myColor = tsMyColor();
+  state.toMove = settings.tfirst;
+  tsResetBoardState();     // 手顺不再成立（顺带 +1 局面代，在飞的应手会作废）
+  syncTsumegoUI();         // 内含 syncTkaicolorUI
+  draw();
+  syncUI();
+  flash('这道题改成' + (settings.tfirst === 'b' ? '黑先' : '白先') + '了 · 手顺已清空 · KATAGO 执'
+    + (tsAIColor() === 'b' ? '黑' : '白') + '（你来解题）');
+}
+
+/* 「新对局」面板里的四个习题设置（即时写进 settings；点「开始」时才真正建题） */
+initSeg('seg-tmode', v => { settings.tmode = v; });
+/* ★ 改「先手」时**顺手把 KATAGO 的颜色翻到对方**（2026-10-14）：
+   默认语义 = "你来解题、KATAGO 防守"。不跟着翻的话，白先的题会变成
+   "KATAGO 执白先动手、你来守" —— 跟绝大多数人的预期相反。
+   想练防守的话，把它改成先手那一方即可（面板或练习卡都行）。 */
+initSeg('seg-tfirst', v => {
+  settings.tfirst = v;
+  settings.taicolor = (v === 'b' ? 'w' : 'b');
+  syncFirstUI();
+  syncTkaicolorUI();
+});
+/* 练习卡上的先手（常驻行）。★ 走 applyFirstChange —— 当场生效，会清手顺（见它的注释）。 */
+initSeg('seg-tsfirst', v => applyFirstChange(v));
+initSeg('seg-tkaicolor', v => {
+  settings.taicolor = (v === 'b' ? 'b' : 'w');
+  applyRoleChange();
+});
+initSeg('seg-tframe', v => { settings.tframe = v; applyFrameChange(); });
+$('inp-tdist').oninput = e => setFrameDist(e.target.value);
+
+/* 练习卡上的框架 / 框距（和面板那份写的是同一对设置） */
+initSeg('seg-tsframe', v => { settings.tframe = v; applyFrameChange(); });
+$('btn-ts-dist-less').onclick = () => setFrameDist(settings.tdist - 1);
+$('btn-ts-dist-more').onclick = () => setFrameDist(settings.tdist + 1);
+
+/* 练习卡上的 KATAGO 执哪一方（和面板那份写的是同一个值） */
+initSeg('seg-tsaicolor', v => {
+  settings.taicolor = (v === 'b' ? 'b' : 'w');
+  applyRoleChange();
 });
 
-/* ---------------- 摆棋 → AI 对弈：先确认「AI 执哪一方」（2026-10-04 用户要求） ----------------
-   为什么必须问：摆棋模式下**两边都是用户在摆**，「我方」在切换那一刻没有定义 ——
-   不问就只能沿用上次开新局时设的 myColor（界面上看不见），而且一切过去
-   如果正好轮到那一方，AI 会立刻自己落一手，人完全没准备。 */
-const TK_MASK = $('takeover');
-let tkAI = 'w';          // 弹窗里选的「AI 执哪一方」
-
-/* 弹窗里那行动态说明 —— 关键是把「点确定之后会发生什么」讲清楚：
-   会不会 AI 立刻走一手 / 还是轮到你走。 */
-function syncTakeoverNote() {
-  const side = sideToMove(state.viewAt);
-  const aiCol = tkAI === 'b' ? '黑' : '白';
-  const myCol = tkAI === 'b' ? '白' : '黑';
-  $('tk-note').textContent = '摆棋时两边都是你在摆，切换后由 AI 接手一方。'
-    + (side === tkAI
-      ? 'AI 执' + aiCol + '，正好轮到它 —— 点确定它会立刻走一手；你执' + myCol + '。'
-      : 'AI 执' + aiCol + '，你执' + myCol + ' —— 点确定后轮到你走。');
-}
-
-function openTakeover() {
-  const side = sideToMove(state.viewAt);
-  $('tk-turn').textContent = '当前轮到 ' + (side === 'b' ? '黑' : '白') + ' 落子';
-  /* 默认：AI 执「你现在的对方」—— 也就是沿用原设置不动，最少意外
-     （想换成「让 AI 接着下当前这一手」，点另一边即可）。 */
-  tkAI = state.myColor === 'b' ? 'w' : 'b';
-  setSeg('seg-tk-color', tkAI);
-  syncTakeoverNote();
-  TK_MASK.classList.add('open');
-}
-
-function cancelTakeover() {
-  TK_MASK.classList.remove('open');
-  setSeg('seg-mode', settings.mode);    // 顶栏开关还原到「摆棋」（它已经被点亮了）
-}
-
-$('tk-cancel').onclick = cancelTakeover;
-TK_MASK.addEventListener('click', e => { if (e.target === TK_MASK) cancelTakeover(); });
-initSeg('seg-tk-color', v => {
-  tkAI = v;
-  if (TK_MASK.classList.contains('open')) syncTakeoverNote();
+/* 练习卡 · 摆题阶段：落子工具（黑 / 白 / 擦） */
+initSeg('seg-tscolor', v => {
+  if (!state.tsumego) return;
+  state.tsumego.placeTool = v;
+  syncTsumegoUI();
 });
 
-$('tk-ok').onclick = () => {
-  TK_MASK.classList.remove('open');
-  settings.mode = 'play';
-  /* ★ 顶栏那个开关也要点亮到「人机对弈」——
-     不然设置切过去了、按钮还停在「摆棋」上，两处显示打架
-     （用户 2026-10-04 报的就是这个：从摆棋切过来后「人机对弈」没亮）。 */
-  setSeg('seg-mode', 'play');
-  /* 「AI 执 X」→ 我执另一方。settings.color 一并定下来（原来是「随机」也变成确定的），
-     否则下次开新局又会随掉。 */
-  const mine = tkAI === 'b' ? 'w' : 'b';
-  settings.color = mine;
-  state.myColor = mine;
-  syncUI();       // 若正好轮到 AI，这里就会让它接手落子
+/* 练习卡 · 解题阶段：对手（按正解 / KATAGO / 我下两边）。
+   ★ 切完主动 syncUI 一次 —— 若此刻正好轮到对方，对手会立刻应一手。 */
+initSeg('seg-tsdefend', v => {
+  if (!state.tsumego) return;
+  state.tsumego.defend = v;
+  syncTsumegoUI();
+  syncUI();
+  flash(v === 'solution'
+    ? '按正解：对手照题集的正解应对（不脱先）；你走偏了会自动改用 KATAGO'
+    : v === 'ai'
+      ? 'KATAGO：对手由强引擎走，只在题目附近（离棋子 2 路内）找点'
+      : '我下两边：黑白交替、两边都由你走（自己推演变化）');
+});
+
+$('btn-ts-start').onclick = () => tsStartSolve();
+$('btn-ts-back').onclick = () => tsBackToSetup();
+$('btn-ts-clear').onclick = () => tsClearSetup();
+$('btn-ts-reset').onclick = () => tsResetSolve();
+$('btn-ts-answer').onclick = () => tsToggleAnswer();
+
+/* ==================== 习题题集 · 控件接线（2026-10-14）==================== */
+/* 弹窗遮罩。⚠️ 这个 const 必须在使用它的那些函数**被调用之前**初始化 ——
+   函数声明会提升，但 const 不会（TDZ）。这里在模块顶层、且调用都来自用户点击，
+   所以安全。 */
+const PUZ_MASK = $('puzzles');
+
+$('btn-pset').onclick = () => openPuzzles();
+$('btn-ts-prev').onclick = () => tsGotoProblem(-1);
+$('btn-ts-next').onclick = () => tsGotoProblem(1);
+$('puz-close').onclick = () => PUZ_MASK.classList.remove('open');
+PUZ_MASK.addEventListener('click', e => { if (e.target === PUZ_MASK) PUZ_MASK.classList.remove('open'); });
+$('puz-open-dir').onclick = () => window.api.puzzles.openDir();
+$('puz-import').onclick = async () => {
+  const btn = $('puz-import');
+  btn.disabled = true; btn.textContent = '导入中…';
+  try {
+    const r = await window.api.puzzles.import();
+    if (!r || r.canceled) return;
+    if (r.error) { flash('导入失败：' + r.error); return; }
+    flash('已导入题集「' + String(r.name).replace(/\.sgf$/i, '') + '」');
+    await refreshPuzzles();
+    await openPuzzleSet(r.name);          // 导入完直接开始练第 1 题
+    PUZ_MASK.classList.remove('open');
+  } finally {
+    btn.disabled = false; btn.textContent = '导入题集…';
+  }
 };
 
 /* 走势图纵轴切换：黑方胜率（%）/ 黑方领先目数。两者视角都是**黑方**，只是量纲不同。 */
@@ -2750,45 +3456,131 @@ function refreshVisitsNote() {
 $('m-visits').onchange = e => applyVisits(e.target.value);
 $('sel-visits').onchange = e => applyVisits(e.target.value);
 
-function openNewGame() {
+/* 打开「新对局」设置面板。
+   · 默认（顶栏「新对局」按钮 / 未开局时棋盘中央那个按钮）：对局类型 = 当前模式
+   · ★ 传了 type（2026-10-14 起，顶栏那个对局模式下拉走这条）：把这个类型预选上
+   ⚠️ 打开时会先把 settings.mode 改成预选的那个类型 —— 面板里所有"按类型显隐"的行
+     都读它（本项目「面板选项即时生效」的一贯做法）。但**点取消要还回去**，
+     否则顶栏会亮着一个其实没生效的模式（见 cancelNewGame）。 */
+let ngPrevMode = null;
+
+function openNewGame(type) {
+  /* ★ 只在**面板原本是关着**的时候记"上一个模式"（2026-10-14）。
+     为什么：settings.mode 在面板开着时可能是**还没应用**的预选值（面板选项即时生效），
+     拿它当"上一个模式"，取消之后就会还原成一个同样没生效的值。
+     （顶栏那三个按钮点起来本来就在遮罩后面，正常点不到；但代码要经得起） */
+  if (!$('newgame').classList.contains('open')) ngPrevMode = settings.mode;
+  const t = (type === 'play' || type === 'free' || type === 'tsumego') ? type : settings.mode;
+  settings.mode = t;
+  setSeg('seg-mode', t);                // 顶栏跟着亮，免得两处显示打架
   $('m-rules').value = settings.rules;
   setLevel(settings.level);
   setSeg('seg-color', settings.color);
   setSeg('seg-size', settings.size);
   setSeg('seg-handicap', settings.handicap);
   setSeg('seg-komi', settings.komi);
-  setSeg('seg-ntype', settings.mode);   // 对局类型跟着当前的模式走
+  setSeg('seg-ntype', t);               // 对局类型（顶栏点进来的就是它）
   $('m-clock').value = settings.clock;
+  /* ★ 习题练习的四个设置也要同步到面板（值来自 settings，用户上次选过的保留） */
+  setSeg('seg-tmode', settings.tmode);
+  setSeg('seg-tfirst', settings.tfirst);
+  syncFrameUI();                         // 框架 / 框距（面板 + 练习卡两处一起拉齐）
+  syncTkaicolorUI();                     // KATAGO 执哪一方（两处 + 说明文字）
+  $('chk-keep').checked = false;         // 「接着当前局面下」每次都从**不勾**开始（要显式选）
+  $('chk-autoboth').checked = !!settings.autoBoth;   // 「双方都由 KATAGO 走」：保留上次的选择
   fillVisitSelect();                     // 搜索量下拉（值同步 + 说明文字）
   syncRulesUI(settings.rules, false);   // 只做禁用联动，不覆盖用户选过的贴目
-  syncNewGameRows();                     // 按类型显隐「我执」「对手棋力」
+  syncNewGameRows();                     // 按类型显隐各行
   $('newgame').classList.add('open');
 }
 
-$('btn-new').onclick = openNewGame;
-$('btn-gate-new').onclick = openNewGame;   // ★ 未开局时棋盘中央那个大按钮（同一入口）
+/* 关掉面板而**不**应用：把模式还原成打开之前那一个。
+   为什么只有 mode 要还原：面板里其它选项（我执 / 规则 / 棋盘…）虽然也是即时写进 settings，
+   但它们**只在点「开始」时才起作用**；而模式不一样 —— 它是"当前正在用的工作台"，
+   顶栏还亮着它、右栏双方名字也跟着变。不还原就会出现
+   "顶栏写着习题练习、其实还在下棋"这种自相矛盾的状态。 */
+function cancelNewGame() {
+  $('newgame').classList.remove('open');
+  if (ngPrevMode && ngPrevMode !== settings.mode) {
+    settings.mode = ngPrevMode;
+    setSeg('seg-mode', ngPrevMode);
+    setSeg('seg-ntype', ngPrevMode);
+    syncNewGameRows();
+    syncUI();                            // 右栏名字 / 状态栏跟着回原样
+  }
+  ngPrevMode = null;
+}
+
+$('btn-new').onclick = () => openNewGame();       // ⚠️ 不能直接挂 openNewGame：
+$('btn-gate-new').onclick = () => openNewGame();  //    那样第一个参数会收到 Event 对象
 /* 引擎没起来时，中央那条提示里的「去设置」（openSettings 是函数声明，会提升） */
 $('gate-setup').onclick = () => openSettings();
-$('m-cancel').onclick = () => $('newgame').classList.remove('open');
-$('newgame').onclick = e => { if (e.target === $('newgame')) $('newgame').classList.remove('open'); };
+$('m-cancel').onclick = cancelNewGame;
+$('newgame').onclick = e => { if (e.target === $('newgame')) cancelNewGame(); };
 
 $('m-start').onclick = () => {
   settings.rules = $('m-rules').value;
   setLevel($('m-level').value);
   settings.clock = $('m-clock').value;
+  /* ★ 习题练习的专用设置（面板上那几行）—— 只在这里读一次，之后由练习卡改 */
+  settings.tmode = ($('seg-tmode').querySelector('.on') || { dataset: {} }).dataset.v || settings.tmode;
+  settings.tfirst = ($('seg-tfirst').querySelector('.on') || { dataset: {} }).dataset.v || settings.tfirst;
+  settings.tframe = ($('seg-tframe').querySelector('.on') || { dataset: {} }).dataset.v || settings.tframe;
+  const dv = parseInt($('inp-tdist').value, 10);
+  settings.tdist = Number.isFinite(dv) ? Math.max(0, Math.min(10, dv)) : 4;
+  /* （2026-10-17：原来这里还读一档「题目目标」sel-tgoal —— 随判定/提示一起删了） */
   /* 类型以面板上亮着的那一个为准（点它时已经改过 settings.mode，这里再对齐一次） */
   const nt = $('seg-ntype').querySelector('.on');
   if (nt) settings.mode = nt.dataset.v;
-  applyNewGame();
+  /* ★ 「接着当前局面下」：勾了 + 这一项确实适用（面板正显示着它）→ 保留盘面只换模式 */
+  const keep = $('chk-keep').checked && !$('row-keep').hidden;
+  ngPrevMode = null;                   // 已应用 → 不再是"待还原"的状态
   $('newgame').classList.remove('open');
+  /* ★ 习题练习有自己的开局路径（空盘 + 摆题阶段），**不能走 applyNewGame** ——
+     applyNewGame 是"开一局棋"，会按让子 / 座子填 state.setup，和"用户自己摆题"冲突。
+     它也永远从空盘开始，所以「接着当前局面下」在它这里不适用（那一项也会收起来）。 */
+  if (settings.mode === 'tsumego') { enterTsumego(); return; }
+  if (keep) { continueCurrentGame(); return; }
+  applyNewGame();
 };
+
+/* 「接着当前局面下」——保留盘面与手顺，只把模式换掉（2026-10-14 用户要求）。
+   这件事实质上就是原来那个「摆棋 → AI 对弈：先问 AI 执哪一方」弹窗在做的事：
+   顶栏改成"打开设置面板"之后，那个能力得在这里补回来。
+   · 盘面 / 手顺 / 历史 / 已算出的分析**一概不动**（所以不走 applyNewGame）
+   · 我执按面板上的 settings.color 定下来（含「随机」），人机对弈下另一半就是 AI
+   · 换完 syncUI：若正好轮到 AI，它会立刻接手落子 —— 这正是"接着下"的意思
+   · 棋盘 / 让子 / 贴目 这几项**不生效**（局面保持原样），面板上那行小字写了 */
+function continueCurrentGame() {
+  if (state.tsumego) exitTsumego();      // 从习题练习切过来：练习状态要收掉
+  if (settings.mode === 'play') {
+    const c = settings.color === 'r' ? (Math.random() < 0.5 ? 'b' : 'w') : settings.color;
+    settings.color = c;                  // 「随机」也定下来，免得下次开新局又随掉
+    state.myColor = c;
+  }
+  /* ★ 双方都由 KATAGO 走：接着下也能用（继续当前局面 → 两边都交给它） */
+  state.autoBoth = settings.mode === 'play' && !!settings.autoBoth;
+  state.autoPaused = false;
+  setSeg('seg-mode', settings.mode);
+  syncUI();
+  flash('接着当前局面下 · ' + (settings.mode === 'play' ? '人机对弈' : '双人摆棋')
+    + (state.autoBoth ? ' · 双方都由 KATAGO 走' : ''));
+}
 
 /* idle = true → 只把界面摆成「未开局」的中性样子（**软件启动时**用，见文件末尾的启动段）。
    点「新对局 → 开始」时不传这个参数，等于真的开一局。 */
 function applyNewGame(idle) {
+  /* ★ 从习题练习切到别的模式时**必须收掉练习状态**（2026-10-14 补）。
+     原来这条逻辑在顶栏的模式开关里（`if (tsOn()) exitTsumego()`）——
+     顶栏改成"打开新对局面板"之后，切模式走的是 `m-start → applyNewGame`，
+     于是 state.tsumego 会**留在那儿**：卡片虽然藏了（tsOn() 为假），
+     但下次进习题练习时那是个旧对象，而且 `defaultName` 之类的判断会读到它。
+     实测就是这么漏的：切到摆棋之后 `state.tsumego` 还在。 */
+  if (state.tsumego) exitTsumego();
   N = settings.size;
   state.fromRecord = false;     // 新开的局不是打谱
   state.sgfComments = [];       // 新开局没有「棋谱自带的解说词」
+  state.varRoot = null;         // 新开局没有变化树（分支来自棋谱）
   state.rootComment = '';       // 也没有「棋谱说明」（那是某份棋谱根节点上的文字）
   state.quizTips = [];           // 也不是题集，没有「第几题」
   state.recName = '';           // ★ 也不是某份棋谱了 —— 讲解没有存放处（全盘讲解按钮会收起）
@@ -2825,6 +3617,10 @@ function applyNewGame(idle) {
   state.pv = null;                 // 新对局：收掉变化图
   state.names = { b: '', w: '' };  // 新对局：名字回到默认（人机 PLAYER/KATAGO、摆棋 PLAYER1/2）
   state.noGame = !!idle;           // ★ 启动时停在「未开局」；「新对局 → 开始」时解除
+  state.anaAt = {};                // ★ 逐手分析快照（「解说词」卡用）—— 新局从零开始
+  /* ★ 双方都由 KATAGO 走（只有 AI 对弈模式有意义；启动时的"未开局"一律不算） */
+  state.autoBoth = !idle && settings.mode === 'play' && !!settings.autoBoth;
+  state.autoPaused = false;
   hover = null;
 
   if (settings.color === 'r') state.myColor = Math.random() < 0.5 ? 'b' : 'w';
@@ -2834,6 +3630,1091 @@ function applyNewGame(idle) {
   clockReset();          // 计时按新设置重置（不限时则隐藏计时面板）
   resize();
   syncUI();
+  /* 自我对弈开了就明说一声 —— 否则用户会以为"我怎么下不了棋" */
+  if (state.autoBoth) flash('双方都由 KATAGO 走 · 底栏「暂停」可以随时停住');
+}
+
+/* ==================== 习题练习（tsumego，2026-10-12）====================
+
+   要解决什么：拿一道题（死活 / 手筋 / 对杀 / 中盘 / 官子）反复练，做完能知道对不对。
+
+   ★ 和「摆棋」最根本的区别是**两阶段**：
+     ① 摆题阶段：落子进 `state.setup`（初始局面），**不进 `state.moves`**。
+        为什么必须这样：题的第一手要当「第 1 手」用 —— 手数、分析请求的 initialStones、
+        复盘、讲解全靠这个区分。摆进 moves 的话初始局面会变成"前 N 手棋"，
+        手数列表、胜率曲线、判定全都错位。
+     ② 解题阶段：落子进 `state.moves`，`state.toMove` 从「先手」起。
+        `state.setup` 全程不动（就是这道题的初始局面）。
+
+   ★ KATAGO 走「分析引擎」（强权重）而不是人机对弈那套段位引擎。理由：
+     死活题的正解是以「对方最强应对」为前提的；拿"模仿业余 3 段"的模型去防守，
+     它自己会应错，会把用户的错着放过去，判定就不成立了。
+
+   ★ 死活框架：自动框住题目棋子 + 外扩「框距」路。它同时干两件事 ——
+     视觉上圈出局部；计算上通过 allowMoves 把引擎锁在框内（否则空棋盘上的小题，
+     引擎会推荐"脱先走大场"这种对做题毫无意义的点）。
+*/
+
+/* 建一份习题状态。字段含义：
+     phase    'setup' 摆题 / 'solve' 解题
+     placeTool 摆题阶段的落子工具：'b' | 'w' | 'erase'（只在自由摆棋下用）
+     nextColor 交替摆棋用：下一子该谁
+     defend   'ai' = KATAGO 应手（强引擎）/ 'both' = 我下两边（两边都由你走）
+     source   来自哪份棋谱（导入习题时记下；手摆的是空串）
+   （2026-10-17：hint / target / judge / lastGoal / targetManual 随「提示 / 判定 / 题目目标」一起删了） */
+function makeTsumego() {
+  return {
+    phase: 'setup', placeTool: 'b', nextColor: 'b',
+    defend: 'ai', source: '',
+    /* 正在展示「参考答案」（把题集里写着的正解摆出来）。
+       ★ 它为 true 时：不许落子、KATAGO 不许应手（否则会把答案后面接下去走），
+         「重来 / 重摆」会把它清掉。见 tsToggleAnswer。 */
+    showAnswer: false,
+    /* KATAGO 上次是**为什么**没应子（「被掐断，重试中」/ 引擎原话 / 停一手）。
+       ★ 为什么留这个字段：第一版把失败吞在空 catch 里，端到端测试只看到
+         「AI 一声不吭」，完全查不出原因。诊断信息要留得住。 */
+    defendNote: '',
+  };
+}
+
+/* ⚠️ 必须**同时**判 settings.mode 和 state.tsumego：
+   「新对局」面板里点一下「习题练习」就会立刻把 settings.mode 改成 'tsumego'
+   （那是本项目"面板选项即时生效"的一贯做法），但这时候还没建题 ——
+   用户点了「取消」时 state.tsumego 仍是 null。只判 mode 的话，整个应用会以为
+   自己在习题模式里、到处走习题的分支，而 state.tsumego 是空的 → 必崩或行为诡异。 */
+const tsOn = () => settings.mode === 'tsumego' && !!state.tsumego;
+const tsPhase = () => (state.tsumego ? state.tsumego.phase : null);
+
+/* 框架矩形：**题目的初始棋子**（state.setup）的外接矩形，四边各外扩 settings.tdist 路，
+   clamp 到棋盘内。没有任何摆子 → null（框不起来，也正好对上「引擎也没东西可约束」）。
+
+   ★★ 只看 state.setup，**绝不看 state.moves**（2026-10-12 用户报错后改）。
+   原来把 state.moves 也算进去，后果是：解题时你每落一子，框就跟着往外长一格 ——
+   一手走出棋子外接矩形的边，框就"长大"一块，越下越大，看着像框在飘。
+   而且这不是纯视觉问题：框同时是 allowMoves 的范围，框一变、
+   发给引擎的约束也跟着变 —— 同一道题，框应该在解题开始那一刻就定死。
+   只看 setup 就自然满足：摆题阶段框跟着你摆的子走（那时 moves 本来就是空的），
+   一旦进了解题阶段 setup 不再变 → 框彻底固定。 */
+function frameRect() {
+  if (!tsOn() || settings.tframe === 'off') return null;
+  let x0 = N, y0 = N, x1 = -1, y1 = -1;
+  for (const s of state.setup) {
+    if (s.x < x0) x0 = s.x; if (s.x > x1) x1 = s.x;
+    if (s.y < y0) y0 = s.y; if (s.y > y1) y1 = s.y;
+  }
+  if (x1 < 0) return null;
+  const d = Math.max(0, Math.min(10, parseInt(settings.tdist, 10) || 0));
+  return {
+    x0: Math.max(0, x0 - d), y0: Math.max(0, y0 - d),
+    x1: Math.min(N - 1, x1 + d), y1: Math.min(N - 1, y1 + d),
+  };
+}
+
+/* ★★ 「贴题半径」（2026-10-17）：引擎找点时**只允许落在离最近棋子 ≤ 2 路的空点**上。
+   来龙去脉（实测数据见 daily log 2026-10-17）：原来 allowMoves 只给「整个框」，
+   框距默认 4、框里 100~195 个点，大半离战斗 4~6 路。而死活题的胜率几乎是常数
+   （黑已大优 → 99.9%），引擎没有"必须应"的动机，就在框内随手挑个大场 —— 这就是
+   用户看到的"KATAGO 老脱先 / 落在框边"。实测《玄玄棋经》前 24 题：
+     · 整框：首选距最近棋子 >2 路的占 25~33%（另一次跑 33%，引擎有随机性）
+     · 收成 2 路：**0%**，与 SGF 正解应手的吻合率不变（42%）
+     · 把框距从 4 调到 2：仍是 29% —— **调框距治不了**（框的角落照样离棋子 4~5 路）
+   ⚠️ 这只影响**引擎**（allowMoves / 候选过滤）；人的落子范围仍由框架管。 */
+const TS_BAND = 2;
+
+/* 「离棋子 ≤ maxD 路」的空点集合（按当前局面：摆子 + 手顺到 state.moves.length）。
+   19×19 只有 361 点，直接对每颗棋子做一次切比雪夫膨胀，够快也够直白。 */
+function bandNear(maxD) {
+  const b = boardAt(state.moves.length);
+  const set = new Set();
+  for (let i = 0; i < N * N; i++) {
+    if (!b[i]) continue;
+    const sx = i % N, sy = Math.floor(i / N);
+    for (let y = Math.max(0, sy - maxD); y <= Math.min(N - 1, sy + maxD); y++)
+      for (let x = Math.max(0, sx - maxD); x <= Math.min(N - 1, sx + maxD); x++)
+        if (!b[idx(x, y)]) set.add(y * N + x);      // 已有子的点不算（引擎也不会往那儿走）
+  }
+  return set;
+}
+
+/* 框内 ∩ 贴题半径。带太窄时（盘上只有一两颗子、或题目本身很空）依次放宽到 3 路、
+   最后退回整框 —— 宁可给引擎一点余地，也不能让它无点可选（无点 = 应手直接失败）。 */
+function bandPointsInFrame(fr) {
+  const all = [];
+  for (let y = fr.y0; y <= fr.y1; y++)
+    for (let x = fr.x0; x <= fr.x1; x++) all.push([x, y]);
+  for (const d of [TS_BAND, TS_BAND + 1]) {
+    const set = bandNear(d);
+    const pts = all.filter(([x, y]) => set.has(y * N + x));
+    if (pts.length >= 20) return pts;
+  }
+  return all;
+}
+
+/* 候选过滤（方案 3 的兜底）：只留贴题的候选，pass 永远留着（该收束时允许停一手）。
+   正常情况用不上 —— 请求里已经把搜索限在带内了。留这一层是因为 allowMoves 是引擎标注
+   「experimental」的字段，而且带太窄时我们会退回整框：万一引擎给了远处大场，
+   这一层保证"不会当真落下去"。返回空数组时调用方要保留原列表（别把候选清空）。 */
+function filterLocalMoves(infos, maxD) {
+  const set = bandNear(maxD);
+  return infos.filter(m => {
+    const s = String(m.move || '');
+    if (!s || s.toLowerCase() === 'pass') return true;
+    const p = fromGTP(s);
+    return !!p && set.has(p.y * N + p.x);
+  });
+}
+
+/* 发分析请求时要额外带的两个字段（习题专用）。**每个分析请求都要带上** ——
+   漏了 initialPlayer 引擎会自己猜先手（纯黑子判白先），漏了 allowMoves 就会推荐脱先。 */
+function tsAnalyzeExtras() {
+  if (!tsOn()) return {};
+  const extra = {};
+  /* ★ 规则与贴目**一律用固定值**（2026-10-14）：死活题与它们无关，面板里那两行也藏了。
+     放在这里覆盖，是因为三个请求点（常规分析 / KATAGO 应手 / 判定）都是
+     `Object.assign({...}, req, tsAnalyzeExtras())` —— 附加项在**最后**，能盖掉 req 里的值，
+     而 settings.rules / settings.komi 本身不动（退出习题模式后还是用户原来那套）。 */
+  extra.rules = TS_RULE;
+  extra.komi = TS_KOMI;
+  /* moves 为空时先手只能靠它告诉引擎。有 moves 时不必传（引擎从第一手的颜色就知道）。 */
+  if (!state.moves.length) extra.initialPlayer = (state.toMove === 'b') ? 'B' : 'W';
+  const fr = frameRect();
+  if (fr) {
+    /* ★ 2026-10-17：从「整框」收成「框内 ∩ 离棋子 2 路内」—— 治"脱先"的关键一层。
+       详见 TS_BAND 顶上那段实测数据。 */
+    const pts = bandPointsInFrame(fr).map(([x, y]) => toGTP(x, y));
+    extra.allowMoves = [
+      { player: 'B', moves: pts, untilDepth: 1000 },
+      { player: 'W', moves: pts, untilDepth: 1000 },
+    ];
+  }
+  return extra;
+}
+
+/* ★ 「局面代」：每次进入/重置局面就 +1（进入练习、开始解题、重来、重摆、清空都算）。
+   为什么需要它 —— **实测踩到过**（2026-10-12）：AI 应手的请求要算几秒，
+   这期间用户按了「重来」，请求回来时把应手落在**已经清空的盘**上，成了第 1 手：
+   盘上凭空多一手、双方轮次错乱，看着像"AI 乱下"，而且不报任何错。
+   光比手数不够（悔棋会把手数变回去），所以要一个只增不减的记号。
+   ⚠️ 声明必须放在**调用点之前**（tsResetBoardState 从这里往下就会调它），
+      否则模块加载阶段若直接进习题模式会踩 `let` 的暂时性死区。 */
+let defendSeq = 0;
+/* 局面重置的唯一出口（凡是"手顺/摆子被改掉"的地方都调它）。 */
+function tsBumpSeq() { defendSeq++; }
+
+/* 清掉"跟着手顺走"的那一堆状态。换阶段 / 重来 / 重摆都走它，避免各处漏清。 */
+function tsResetBoardState() {
+  /* ★ 局面被重置 → 让**在飞的防守请求**作废（它算的是别的局面，回来会乱插一手）。 */
+  tsBumpSeq();
+  state.moves = [];
+  state.candidates = []; state.candAt = -1;
+  state.ownership = null; state.ownAt = -1;
+  state.history = []; state.leads = []; state.histVisits = [];
+  resetAnalysisState();
+  state.viewAt = 0;
+  state.thinking = false;
+  state.koPoint = null;
+  state.draft = null;
+  state.result = null;
+  state.lastEval = null;
+  state.review = null;
+  state.pv = null;
+  hover = null;
+}
+
+/* 进入习题练习（空盘、摆题阶段）。顶栏开关与「新对局 → 开始」都走这条。 */
+function enterTsumego() {
+  settings.mode = 'tsumego';
+  state.tsumego = makeTsumego();
+  state.tsumego.nextColor = settings.tfirst;
+  /* ★ 清掉上一个模式残留的定时器（2026-10-12 加的保险）。
+     来龙去脉要说清楚：跑端到端测试时出现过**一次没复现的**异常
+     （`reading 'phase'`，界面停在了人机对弈、盘上却有一手棋）——
+     根因没查到，但"换模式时旧定时器还在跑"是一个合理嫌疑：
+     `scheduleAIMove` / `scheduleDefendMove` 都是 setTimeout，
+     排上之后如果模式被切走，回调醒来仍会按旧模式的状态去落子 / 改 state。
+     清掉是零成本的，先堵上这一条。 */
+  clearTimeout(aiTimer); aiTimer = null;
+  clearTimeout(defendTimer); defendTimer = null;
+  N = settings.size;
+  state.fromRecord = false;     // 不是打谱
+  state.varRoot = null;         // 习题的"题集变体"走自己的 tree，别把上一份棋谱的分支带进来
+  state.sgfComments = [];
+  state.rootComment = '';
+  state.quizTips = [];
+  state.recName = '';           // 不是某份棋谱 → 没地方存全盘讲解（按钮会收起）
+  clearCoachPanels();
+  state.setup = [];             // 空盘开始摆题
+  state.myColor = tsMyColor();   // 你执 KATAGO 的另一方（见 settings.taicolor）
+  state.toMove = settings.tfirst;
+  state.names = { b: '', w: '' };
+  tsResetBoardState();
+  state.noGame = false;         // 进练习就是「有内容了」
+  setSeg('seg-mode', 'tsumego');
+  clockReset();
+  resize();
+  syncTsumegoUI();
+  syncUI();
+  /* ★ 有题集打开时：接着**上次那道题**载入（而不是空盘）。
+     为什么：切去人机对弈下两盘再切回来，练习册不该翻回第一页、更不该变成空盘。
+     （openPuzzleSet 会先把自己的 tsumegoSet 清掉再调这里，所以不会串到上一份题集。） */
+  if (tsSet() && tsSet().list.length) tsLoadProblem(tsSet().idx);
+  /* ★ 这里**故意不发 flash**（2026-10-12 用户要求）。
+     flash 写的是顶栏「帮助」右边那个状态栏，会挂 1.8 秒 ——
+     进个模式就弹一段说明，属于打扰。该怎么操作，左栏练习卡上已经写着，
+     不必再往状态栏塞一遍。（状态栏留给"动作反馈"：开始解题 / 重来 / 判定结果这类。） */
+}
+
+/* 离开习题练习（切到别的模式时调）。 */
+function exitTsumego() {
+  /* 把还没跑的防守定时器掐掉 —— 否则切走之后它醒来还会照旧模式去落子（见 enterTsumego 的注释） */
+  clearTimeout(defendTimer); defendTimer = null;
+  defendBusy = false;
+  state.tsumego = null;
+  syncTsumegoUI();
+}
+
+/* ==================== 习题题集（2026-10-14，「导入 SGF 习题」）====================
+
+   先把一件事说清：**题集 ≠ 棋谱**。
+     · 棋谱：一个文件 = 一局棋（有手数、能复盘、能逐手讲解）。
+     · 题集：一个文件里往往**并列串着几百道题**（实测用户那份《玄玄棋经》
+       xxqj.sgf 就是 347 棵顶层树串在一起），一道题一棵树。
+   所以题集单独一个目录（`puzzles/`，见 main.js），不混进棋谱库 ——
+   一份 347 题的 SGF 放进棋谱库，列表会把它当成"一局棋"，手数和复盘按钮全是错的。
+
+   每道题从 SGF 里取三样东西（见 parseProblemSet）：
+     初始局面（AB/AW 摆子）、先手（PL）、正解（主变化 = 做者写进去的答案）。
+   ★ 判定**不看** SGF 里的正解 —— 仍然让 KATAGO 算死活（那是客观结论）。
+     SGF 的正解只喂给「正解」按钮（手动按才摆出来）。两条路互不依赖，
+     所以题集里没写正解也不影响判定；反过来手摆的题没有正解也不影响判定。 */
+
+const tsSet = () => state.tsumegoSet;
+
+/* ---------- 题集进度：记住每份题集"练到第几题"（2026-10-16 用户要求）----------
+   ★ 为什么需要：用户那份《玄玄棋经》有 347 道题。练到第 100 题时切去下盘棋、
+     再打开这份题集又回到第 1 题 —— 想接着练得按 99 次 ‹。
+   ★ 为什么存 localStorage 而不是岔进 puzzles/ 或 settings.json：
+     这是**本机、本用户的界面进度**，跟题集文件本身无关（题集可能是从别人那儿
+     拷来的、也可能是只读的）；项目里已有同样的先例（「显示」菜单那几项就存在
+     localStorage，见 rapacego.showHints）。存在不下也不影响功能，只是不记进度。 */
+const PSET_PROG_KEY = 'rapacego.pset.progress';
+
+function psetProgAll() {
+  try {
+    const o = JSON.parse(localStorage.getItem(PSET_PROG_KEY) || '{}');
+    return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+  } catch (e) { return {}; }
+}
+function psetProgWrite(all) {
+  try { localStorage.setItem(PSET_PROG_KEY, JSON.stringify(all)); } catch (e) { /* 记不住也能用 */ }
+}
+/* 这份题集上次练到第几题（0 起；没记过或值不合法 → 0）。也接受"带不带 .sgf"两种写法。 */
+function psetProgGet(name) {
+  const all = psetProgAll();
+  const v = (name in all) ? all[name] : all[String(name).replace(/\.sgf$/i, '')];
+  return (typeof v === 'number' && Number.isFinite(v) && v >= 0) ? (v | 0) : 0;
+}
+function psetProgSet(name, idx) {
+  if (!name) return;
+  const all = psetProgAll();
+  if (all[name] === (idx | 0)) return;              // 没变就不用写
+  all[name] = idx | 0;
+  psetProgWrite(all);
+}
+/* 题集改名 / 删除 → 进度跟着走（不然进度会认不出改过名的那一份） */
+function psetProgRename(oldName, newName) {
+  const all = psetProgAll();
+  if (!(oldName in all)) return;
+  all[newName] = all[oldName];
+  delete all[oldName];
+  psetProgWrite(all);
+}
+function psetProgDrop(name) {
+  const all = psetProgAll();
+  if (!(name in all)) return;
+  delete all[name];
+  psetProgWrite(all);
+}
+/* 当前这道题（题集里那一项）；手摆的题 → null */
+function tsSetProblem() {
+  const s = tsSet();
+  return (s && s.list && s.list[s.idx]) ? s.list[s.idx] : null;
+}
+
+/* 载入题集里的第 i 道题（0 起）。成功返回 true。 */
+function tsLoadProblem(i, why) {
+  const s = tsSet();
+  const t = state.tsumego;
+  if (!s || !s.list.length || !t) return false;
+  const n = s.list.length;
+  const idx = Math.max(0, Math.min(n - 1, i | 0));
+  s.idx = idx;
+  const p = s.list[idx];
+
+  /* 尺寸：题集里可能混着小盘题（9/13 路）。settings.size 也跟着切 ——
+     不切的话退出习题模式后开新局会用错尺寸（新对局面板读的就是这个值）。 */
+  if (p.size && p.size !== N) {
+    settings.size = p.size;
+    N = p.size;
+    if (p.size !== 19 && settings.handicap) settings.handicap = 0;   // 让子只对 19 路有意义
+  }
+
+  state.setup = p.setup.map(x => ({ x: x.x, y: x.y, color: x.color }));
+  /* 先手是**题目的属性**，逐题不同 → 必须写进 settings（它同时也是发给引擎的 initialPlayer）。
+     ★ 谁坐哪边（taicolor）**每题都重置成默认**（KATAGO 执先手的对方 = 你来解题）。
+       为什么不沿用上一题的：先手逐题变，沿用会出现"这道题突然变成我防守"，
+       跟"练题"这件事本身矛盾。想练防守，当场把练习卡上那个值改掉即可。 */
+  settings.tfirst = p.first;
+  settings.taicolor = (p.first === 'b' ? 'w' : 'b');
+
+  t.phase = 'setup';          // ★ 停在摆题阶段：让你先核对题目 + 调框距，再按「开始解题」
+  t.showAnswer = false;
+  /* ★ 对手默认「按正解」（2026-10-17）：题集自带正解，照它应才真正贴题（一手不脱先）。
+     题集里没写主变化（rare）→ 退回 KATAGO。每题都重置，和 taicolor 同一个道理：
+     这两样都是"这道题"的属性，沿用上一题容易莫名其妙。 */
+  t.defend = (p.answer && p.answer.length >= 2) ? 'solution' : 'ai';
+  t.nextColor = p.first;
+  t.placeTool = 'b';
+  t.defendNote = '';
+  t.source = s.name + ' · 第 ' + (idx + 1) + ' 题';
+  state.myColor = tsMyColor();
+  state.toMove = p.first;
+  state.names = { b: '', w: '' };
+  tsResetBoardState();        // 手顺 / 候选全清（顺带 +1 局面代，在飞的应手会作废）
+  /* ★ 记下"这份题集练到第几题"（2026-10-16）：下次打开这份题集直接定位过来。
+     写在这里而不是 tsGotoProblem 里 —— 翻题、面板点开、切模式回来都要记，
+     而它们最终都会经过 tsLoadProblem（唯一的载入出口）。 */
+  psetProgSet(s.name, idx);
+  draw();
+  syncTsumegoUI();
+  syncUI();
+  if (why) flash(why);
+  return true;
+}
+
+function tsGotoProblem(delta) {
+  const s = tsSet();
+  if (!s || !s.list.length) { flash('还没有打开题集 —— 点练习卡上的「题集」导入一份 SGF 题集'); return; }
+  const to = s.idx + delta;
+  if (to < 0) { flash('已经是第一题' ); return; }
+  if (to >= s.list.length) { flash('已经是最后一题（共 ' + s.list.length + ' 题）'); return; }
+  const p = s.list[to];
+  tsLoadProblem(to, '第 ' + (to + 1) + ' / ' + s.list.length + ' 题 · '
+    + (p.first === 'b' ? '黑先' : '白先') + ' · 摆子 ' + p.setup.length
+    + (p.answer.length ? ' · 正解 ' + p.answer.length + ' 手' : ''));
+}
+
+/* 打开一份题集（从 puzzles/ 里按文件名读）→ 进习题模式 → 摆好题。
+   ★ 2026-10-16：起始题从"永远第 1 题"改成**上次练到的那一题**（见 psetProgGet）——
+     347 道的题集不然每次都要从头翻。
+   pre 是可选的前缀说明（「当题练」复用已有题集时用它，见棋谱库那行）。 */
+async function openPuzzleSet(name, pre) {
+  if (!name) return;
+  const r = await window.api.puzzles.read(name);
+  if (!r || r.error) { flash('打开题集失败：' + ((r && r.error) || '未知')); return; }
+  const { list, skipped } = parseProblemSet(r.text);
+  if (!list.length) { flash('这份文件里没解析出题目 —— 它可能是一局棋而不是题集'); return; }
+  /* 先进习题模式（enterTsumego 会把盘面清空、并把 state.tsumego 建起来），
+     再把题集挂上、载入上次那一题。顺序反过来的话 enterTsumego 会把刚摆好的题清掉。
+     ⚠️ enterTsumego 里有一句"若有题集就接着上次那道题载入" —— 那一刻
+        state.tsumegoSet 还是**上一份**题集，所以要先把它清掉，避免串题。 */
+  state.tsumegoSet = null;
+  enterTsumego();
+  state.tsumegoSet = { name, list, idx: 0, skipped };
+  const start = Math.max(0, Math.min(list.length - 1, psetProgGet(name)));
+  tsLoadProblem(start);
+  flash((pre ? pre + ' · ' : '')
+    + '已打开题集「' + name.replace(/\.sgf$/i, '') + '」· 共 ' + list.length + ' 题'
+    + (start > 0 ? ' · 接着上次的第 ' + (start + 1) + ' 题' : '')
+    + (skipped ? '（另有 ' + skipped + ' 段没解析出题目，已跳过）' : ''));
+}
+
+/* 「正解」按钮：把这道题的正解顺序摆出来（题集里写着的答案）。
+   只手动触发 —— 分级提示（提示①②③）仍然按原来的节奏，一按就给答案等于没得练。
+   ★ 为什么要求"先回到初始局面"再摆：题集里的正解是从**初始局面**起算的，
+     盘上已经有手顺时直接接上去会牛头不对马嘴。用户的落子不能悄悄丢掉，
+     所以这里只是提示他先按「重来」。
+   ★ 摆出来之后用 ← → （或手数列表）可以一手一手回看 —— 复用已有的回看机制，
+     不另做一套动画（动画要管定时器，换题/重来时还得清，不值当）。 */
+function tsToggleAnswer() {
+  const t = state.tsumego;
+  if (!t) return;
+  if (t.phase !== 'solve') { flash('先点「开始解题」，再看参考答案'); return; }
+  if (t.showAnswer) {
+    t.showAnswer = false;
+    tsResetSolve();
+    flash('已收起参考答案');
+    return;
+  }
+  const p = tsSetProblem();
+  if (!p || !p.answer.length) {
+    flash(tsSet() ? '这道题在 SGF 里没写正解手顺' : '手摆的题没有参考答案（正解来自导入的题集）');
+    return;
+  }
+  if (state.moves.length) { flash('盘上已经有手顺了 —— 先按「重来」回到初始局面，再看参考答案'); return; }
+  if (t.defend === 'ai') { /* 摆答案时不需要 KATAGO 插嘴，下面的守卫会挡住应手 */ }
+  t.showAnswer = true;
+  state.moves = p.answer.map(m => ({ color: m.color, x: m.x, y: m.y, pass: !!m.pass }));
+  state.viewAt = state.moves.length;
+  state.candidates = []; state.candAt = -1;
+  /* ★ 必须走 syncUI()（它内含 draw + syncTsumegoUI）—— 只调这两个的话，
+     **左栏「手数」卡和底部滑块不会更新**：正解摆在盘上了、右下角却还写着"还没有落子"、
+     滑块还是 0/0（2026-10-15 在截图里看出来的，断言没覆盖到，已补一条）。
+     走 syncUI 也不会让 KATAGO 应手 —— `stillNeedDefend()` 在 showAnswer 期间为假。 */
+  syncUI();
+  flash('参考答案 · 共 ' + state.moves.length + ' 手 —— 用 ← → 逐步回看；再按一次「正解」收起');
+}
+
+/* 摆题 → 解题 */
+function tsStartSolve() {
+  const t = state.tsumego;
+  if (!t) return;
+  if (!state.setup.length) { flash('先在棋盘上摆出题目的初始局面（点棋盘落子）'); return; }
+  t.phase = 'solve';
+  t.showAnswer = false;      // 开始解题 = 收起参考答案（那是"看答案"，不是解题）
+  state.myColor = tsMyColor();   // 你执 KATAGO 的另一方（见 settings.taicolor）
+  state.toMove = settings.tfirst;
+  tsResetBoardState();
+  draw();
+  syncTsumegoUI();
+  syncUI();
+  scheduleAnalysis(0, true);
+  flash('开始解题 · ' + (settings.tfirst === 'b' ? '黑先' : '白先')
+    + (t.defend === 'solution' ? ' · 对手按正解应对'
+      : t.defend === 'ai' ? ' · 另一方由 KATAGO 走' : ' · 两边都由你走'));
+}
+
+/* 解题 → 摆题（重摆） */
+function tsBackToSetup() {
+  const t = state.tsumego;
+  if (!t) return;
+  t.phase = 'setup';
+  t.showAnswer = false;
+  state.toMove = settings.tfirst;
+  tsResetBoardState();
+  draw();
+  syncTsumegoUI();
+  syncUI();
+  flash('回到摆题阶段 —— 可继续改初始局面');
+}
+
+/* 重来：摆子保留，手顺清掉，回到初始局面（仍在解题阶段） */
+function tsResetSolve() {
+  const t = state.tsumego;
+  if (!t || t.phase !== 'solve') return;
+  t.showAnswer = false;
+  state.myColor = tsMyColor();   // 你执 KATAGO 的另一方（见 settings.taicolor）
+  state.toMove = settings.tfirst;
+  tsResetBoardState();
+  draw();
+  syncTsumegoUI();
+  syncUI();
+  scheduleAnalysis(0, true);
+  flash('已回到这道题的初始局面');
+}
+
+function tsClearSetup() {
+  const t = state.tsumego;
+  if (!t) return;
+  tsBumpSeq();                    // 摆子清空 = 局面变了，在飞的请求作废（见 defendSeq）
+  state.setup = [];
+  t.nextColor = settings.tfirst;
+  draw();
+  syncTsumegoUI();
+}
+
+/* 摆题阶段落子 —— **写 state.setup，不写 moves**（见本节开头）。 */
+function placeSetupStone(x, y, forceErase) {
+  const t = state.tsumego;
+  if (!t || t.phase !== 'setup') return false;
+  if (state.noGame) { flash('还没开局 —— 点棋盘中间的「新建对局」开始'); return false; }
+
+  const i = state.setup.findIndex(s => s.x === x && s.y === y);
+  const asErase = forceErase || t.placeTool === 'erase';
+
+  if (asErase) {
+    if (i < 0) return false;
+    state.setup.splice(i, 1);
+  } else if (settings.tmode === 'alt') {
+    /* 交替摆棋：空点落「下一子」的颜色并轮换；点已有的子 = 擦掉（改错用） */
+    if (i >= 0) state.setup.splice(i, 1);
+    else {
+      state.setup.push({ x, y, color: t.nextColor });
+      t.nextColor = t.nextColor === 'b' ? 'w' : 'b';
+    }
+  } else {
+    /* 自由摆棋：落当前颜色。同色再点 = 撤掉；异色 = 改成当前色（都符合"摆棋"的直觉） */
+    const color = t.placeTool === 'w' ? 'w' : 'b';
+    if (i < 0) state.setup.push({ x, y, color });
+    else if (state.setup[i].color === color) state.setup.splice(i, 1);
+    else state.setup[i].color = color;
+  }
+
+  /* 初始局面变了 → 之前的候选点/形势作废（局面已经不是那个局面了） */
+  state.candidates = []; state.candAt = -1;
+  state.ownership = null; state.ownAt = -1;
+  resetAnalysisState();
+  draw();
+  syncTsumegoUI();
+  /* 摆题时也让引擎跟着看（有子才发 —— 空盘没什么可算的，而且没有框架时
+     引擎会推荐"脱先走大场"，对摆题没帮助）。延时一点，免得连续摆子时狂发请求。 */
+  if (state.setup.length) scheduleAnalysis(280);
+  return true;
+}
+
+/* ---------- 摆题阶段画在棋盘上的东西 ---------- */
+
+/* 框架：一圈圆角矩形 + 四角加重，让人一眼看出"题目在这一块"。
+   ⚠️ 画在棋子**之上**（半透明线），否则会被棋子压住看不清。 */
+function drawFrame() {
+  const fr = frameRect();
+  if (!fr) return;
+  const [ax, ay] = pxOf(fr.x0, fr.y0);
+  const [bx, by] = pxOf(fr.x1, fr.y1);
+  const m = gap * 0.5;
+  const x = ax - m, y = ay - m, w = (bx - ax) + m * 2, h = (by - ay) + m * 2;
+
+  ctx.save();
+  /* （2026-10-17：原来这里有一条"提示②把框画亮"的联动，随分级提示一起删了 —— 框恒为虚线） */
+  ctx.strokeStyle = 'rgba(24,95,165,.62)';
+  ctx.lineWidth = Math.max(1.4, gap * 0.06);
+  ctx.setLineDash([gap * 0.34, gap * 0.26]);
+  roundRect(x, y, w, h, gap * 0.34);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- KATAGO 应手（强引擎） ---------- */
+let defendBusy = false;
+let defendTimer = null;
+/* 「本次应手」的令牌：每次进入 maybeDefendMove 就 +1。
+   为什么要它：两个应手请求**可能重叠**（旧的被新的掐断后还在等结果），
+   而 defendBusy 是个共享的布尔 —— 旧的那次先回来、在 finally 里把它放掉，
+   新的那次还在跑，标志却已经松了 → 又会被排一次应手，盘上可能多出一手。
+   所以只有"最新那一次"负责放开（见 finally）。 */
+let defendToken = 0;
+/* 「正解这一手落不下去」的**局面代**（打劫/自填眼之类，极罕见）。
+   记下当时的 defendSeq，同一局面就不再试正解、直接交给 KATAGO；
+   任何局面重置都会 +1 局面代 → 这个记号自动失效（不会一直卡住）。 */
+let solutionFailSeq = -1;
+/* 「按正解」这一档退回 KATAGO 的**次数**（诊断用，只增不减）。
+   为什么不靠 defendTrace：那个数组只留最近 14 条，一次应手就能把几条挤出去 ——
+   测试按"切片"去查会被挤出窗口，产生假红（2026-10-17 实测踩到）。 */
+let solutionFallbacks = 0;
+/* KATAGO 应手的诊断轨迹（最近 14 条）。**必须留得住**：应手这条链路有
+   "请求被掐断 / 重试 / 作废 / 引擎没给点"多种正常路径，出问题时只看最后一句 note
+   根本判断不出卡在哪一步 —— 上一次就是这么查了半天的（当时把失败吞在空 catch 里）。 */
+let defendTrace = [];
+function dlog(s) {
+  defendTrace.push(s);
+  if (defendTrace.length > 14) defendTrace.shift();
+}
+
+/* ★★ 对手「按正解」（2026-10-17）：照题集自带的主变化应一手。
+   为什么需要它：KATAGO 再强也不是"会做死活题的人" —— 死活题的胜率几乎是常数，
+   它没有"必须应"的动机（实测：整框约束下 25~33% 的首选落在 4~6 路外；就算把搜索
+   收到 2 路内，"与正解一致"也只有 42%）。正解是**题目的答案**，照它应才真正贴题。
+
+   规则（刻意保守）：
+     · 你前面每一手都和正解一样 → 对手走正解的第 n 手（n = 已经走了几手）；
+     · 你有任何一手和正解不一样 → 这道题后面不再用正解，整段交给 KATAGO
+       （否则会出现"你走错了、它却还按正解往下摆"的假象）；
+     · 没有正解 / 正解走完了 / 这一手在框外 / 颜色对不上 → 返回 null（交给 KATAGO）。
+   ⚠️ 只读 `p.answer`（主变化），不读变体树 —— 等价变化会被当成"走偏"，退回 KATAGO
+      处理，属于可接受的降级（不会乱走）。 */
+function solutionReply() {
+  const p = tsSetProblem();
+  const t = state.tsumego;
+  if (!t || !p) return null;
+  if (solutionFailSeq === defendSeq) return null;      // 这一手刚刚落不下去 → 本局面不再试正解
+  /* ★ 2026-10-17：改用**整棵变化树**（p.tree）而不是主变化数组（p.answer）。
+     差别就在"多条正确分支"：只读主变化时，第二条正解会被当成走偏 → 退回引擎；
+     现在只要用户这一手在树上，就顺着这一支往下应。 */
+  let cur = p.tree;
+  if (!cur) return null;                               // 老数据 / 没有树
+  for (let i = 0; i < state.moves.length; i++) {
+    const m = state.moves[i];
+    let next = null;
+    for (const c of cur.children) {
+      if (!c.move) continue;
+      if (!!c.move.pass !== !!m.pass) continue;
+      if (!m.pass && (c.move.x !== m.x || c.move.y !== m.y)) continue;
+      next = c; break;
+    }
+    if (!next) return null;                            // 有一手不在树上 → 走偏
+    cur = next;
+  }
+  /* 对手这一手 = 当前节点的**第一个**孩子（主变体优先；同一节点多分支时，其余是别的选择） */
+  let nx = null;
+  for (const c of cur.children) if (c.move) { nx = c.move; break; }
+  if (!nx) return null;                                // 正解走完了
+  /* 颜色必须真是"轮到的那一方"（SGF 的 PL 偶尔和首手颜色不一致，别硬来） */
+  if (nx.color !== state.toMove) return null;
+  /* 这一点得真空着（正解手顺与摆子对不上时会发生，比如题集被人改过摆子） */
+  if (!nx.pass && boardAt(state.moves.length)[idx(nx.x, nx.y)]) return null;
+  const fr = frameRect();
+  if (fr && !nx.pass && (nx.x < fr.x0 || nx.x > fr.x1 || nx.y < fr.y0 || nx.y > fr.y1)) return null;
+  return nx;
+}
+
+/* 「这个局面还需要 KATAGO 应手吗」——**不含 defendBusy 判断**。
+   ⚠️ 为什么要拆出来：重试前要问的就是这句话，而那一刻 defendBusy 一定是 true
+      （正是我自己占着的），直接用 needDefendMove() 会永远得到 false →
+      **那个"最多试 3 次"的重试循环从来没重试过**（2026-10-14 查出来的死代码）。 */
+function stillNeedDefend() {
+  const t = state.tsumego;
+  if (!(settings.mode === 'tsumego' && !!t && t.phase === 'solve')) return false;
+  /* ★ 2026-10-17：「按正解」与「KATAGO」都要**对手**应手，只有「我下两边」不用。
+     所以这里判 !== 'both'，不再只认 'ai'。 */
+  if (t.defend === 'both') return false;
+  if (t.showAnswer) return false;          // ★ 正在展示参考答案 → 不许接在答案后面继续走
+  if (state.noGame || state.result) return false;
+  if (state.viewAt !== state.moves.length || isMyTurn()) return false;
+  /* ★★ 「按正解」这一档**不依赖引擎**（2026-10-17）：正解就写在题集里，引擎没就绪
+     也照样能练（以前这条链一律要求 engineReady）。只有走偏 / 没正解时才会真的用到引擎。
+     KATAGO 那一档照旧：引擎没就绪就不排应手。 */
+  if (t.defend === 'solution' && solutionReply()) return true;
+  return engineReady;
+}
+
+function needDefendMove() {
+  return stillNeedDefend() && !defendBusy;
+}
+
+function scheduleDefendMove(delay) {
+  clearTimeout(defendTimer);
+  defendTimer = setTimeout(maybeDefendMove, delay === undefined ? 200 : delay);
+}
+
+async function maybeDefendMove() {
+  /* ★ 上一次应手还在飞（占着标志）→ **再排一次**，不能静默丢掉（2026-10-14 实测的坑）。
+     为什么必须这样：这个定时器是"需要 KATAGO 应手"这件事的**唯一入口**
+     （落子 / 切角色 / syncUI 都只调 scheduleDefendMove）——在这里 return，
+     就再也没人叫它了。症状是："轮到 KATAGO，它却一直不动"，
+     而 defendNote 还停在上一句（比如"局面已变，这手作废"），看着完全像另一个问题。
+     实测就是这么踩的：旧的应手请求还挂着，新的需求被丢掉 → 卡住。
+     重排是零成本的（scheduleDefendMove 自带 clearTimeout 去抖）。 */
+  if (defendBusy) { dlog('占着标志 → 稍后再排'); scheduleDefendMove(300); return; }
+  if (!needDefendMove()) return;
+  const t = state.tsumego;
+
+  /* ★★ 对手 = 按正解 → 照正解应一手，**不叫引擎**（2026-10-17）。
+     这一条比引擎快、且一手不脱先；你走偏了 / 没有正解（手摆的题）→ solutionReply()
+     返回 null，于是继续走下面那条引擎路径 —— 等于**自动退回 KATAGO**。 */
+  if (t.defend === 'solution') {
+    const nx = solutionReply();
+    if (nx) {
+      const myTok2 = ++defendToken;
+      const mySeq2 = defendSeq;
+      const myLen2 = state.moves.length;
+      defendBusy = true;
+      state.thinking = true;
+      draw();
+      await new Promise(r => setTimeout(r, 260));   // 稍等一拍，别像凭空蹦出来
+      try {
+        if (defendToken !== myTok2) return;
+        if (defendSeq !== mySeq2 || state.moves.length !== myLen2) {
+          t.defendNote = '局面已变，这手作废';
+          dlog('正解作废：代 ' + mySeq2 + '→' + defendSeq + ' 手数 ' + myLen2 + '→' + state.moves.length);
+          return;
+        }
+        if (!stillNeedDefend()) return;
+        if (nx.pass) {
+          t.defendNote = '按正解 · 停一手';
+          state.moves.push({ color: state.toMove, pass: true });
+          state.toMove = state.toMove === 'b' ? 'w' : 'b';
+          state.viewAt = state.moves.length;
+          return;
+        }
+        t.defendNote = '按正解 · ' + toGTP(nx.x, nx.y);
+        dlog('正解落子 ' + t.defendNote);
+        const okSol = tryPlay(nx.x, nx.y, true);
+        /* 极罕见：正解这一手在这个局面里落不下去（打劫/自填眼…）。
+           别一声不吭地卡住 —— 记下局面代（本局面不再试正解），并立刻改排一次引擎应手。 */
+        if (!okSol) {
+          solutionFailSeq = defendSeq;
+          t.defendNote = '正解这一手落不下去 → 改用 KATAGO';
+          dlog('正解落子被拒');
+          scheduleDefendMove(60);
+        }
+      } finally {
+        if (defendToken === myTok2) {
+          defendBusy = false;
+          state.thinking = false;
+          syncTsumegoUI();
+          draw();
+          /* 和引擎那条路径一样补排一次分析（理由见下面 finally 那段注释） */
+          if (tsOn() && tsPhase() === 'solve' && !needDefendMove()) scheduleAnalysis(150, true);
+        }
+      }
+      return;
+    }
+    t.defendNote = '没有正解可依（走偏了 / 手摆的题）→ 改用 KATAGO';
+    solutionFallbacks += 1;
+    dlog('正解缺位 → 交给引擎');
+  }
+
+  const myTok = ++defendToken;
+  const mySeq = defendSeq;          // ★ 记下"我是替哪个局面算的"
+  defendBusy = true;
+  state.thinking = true;
+  draw();
+  dlog('起：手数' + state.moves.length + ' 代' + mySeq);
+  try {
+    /* 最多试 3 次。为什么要重试：引擎**一次只算一个请求**，
+       别的请求（比如刚触发的那次分析）可能正好把它掐掉 —— 那不是错，重发一次就好。
+       ⚠️ 这里**不能静默失败**：第一版把失败吞在一个空 catch 里，
+          端到端测试只看到「AI 一声不吭」，查不出为什么。所以把原因记进 t.defendNote，
+          界面和测试都读得到。 */
+    for (let tryN = 0; tryN < 3; tryN++) {
+      /* ★ 发请求前记下局面的"指纹"：手数 + 看的是第几手。
+         回来时对不上 → 这一手属于已经不存在了的局面，整手丢弃（见 defendSeq 的注释）。 */
+      const mySeqNow = defendSeq;
+      const myLen = state.moves.length;
+      const req = Object.assign({
+        initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
+        moves: state.moves.map(m => [m.color === 'b' ? 'B' : 'W', m.pass ? 'pass' : toGTP(m.x, m.y)]),
+        rules: (RULES[settings.rules] || RULES.chinese).kata,
+        komi: settings.komi,
+        size: N,
+        maxVisits: Math.max(200, settings.visits),
+      }, tsAnalyzeExtras());
+
+      const res = await window.api.analyze(req);
+      dlog('回应：ok=' + (res && !res.error && !res.cancelled)
+        + ' cancelled=' + !!(res && res.cancelled) + ' err=' + ((res && res.error) || '—'));
+      /* 局面被重置过 / 手数变了（重来、重摆、悔棋）→ 丢弃，什么都不落 */
+      if (defendSeq !== mySeqNow || defendSeq !== mySeq || state.moves.length !== myLen) {
+        t.defendNote = '局面已变，这手作废';
+        dlog('作废：代 ' + mySeq + '→' + defendSeq + ' 手数 ' + myLen + '→' + state.moves.length);
+        return;
+      }
+      if (res && !res.error && !res.cancelled) {
+        /* ★ 兜底：万一引擎给的应手落在框外，就当它没给（2026-10-12）。
+           正常情况不会发生 —— 请求里带了 allowMoves，引擎只会在框内找点（实测过：
+           PV 都留在框内、连 pass 都不给）。但 allowMoves 是引擎侧的约定，
+           客户端不核实的话，一旦哪天它失效，画面就会"AI 跑到框外应一手"，
+           而且这时 tryPlay 的人也挡在框内 —— 看起来像 bug 但不报错。
+           这里过滤一遍，取**框内的第一个候选**；框内一个都没有才认输。 */
+        const fr = frameRect();
+        let infos = res.moves || [];
+        if (fr) {
+          const inside = infos.filter(m => {
+            const s = String(m.move || '');
+            if (!s || s.toLowerCase() === 'pass') return true;   // 停一手照收
+            const p = fromGTP(s);
+            return !!p && p.x >= fr.x0 && p.x <= fr.x1 && p.y >= fr.y0 && p.y <= fr.y1;
+          });
+          if (!inside.length) { t.defendNote = '引擎给的应手全在框外（已丢弃）'; return; }
+          infos = inside;
+        }
+        /* ★ 方案 3（兜底，2026-10-17）：候选里只留贴题的（离棋子 ≤ TS_BAND 路）。
+           正常是空操作（请求里的 allowMoves 已经把搜索限在带内）；万一 allowMoves 失效、
+           或者带太窄退回整框，这一层挡住"引擎跑到远处大场"。一个不剩就保留原列表。 */
+        const localMoves = filterLocalMoves(infos, TS_BAND);
+        if (localMoves.length) infos = localMoves;
+        const top = infos.find(m => m.order === 0) || infos[0];
+        if (!top) { t.defendNote = '引擎没给候选点'; return; }
+        const mv = String(top.move || '');
+        if (!mv || mv.toLowerCase() === 'pass') {
+          t.defendNote = '对方停一手';
+          state.moves.push({ color: state.toMove, pass: true });
+          state.toMove = state.toMove === 'b' ? 'w' : 'b';
+          state.viewAt = state.moves.length;
+          return;
+        }
+        const pt = fromGTP(mv);
+        if (!pt) { t.defendNote = '应手坐标读不出来：' + mv; return; }
+        t.defendNote = '应了 ' + mv;
+        dlog('落子 ' + mv);
+        tryPlay(pt.x, pt.y, true);
+        return;
+      }
+      t.defendNote = (res && res.error) ? res.error : '被掐断，重试中';
+      /* 重试之前再看一眼：这期间局面变了（用户悔棋 / 又落了一手）就不用再应了。
+         ⚠️ 用 stillNeedDefend()，**不能用 needDefendMove()**（见那边的注释）。 */
+      if (!stillNeedDefend()) { dlog('退出重试：局面不需要应手了（第 ' + tryN + ' 次）'); return; }
+      dlog('重试第 ' + (tryN + 1) + ' 次');
+      await new Promise(r => setTimeout(r, 350));
+    }
+  } catch (e) {
+    t.defendNote = '异常：' + ((e && e.message) || e);
+    dlog('异常：' + ((e && e.message) || e));
+  } finally {
+    /* ⚠️ 只有**最新**那一次负责放开标志（见 defendToken 的注释） */
+    if (defendToken === myTok) {
+      defendBusy = false;
+      state.thinking = false;
+      syncTsumegoUI();
+      draw();
+      /* ★ 应手结束后补排一次分析（2026-10-12）。
+         为什么要补：`runAnalysis` 在门口就有"轮到 KATAGO 就让路"的守卫 ——
+         应手期间它直接 return，**不会**自己再排下一次。正常流程里 KATAGO 落子后
+         syncUI 会把分析接着排起来；但当这一手被上面的校验丢弃时（局面已重置）
+         就没人接手了 → 表现是"重来之后推荐点一直是空的"。
+         补这一下是零成本的（scheduleAnalysis 自带去抖），换来这条路径能自愈。 */
+      if (tsOn() && tsPhase() === 'solve' && !needDefendMove()) scheduleAnalysis(150, true);
+    }
+  }
+}
+
+/* ---------- 练习卡上的「题集」行（唯一出口，和 syncTsumegoUI 一起调） ---------- */
+function syncPsetUI() {
+  const s = tsSet();
+  const btn = $('btn-pset');
+  if (btn) {
+    const nm = s ? s.name.replace(/\.sgf$/i, '') : '未打开';
+    btn.textContent = nm;                       // 长了由 CSS 截断（title 里有全名）
+    btn.classList.toggle('has-set', !!s);
+    btn.title = s
+      ? '当前题集：' + nm + '（共 ' + s.list.length + ' 题）—— 点这里可以换一份、导入新的、改名 / 删除'
+      : '还没有打开题集 —— 点这里导入一份 SGF 题集（或打开已存的）';
+  }
+  const pos = $('pset-pos');
+  if (pos) {
+    pos.textContent = (s && s.list.length) ? (s.idx + 1) + '/' + s.list.length : '—';
+    pos.title = s ? ('第 ' + (s.idx + 1) + ' 题 / 共 ' + s.list.length + ' 题') : '还没打开题集';
+  }
+  const prev = $('btn-ts-prev'), next = $('btn-ts-next');
+  if (prev) prev.disabled = !s || !s.list.length || s.idx <= 0;
+  if (next) next.disabled = !s || !s.list.length || s.idx >= s.list.length - 1;
+}
+
+/* ---------- 习题题集面板（导入 / 打开 / 改名 / 删除） ----------
+   结构照抄棋谱库那个弹窗，不另发明一套。
+   ★ 题数（一份题集里有几道题）在这里现算 —— 读一遍文件、数顶层树。
+     为什么不由主进程给：**"怎么把 SGF 切成一道道的题"只允许有一处实现**
+     （parseProblemSet/splitSgfGames）。两处各写一遍，迟早分叉。
+     题集一般只有几份，全读一遍也就几十 KB~几 MB，够便宜。 */
+async function refreshPuzzles() {
+  const ul = $('puzlist');
+  if (!ul) return;
+  const all = (await window.api.puzzles.list()) || [];
+  ul.textContent = '';
+  const cnt = $('puz-count');
+  if (cnt) cnt.textContent = all.length ? '共 ' + all.length + ' 份' : '';
+  if (!all.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = '还没有题集 —— 点下面的「导入题集…」挑一份 SGF（一份里可以有好几百道题）';
+    ul.appendChild(li);
+    return;
+  }
+  for (const it of all) {
+    const li = document.createElement('li');
+    const info = document.createElement('div');
+    info.className = 'rec-info';
+    const nm = document.createElement('span');
+    nm.className = 'rec-name';
+    nm.textContent = it.name.replace(/\.sgf$/i, '');
+    nm.title = it.name;
+    info.appendChild(nm);
+    const meta = document.createElement('span');
+    meta.className = 'rec-meta';
+    meta.textContent = Math.max(1, Math.round(it.size / 1024)) + ' KB · ' + fmtRecTime(it.mtime);
+    li.append(info, meta);
+
+    /* 题数：读一遍文件数顶层树。读不出来（文件被删/没权限）就标一下，不静默。 */
+    let games = 0, readErr = '';
+    try {
+      const r = await window.api.puzzles.read(it.name);
+      if (r && r.text) games = splitSgfGames(r.text).length;
+      else readErr = (r && r.error) || '读不出来';
+    } catch (e) { readErr = String((e && e.message) || e); }
+    meta.textContent = (readErr ? '（' + readErr + '）' : games + ' 题')
+      + ' · ' + Math.max(1, Math.round(it.size / 1024)) + ' KB · ' + fmtRecTime(it.mtime);
+
+    const isCur = !!(tsSet() && tsSet().name === it.name);
+    const mk = (label, title, fn, cls) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      b.onclick = fn;
+      if (cls) b.classList.add(cls);
+      return b;
+    };
+    const openBtn = mk(isCur ? '正在练' : '打开',
+      isCur ? '这道题集正在练 —— 点一下回到它（不动当前进度）'
+        : '打开这份题集（接着上次练到的那一题，可以用 ‹ › 翻题）',
+      async () => {
+        PUZ_MASK.classList.remove('open');
+        await openPuzzleSet(it.name);
+      });
+    if (isCur) openBtn.classList.add('primary');
+    li.append(openBtn,
+      mk('改名', '给题集换个名字（只改文件名）', () => {
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.value = it.name.replace(/\.sgf$/i, '');
+        inp.placeholder = '题集名字…';
+        const ok = document.createElement('button');
+        ok.textContent = '确定';
+        const no = document.createElement('button');
+        no.textContent = '取消';
+        const commit = async () => {
+          const nv = (inp.value || '').trim();
+          if (!nv) { refreshPuzzles(); return; }
+          const r = await window.api.puzzles.rename(it.name, nv);
+          if (r && r.error) flash('改名失败：' + r.error);
+          else {
+            flash('题集已改名为「' + String((r && r.name) || nv).replace(/\.sgf$/i, '') + '」');
+            /* 进度是**按名字**记的 → 改名了得把那条记录跟着搬，否则下次打开会从第 1 题开始 */
+            if (r && r.name) psetProgRename(it.name, r.name);
+            /* 正在练的就是这份 → 把内存里那份的名字也跟着改（否则卡片上还是老名字） */
+            if (tsSet() && tsSet().name === it.name && r && r.name) {
+              tsSet().name = r.name;
+              if (state.tsumego) state.tsumego.source = r.name + ' · 第 ' + (tsSet().idx + 1) + ' 题';
+              syncTsumegoUI();
+            }
+          }
+          refreshPuzzles();
+        };
+        ok.onclick = commit;
+        no.onclick = () => refreshPuzzles();
+        inp.onkeydown = e => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(); }
+          if (e.key === 'Escape') refreshPuzzles();
+        };
+        li.textContent = '';
+        li.append(inp, ok, no);
+        inp.focus(); inp.select();
+      }),
+      /* 删除：和棋谱库同一套（就地变「确认删除？」，3 秒后自动还原；进系统回收站） */
+      mk('删除', '移到系统回收站（可以恢复）', function () {
+        if (this.dataset.armed !== '1') {
+          this.dataset.armed = '1';
+          this.textContent = '确认删除？';
+          setTimeout(() => { if (this.isConnected) { this.dataset.armed = ''; this.textContent = '删除'; } }, 3000);
+          return;
+        }
+        window.api.puzzles.remove(it.name).then(r => {
+          if (r && r.error) flash('删除失败：' + r.error);
+          else {
+            flash('已删除题集「' + it.name.replace(/\.sgf$/i, '') + '」（在系统回收站里）');
+            /* 进度也一起清掉（题集没了，留着那条记录只会在回收站恢复后又"悄悄生效"） */
+            psetProgDrop(it.name);
+            /* 正在练的就是这份 → 把题集清掉（盘上那题留着，别让人看着名字还在） */
+            if (tsSet() && tsSet().name === it.name) {
+              state.tsumegoSet = null;
+              syncTsumegoUI();
+            }
+          }
+          refreshPuzzles();
+        });
+      }));
+    /* ★★ 这一行是必须的 —— 我第一版**漏了它**：li 造好了、按钮也挂上了，
+       但从来没挂到 ul 上。症状是"面板打开、列表全空、**不报任何错**"，
+       查了四轮诊断才看出来（复刻一遍函数体就能发现：循环跑完了、children 还是 0）。
+       教训：这种"内容造好了但没上屏"的漏挂，静态检查和测试的**空断言**都抓不住，
+       所以下面每条 UI 断言都要求"看到具体的东西"（列表里有名字 / 有题数）才算过。 */
+    ul.appendChild(li);
+  }
+}
+
+function openPuzzles() {
+  PUZ_MASK.classList.add('open');
+  refreshPuzzles();
+  window.api.puzzles.dir().then(d => { const el = $('puz-dir'); if (el) el.textContent = d || ''; });
+}
+
+/* ---------- 练习卡的界面同步（唯一入口，避免各处漏改） ---------- */
+function syncTsumegoUI() {
+  const card = $('ts-card');
+  if (!card) return;
+  const on = tsOn() && !!state.tsumego;
+  card.hidden = !on;
+  /* 框架 / 框距的显示（只是把 settings 的值画到控件上；改值走 syncFrameUI/applyFrameChange）。
+     放在 on 判断**之前**：卡片藏起来时也把显示拉齐，下次一露面就是对的。 */
+  syncFrameUI();
+  /* 先手（黑先/白先）同理 —— 常驻行，也放在 on 之前拉齐。 */
+  syncFirstUI();
+  /* ★ 判定结论走**棋盘上方那条结果条**（见 renderVerdict）。它是卡片之外的元素，
+     所以这一句放在 on 判断**之前** —— 卡片被藏起来时（切走模式）结果条也得跟着收掉。 */
+  renderVerdict();
+  if (!on) return;
+
+  const t = state.tsumego;
+  const setup = t.phase === 'setup';
+  /* 卡上**不写**「摆题中 / 解题中」了（2026-10-14 用户要求：省掉这行）。
+     阶段其实一眼看得出来 —— 摆题阶段是「开始解题 / 清空」，解题阶段是「重来 / 重摆 / 提示 / 判定」。
+     真要判阶段，读 state.tsumego.phase（端到端测试就是这么断言的）。 */
+  $('ts-setup-group').hidden = !setup;
+  $('ts-solve-group').hidden = setup;
+
+  /* ★★ 卡片高度**任何时刻不变**（2026-10-14 用户要求）—— 三条一起才成立：
+     ① 常驻的行不随阶段/状态显隐：KATAGO 执哪方**置灰代替藏起来**；
+     ② 每行 min-height 统一（.ts-row），"交替摆棋"藏掉颜色按钮后行高不变；
+     ③ 卡上不再有会变长变短的文字。
+     改动这三样里的任何一个，都要重跑 dev/_cdp_tsumego.mjs 的"卡片高度不随阶段变"断言。
+     （2026-10-17：「目标 净杀」那一格随判定/提示一起删了 —— 常驻行现在只剩「先手」。） */
+
+  /* KATAGO 执哪一方：显示值两个控件（面板 + 练习卡）一起拉齐，说明文字也跟着。 */
+  syncTkaicolorUI();
+  /* ★ 只有「我下两边」时 KATAGO 执谁没意义（2026-10-17：原来判 === 'ai'，
+     「按正解」那一档接手后也得跟着改，否则 KATAGO 那行会被无端置灰）。 */
+  setTkaicolorEnabled(t.defend !== 'both');
+  /* 「按正解」这一档：没有正解时置灰（手摆的题 / 题集里没写主变化） */
+  const solBtn = $('seg-tsdefend') && $('seg-tsdefend').querySelector('button[data-v="solution"]');
+  if (solBtn) {
+    const pb = tsSetProblem();
+    const hasAns = !!(pb && pb.answer && pb.answer.length >= 2);
+    solBtn.disabled = !hasAns;
+    solBtn.title = hasAns
+      ? '对手照题集自带的正解应对（共 ' + pb.answer.length + ' 手）：一手不脱先；你走偏了会自动改用 KATAGO'
+      : '这道题没有正解（手摆的题 / 题集里没写主变化）→ 这一档实际会把对手交给 KATAGO';
+  }
+  /* 题集行（常驻）：题集名 / 第几题 / ‹ › 能不能按 */
+  syncPsetUI();
+
+  /* ★ 「正解」按钮的状态**两个阶段都拉齐**（2026-10-14 实测踩到）。
+     原来这段只写在解题分支里 → 摆题阶段按钮留着上一次的状态（可能还是可点的），
+     点下去**既不提示也不报错**（disabled 的按钮点击直接无效），
+     而判据只看到"手数没变"，于是**判据假绿**。
+     它虽然在摆题阶段藏在解题组里、肉眼看不见，但"看不见的状态"更该拉齐 ——
+     不然读它的人和测试拿到的都是旧值。 */
+  syncAnswerBtn();
+
+  if (setup) {
+    const alt = settings.tmode === 'alt';
+    setSeg('seg-tscolor', t.placeTool);
+    $('seg-tscolor').hidden = alt;        // 交替摆棋不需要选颜色
+    /* ★ 交替摆棋时黑/白按钮是藏起来的 —— 那"下一子轮到谁"就只剩这一处能说。
+       所以它不做成说明段落，而是挤在「落子」这一行的行内小字（不占额外高度）。 */
+    const altTxt = $('ts-alt-next');
+    altTxt.hidden = !alt;
+    if (alt) altTxt.textContent = '下一子 ' + (t.nextColor === 'b' ? '黑' : '白');
+  } else {
+    setSeg('seg-tsdefend', t.defend);
+  }
+}
+
+/* 「正解」按钮的可用状态 + 高亮 + 悬停说明。
+   ★ 单独一个出口、由 syncTsumegoUI **两个阶段都调**（原因见那里的注释）。 */
+function syncAnswerBtn() {
+  const ab = $('btn-ts-answer');
+  if (!ab) return;
+  const t = state.tsumego;
+  const p = tsSetProblem();
+  const has = !!(p && p.answer.length);
+  ab.disabled = !has;
+  ab.classList.toggle('on', !!(t && t.showAnswer));
+  ab.title = !has
+    ? '手摆的题没有参考答案 —— 正解来自导入的 SGF 题集'
+    : (t && t.showAnswer
+      ? '收起参考答案（回到初始局面）'
+      : '参考答案：把这道题的正解顺序摆出来（' + p.answer.length + ' 手）。再按一次收起；摆出来之后用 ← → 可以逐步回看。');
+}
+
+/* KATAGO 执黑/执白的两个按钮：**「我下两边」时置灰，而不是把整行藏起来**（2026-10-14）。
+   为什么改：藏起来会让练习卡高度跳一下（用户要求"任何时刻不变"）。
+   置灰表达的是同一件事（KATAGO 不上场、这一项此刻无效），而且位置一直留着、不会让人找不着。 */
+function setTkaicolorEnabled(on) {
+  const seg = $('seg-tsaicolor');
+  if (!seg) return;
+  for (const b of seg.querySelectorAll('button')) b.disabled = !on;
+  seg.title = on
+    ? 'KATAGO 执黑还是执白。默认它执「先手」的对方 —— 也就是你来解题（黑先的题你走黑）。想练防守（让它先动手、你来守），就把它改成先手那一方。'
+    : '「我下两边」时 KATAGO 不上场，这一项暂时无效（切回「应对 = KATAGO」就能改）。';
 }
 
 /* ---------------- 引擎分析 ---------------- */
@@ -2920,9 +4801,18 @@ function fromGTP(s) {
   return { x, y };
 }
 
-/* 第 n 手之后轮谁走（让子局 / 明清座子局都是白先） */
+/* 第 n 手之后轮谁走。
+   判据平常是「有没有摆子」—— 让子局 / 明清座子局都是白先（让子本身就是补偿）。
+   ★★ 但**习题练习不能用这个判据**（2026-10-12 端到端测试抓到的真 bug）：
+     题的初局也是用 initialStones 摆出来的（state.setup 非空），
+     可"这道题该谁先走"是用户明确设的 settings.tfirst，跟摆了几颗子毫无关系。
+     照旧判据走的话，**黑先的题会被算成白先** → isMyTurn() 为假 →
+     连自己的落子都会被"只能下自己那方"那条守卫挡掉（实测就是这个连锁）。
+     → 习题模式下先手一律取 settings.tfirst。 */
 function sideToMove(n) {
-  const first = state.setup.length ? 'w' : 'b';
+  const first = tsOn()
+    ? (settings.tfirst === 'w' ? 'w' : 'b')
+    : (state.setup.length ? 'w' : 'b');
   return (n % 2 === 0) ? first : (first === 'b' ? 'w' : 'b');
 }
 
@@ -3095,6 +4985,11 @@ function truncateAnalysisTo(len) {
   /* ★ histVisits（每格的精度）必须跟着一起截 —— 它是 history 的伴随数组，
      错位一格就等于拿别的手的精度去判断这一格要不要改写（2026-10-06 晚新增）。 */
   if (state.histVisits.length > len + 1) state.histVisits.length = len + 1;
+  /* ★ 逐手分析快照也跟着截（2026-10-18）：悔棋后那些手已经不存在了，
+     留着就会被「解说词」卡当成"这一手的分析"显示出来（张冠李戴）。 */
+  for (const key in state.anaAt) {
+    if (+key > len) delete state.anaAt[key];
+  }
   /* candAt / ownAt 也别指着不存在的局面，否则候选点和形势雾会被当成过期的画淡。 */
   if (state.candAt > len) state.candAt = -1;
   if (state.ownAt > len) { state.ownership = null; state.ownAt = -1; }
@@ -3164,6 +5059,14 @@ async function runAnalysis() {
   /* ★ 复盘同理：复盘是一次「整盘逐手」的长请求，被分析掐掉就白跑了（可能要等两分钟）。
      复盘结束后会主动刷一次界面，见 runReview。 */
   if (reviewBusy) { anaDiag.failEarly.review++; anaDiag.note('复盘/讲解中提前return'); alog('run 复盘/讲解中 → 不发'); return; }
+  /* ★★ 习题练习的「KATAGO 应手」**也走同一个分析引擎**（题的正解要求"对方最强应对"，
+     所以不能改用段位引擎）→ 它和分析请求是**竞争关系**：
+     main.js 的 analyze() 会给新请求带上 terminateId，**后发的会掐掉前一个**。
+     于是分析循环不停发请求 → 防守请求每次都被掐掉 → 对方永远不应子。
+     （2026-10-12 端到端测试实测到的就是这个：手数停在 1，AI 一声不吭。）
+     数子 / 复盘那两条守卫是同一个道理，这里照办：
+     **轮到防守方时把引擎让给它**，防守落子后会 syncUI → 分析自然接着排。 */
+  if (needDefendMove() || defendBusy) { anaDiag.note('习题防守中提前return'); return; }
   if (!engineReady) { anaDiag.failEarly.notReady++; anaDiag.note('引擎未就绪提前return'); alog('run 引擎未就绪 → 不发'); return; }
   if (anaBusy) { anaPoke = true; anaDiag.failEarly.busy++; alog('run 已有请求在飞 → 只登记 poke'); return; }
   anaBusy = true;
@@ -3174,7 +5077,7 @@ async function runAnalysis() {
   try {
     /* 上限只是防止意外死循环（正常一轮只会跑十几次）。 */
     for (let guard = 0; guard < 500; guard++) {
-      if (scoreBusy || reviewBusy || !engineReady) { anaDiag.note('数子/复盘/引擎掉了 中断循环'); alog('run 循环中断：数子/复盘/引擎掉了'); break; }
+      if (scoreBusy || reviewBusy || defendBusy || needDefendMove() || !engineReady) { anaDiag.note('数子/复盘/防守/引擎掉了 中断循环'); alog('run 循环中断：数子/复盘/防守/引擎掉了'); break; }
       if (gen !== gameGen) { anaDiag.note('换局中断循环'); alog('run 循环中断：换局/换棋谱（代 ' + gen + '→' + gameGen + '）'); break; }   // ★ 换局 / 换棋谱了：剩下的欠账全部作废
 
       /* ① 先算**当前看着的局面** —— 胜率条 / 候选点 / 形势雾要它上屏（最高优先）。 */
@@ -3261,7 +5164,10 @@ async function runAnalysisOnce(at) {
       window.api.analyze(Object.assign({
         maxVisits: settings.visits || ANALYZE_VISITS,   // ★ 每次请求现读 —— 所以改档位是**热切换**
         includeOwnership: state.showTerritory,   // 形势雾的数据（不增加搜索量）
-      }, req)),
+      }, req, /* ★ 习题练习：先手方(initialPlayer) + 框架约束(allowMoves)。
+                     放在最后 = 不能被 req 覆盖掉（漏了这两个，题就做不严谨：
+                     引擎会自己猜先手，还会推荐框架外的脱先点）。 */
+        tsAnalyzeExtras())),
       new Promise(r => setTimeout(() => r({ error: '分析请求超时（渲染端 25 秒没有响应）' }), ANALYZE_TIMEOUT_MS)),
     ]);
   } catch (e) {
@@ -3345,6 +5251,10 @@ async function runAnalysisOnce(at) {
   if (applyAnalysis(res, at)) { shownAt = at; alog('once at=' + at + ' ✓ 上屏成功 candAt=' + state.candAt + ' 候选点=' + state.candidates.length + ' visits=' + ((res.root && res.root.visits) || 0)); }
   else { alog('★ once at=' + at + ' 未上屏（applyAnalysis 返回 false）→ shownAt 不记，下轮会重算；visits=' + ((res.root && res.root.visits) || 0) + ' viewAt=' + state.viewAt); }
   draw();
+  /* ★ 分析回来了 → 右下角「解说词」卡要跟着刷新（2026-10-18）。
+     原来这里只 draw()（画布），而那块文字只在 syncUI 里刷新 ——
+     于是「这一手还在算…」会一直挂着，直到下次任意操作才变成数字。 */
+  renderCommentBox();
   return true;
 }
 
@@ -3443,10 +5353,6 @@ function blackLeadFrom(p, at) {
 function applyAnalysis(p, at) {
   if (!p || !p.root) return false;
   if (typeof at !== 'number') at = state.viewAt;
-  /* ① 报文与当前局面不符：这不是"当前局面的结果"，一个字段都不该写。
-     为什么必须挡：请求在飞的时候用户落子 / AI 应手，回来的报文属于**上一个**局面；
-     照它画候选点就会把别的局面的点画到当前棋盘上。 */
-  if (at !== state.viewAt) return false;
 
   /* 视角：以引擎返回的 currentPlayer 为准（权威）。
      引擎（RapaceGo/engine.cfg 里 reportAnalysisWinratesAs = SIDETOMOVE）返回的
@@ -3459,6 +5365,34 @@ function applyAnalysis(p, at) {
   const blackWin = side === 'b' ? p.root.winrate : 1 - p.root.winrate;
   const whiteWin = 1 - blackWin;
   const lead = side === 'b' ? p.root.scoreLead : -p.root.scoreLead;   // 正 = 黑领先
+
+  /* ★★ 先存这个局面的**分析快照**，再决定要不要刷界面（2026-10-18）。
+     快照是**按 at 存的**（报文描述的就是第 at 手那个局面），所以哪怕界面已经走到
+     下一手、这份报文不能拿去画候选点了，它本身仍然是对的、该留下来 ——
+     「解说词」卡回看那一手时要靠它。原来的顺序是先 `return false`，
+     自动对弈（每手间隔短）时前一手的数据整批丢掉，那一手就永远显示"还在算"。
+     ⚠️ win / lead 一律换算成**黑方视角**（纪律 11：引擎原值是"轮走方视角"，
+        轮到白走时符号会反）。 */
+  {
+    const toBlack = v => (typeof v === 'number' ? (side === 'b' ? v : -v) : v);
+    const ms = (p.moves || []).map(m => ({
+      gtp: m.move,
+      prior: m.prior,
+      order: m.order,
+      win: toBlack(m.winrate),
+      lead: toBlack(m.scoreLead),
+      pv: Array.isArray(m.pv) ? m.pv.slice(0, 8) : [],
+    }));
+    /* 「推荐最佳选点」按**胜率**排（引擎的 moveInfos 是按访问量排的，不是按胜率） */
+    let best = null;
+    for (const m of ms) if (typeof m.win === 'number' && (!best || m.win > best.win)) best = m;
+    state.anaAt[at] = { at, side, blackWin, lead, visits: (p.root && p.root.visits) || 0, moves: ms, best };
+  }
+
+  /* ① 报文与当前局面不符：这不是"当前局面的结果"，一个界面字段都不该写。
+     为什么必须挡：请求在飞的时候用户落子 / AI 应手，回来的报文属于**上一个**局面；
+     照它画候选点就会把别的局面的点画到当前棋盘上。 */
+  if (at !== state.viewAt) return false;
 
   $('bar-black').style.width = (blackWin * 100).toFixed(1) + '%';      // 条：左段黑、右段白
   $('eval-wr').textContent = '黑 ' + (blackWin * 100).toFixed(1) + '%';
@@ -3636,6 +5570,8 @@ let aiTimer = null;
 function isMyTurn() {
   /* 试下时两边都能下 → 一直算「轮到我」，这样推荐点照常显示（正在探索，正需要它） */
   if (state.draft) return true;
+  /* ★ 双方都由 KATAGO 走：你一手都不下（tryPlay 里那道检查会挡住人手落子） */
+  if (state.autoBoth) return false;
   return sideToMove(state.viewAt) === state.myColor;
 }
 
@@ -3644,15 +5580,26 @@ function needAIMove() {
     && !state.noGame            // ★ 未开局：AI 也不落子（否则执白时一启动它就自己下起来了）
     && !state.draft              // ★ 试下（草稿）时 AI 不自动落子 —— 是你在摆，不是在下棋
     && !state.result             // ★ 本局已结束（数子出结果 / 认输）→ 不再落子
+    /* ★★ 双方各停一手（连续两个 pass）= 终局（2026-10-18 用户报的 bug）：
+       自我对弈时 AI 会接着往下 pass —— 一手接一手，盘上出现一串「停一手」，
+       而数子请求还没回来（700ms）、`state.result` 还是空的，于是它继续下。
+       这里直接掐住：连续两 pass 就**一手都不再下**，把局面交给数子。
+       （2026-10-18 之前只靠 `!state.result`，慢了半拍就会出现 3 个、4 个连着的 pass。） */
+    && !isTerminal()
     && engineReadyPlay           // ★ 是「对弈引擎」就绪，不是分析引擎
     && !aiBusy
     && state.viewAt === state.moves.length
-    && !isMyTurn();
+    /* ★ 2026-10-18：双方都自动时，**两个颜色轮到时都要落子**（不看 isMyTurn），
+       只受人按的「暂停」约束。 */
+    && (state.autoBoth ? !state.autoPaused : !isMyTurn());
 }
 
 function scheduleAIMove(delay) {
   clearTimeout(aiTimer);
-  aiTimer = setTimeout(maybeAIMove, delay === undefined ? 120 : delay);
+  /* 自我对弈时放慢一点 —— 一手接一手地闪，看不清棋是怎么下的；
+     顺带留点时间给**分析引擎**把这一手之前那个局面算完（「解说词」卡的目损/PV 要用）。 */
+  const d = delay === undefined ? (state.autoBoth ? 600 : 120) : delay;
+  aiTimer = setTimeout(maybeAIMove, d);
 }
 
 /* 从结果里挑一手。
@@ -3723,8 +5670,10 @@ async function maybeAIMove() {
 
   let retry = false;
   try {
-    /* AI 认输判断：落后太多就投子。放在发请求之前 —— 没必要为一个已输的局面再算一遍。 */
-    if (aiWantsResign()) {
+    /* AI 认输判断：落后太多就投子。放在发请求之前 —— 没必要为一个已输的局面再算一遍。
+       ★ 自我对弈时**不认输**（2026-10-18）：两边都是 AI，一方领先 20 目就投子，
+         那这局就永远看不到后半盘了 —— 用户要的是看它自己下完。 */
+    if (!state.autoBoth && aiWantsResign()) {
       const aiSide = state.myColor === 'b' ? 'w' : 'b';
       doResign(aiSide, 'ai');
       flash('KATAGO 认输 · ' + (aiSide === 'w' ? '黑' : '白') + '方胜');
@@ -3780,6 +5729,7 @@ async function maybeAIMove() {
     if (pick === 'pass') {
       aiRetry = 0;
       state.moves.push({ pass: true, color: sideToMove(state.moves.length) });
+      noteTreeMove();
       clearCoachAt(state.moves.length);    // 该手号上的旧讲解作废
       state.viewAt = state.moves.length;
       syncUI();
@@ -3801,6 +5751,14 @@ async function maybeAIMove() {
     if (retry && needAIMove()) {
       if (aiRetry < 3) { aiRetry += 1; scheduleAIMove(500); }
       else { aiRetry = 0; flash('AI 连续几次没能落子，请检查引擎是否正常'); }
+    }
+    /* ★★ 双方都由 KATAGO 走：这一手落成后**又轮到对方**，必须在这里再排一次
+       （2026-10-18，实测 bug）。平时这条路是"人落子 → syncUI（那时 aiBusy 已放开）→ 排 AI"，
+       但自我对弈里触发下一手的是 **AI 自己**，而那一刻 `aiBusy` 还是 true →
+       `needAIMove()` 为假 → syncUI 排不出来 → **下完一手就停住**
+       （探针实测：手数停在 1，之后 80 秒一动不动，而 needAIMove 一直是 true）。 */
+    else if (state.autoBoth && !state.autoPaused && needAIMove()) {
+      scheduleAIMove();
     }
   }
 }
@@ -4074,6 +6032,7 @@ if (window.api) {
     if (typeof p.turn === 'number' && p.turn !== state.viewAt) return;
     applyAnalysis(p, state.viewAt);
     draw();
+    renderCommentBox();      // 中间报告也在刷新「这一手的分析」那块文字（见 runAnalysisOnce 里的注释）
   });
 }
 
@@ -4145,6 +6104,15 @@ const CLOCK_PRESETS = {
 /* 没设过名字时的默认叫法（按模式区分） */
 function defaultName(color) {
   if (settings.mode === 'free') return color === 'b' ? 'PLAYER1' : 'PLAYER2';
+  /* ★ 习题练习：一方是你、另一方是 KATAGO（谁执哪一方看 settings.taicolor）。
+     ⚠️ **不能落到下面那条 `color === state.myColor`** —— 「我下两边」时两边都是你在走，
+        写成 PLAYER / KATAGO 会读成"KATAGO 在执一方"，是误导。 */
+  if (settings.mode === 'tsumego') {
+    if (state.tsumego && state.tsumego.defend === 'both') return color === 'b' ? '黑（你）' : '白（你）';
+    return color === tsAIColor() ? 'KATAGO' : '你';
+  }
+  /* ★ 双方都由 KATAGO 走：两边都叫 KATAGO（2026-10-18） */
+  if (state.autoBoth) return 'KATAGO';
   return color === state.myColor ? 'PLAYER' : 'KATAGO';
 }
 
@@ -4714,61 +6682,610 @@ function renderCurve() {
 
 let lastScrolledAt = -1;      // 列表上次自动滚到的手数（免得边算边刷时反复把用户拽回来）
 
+/* 某一手的「涨跌 / 目损」那一格。i = **当前手顺**里的下标（0 起）。
+   树里不在当前线上的手没有评价数据 → 调用方传 onLine=0，不给这一格。
+   ★ leftPx：树是绝对定位的，这一格要摆在**整棵树右边**（不是跟着圆圈走）——
+     跟着圆圈走会正好压在下一列的圆圈上（同一手的另一条分支）。 */
+function moveLossHtml(i, m, leftPx) {
+  const at = ' style="left:' + leftPx + 'px"';
+  const rvLoss = state.review ? state.review.losses[i] : null;
+  if (typeof rvLoss === 'number') {
+    const lv = lossLevel(rvLoss);
+    const t = '这一手亏 ' + rvLoss.toFixed(1) + ' 目' + (lv ? '（' + lv.label + '）' : '');
+    return rvLoss < 0.05
+      ? '<span class="dl rv-ok"' + at + ' title="' + t + '">0</span>'
+      : '<span class="dl ' + (lv ? 'rv-' + lv.cls : '') + '"' + at + ' title="' + t + '">−' + rvLoss.toFixed(1) + '</span>';
+  }
+  /* 这一手让「下棋方」的胜率变化了多少（黑方胜率下降 = 白棋走得好）
+     ★ 必须等这一手**算准了**才显示数字（evalSettled）。
+       否则刚落子那 0.3 秒的粗算值会先摆出来，过一会儿又变成收敛值 ——
+       用户看到的就是「数字自己跳」。没算准就先显示「…」。 */
+  const h = state.history[i + 1], prev = state.history[i];
+  if (typeof h === 'number' && typeof prev === 'number' && evalSettled(i + 1)) {
+    const d = (h - prev) * 100 * (m.color === 'b' ? 1 : -1);
+    if (Math.abs(d) >= 0.05) {
+      return `<span class="dl ${d < 0 ? 'bad' : ''}"${at}>${d > 0 ? '+' : ''}${d.toFixed(1)}%</span>`;
+    }
+    return '';
+  }
+  if (typeof h === 'number' && !evalSettled(i + 1)) {
+    return '<span class="dl calc"' + at + ' title="这一手还在算，算准了才显示涨跌">…</span>';
+  }
+  return '';
+}
+
+/* 树最多画多少个节点 —— 有些职业棋谱挂了几百个变化图，全画出来又慢又没法看。 */
+const MOVE_ROWS_LIMIT = 800;
+
+/* ★ 手数卡 = **圆圈 + 折线** 的分支树（2026-10-18 第三次改版，按用户手绘的样式）：
+   · 每一手画成一个**黑白棋子圆圈**，圈内是第几手；**不显示坐标**（悬停 title 里给）；
+   · 同一手位置的不同走法**往右挪一列**，从分枝点用**折线**接过去（竖 → 横 → 竖），
+     就是用户画的那张图：主变化一直往下走，分叉往右边伸出去再往下；
+   · **点圆圈** = 跳到那一手（不在当前线上就整条线切过去）。
+
+   布局：row = 第几手（同一手的不同分支落在同一行），col = 第几列。
+   ★ 列**只增不减**（每条分支独占一列）→ 同一列上的圆圈必然属于同一条线，
+     竖线才能一笔画到底，不会出现"一条线穿过别的分支"那种错线。
+   ★ 用"绝对定位的圆圈 + 一层 SVG 折线"，而不是嵌套列表：嵌套列表只能靠
+     border-left + 缩进画竖线，**画不出从分枝点折出去的横线**（第一版就是这样）。 */
+
+const MV_DOT = 22;     // 圆圈直径
+const MV_ROW = 27;     // 每一手占的竖直间距（圆圈 22 + 空隙 5 —— 用户要求"相邻圆圈不要那么空"）
+const MV_COL = 28;     // 每往右一列的水平间距
+const MV_PAD_X = 7;    // 左上留白
+const MV_PAD_Y = 6;
+
 function renderMoveList() {
-  const ul = $('movelist');  const total = state.moves.length;
-  if (!total) { ul.innerHTML = '<li class="empty">还没有落子</li>'; return; }
+  const ul = $('movelist');
 
-  let html = '';
-  for (let i = 0; i < total; i++) {
-    const m = state.moves[i];
-    const side = m.color === 'b' ? '黑' : '白';
-    const pt = m.pass ? '停一手' : GTP_COLS[m.x] + (N - m.y);
+  if (!state.moves.length && !state.varRoot) {
+    ul.innerHTML = '<li class="empty">还没有落子</li>';
+    ul.style.height = '';
+    return;
+  }
 
-    /* 右侧标记：有复盘数据就显示**目损**（比胜率涨跌直观，且是我们逐手算出来的）；
-       没有复盘数据时退回「胜率涨跌 %」。 */
-    let dl = '';
-    const rvLoss = state.review ? state.review.losses[i] : null;
-    if (typeof rvLoss === 'number') {
-      const lv = lossLevel(rvLoss);
-      const t = '这一手亏 ' + rvLoss.toFixed(1) + ' 目' + (lv ? '（' + lv.label + '）' : '');
-      dl = rvLoss < 0.05
-        ? '<span class="dl rv-ok" title="' + t + '">0</span>'
-        : '<span class="dl ' + (lv ? 'rv-' + lv.cls : '') + '" title="' + t + '">−' + rvLoss.toFixed(1) + '</span>';
-    } else {
-      /* 这一手让「下棋方」的胜率变化了多少（黑方胜率下降 = 白棋走得好）
-         ★ 必须等这一手**算准了**才显示数字（evalSettled）。
-           否则刚落子那 0.3 秒的粗算值会先摆出来，过一会儿又变成收敛值 ——
-           用户看到的就是「数字自己跳」。没算准就先显示「…」。 */
-      const h = state.history[i + 1], prev = state.history[i];
-      if (typeof h === 'number' && typeof prev === 'number' && evalSettled(i + 1)) {
-        const d = (h - prev) * 100 * (m.color === 'b' ? 1 : -1);
-        if (Math.abs(d) >= 0.05) {
-          dl = `<span class="dl ${d < 0 ? 'bad' : ''}">${d > 0 ? '+' : ''}${d.toFixed(1)}%</span>`;
+  const curPath = state.varRoot ? varPath() : [];
+  const nodes = [];        // 顺序 = data-r
+  /* ★ 列分配（2026-10-19 第三版）三条规则：
+     ① 新分支取**最靠左的空列** —— 不然主线中盘再分叉会跳到第 3、第 4 列（第一版用 nextCol++）；
+     ② 「空」= `colEnd[c] + 1 < row`：同一列上一段结束之后**至少空一行**才复用 ——
+        否则上下两条互不相干的分支会贴着排在同一列，看着像同一条线（第二版踩过）；
+     ③ 主链（i=0 那个孩子）照例跟父节点同列，但**落下去之前要查这一格是不是被别的分支占了**：
+        你自己那条分支往后长的时候，很可能正好长到下面那条老分支头上（用户 2026-10-19 报的
+        「上面分支继续走会和下面的重叠」）。这时把**下面那条分支整体往右挪** ——
+        长的是"你正在下的这条线"，挪它会半路拐弯；挪下面那条只是折线长一点。 */
+  const colEnd = [];                    // colEnd[c] = 第 c 列被占用到的最后一行
+  const allocCol = (minCol, row) => {
+    for (let c = minCol; ; c++) if ((colEnd[c] || 0) + 1 < row) return c;
+  };
+  const useCol = (col, row) => { if ((colEnd[col] || 0) < row) colEnd[col] = row; };
+
+  /* 占位网格 + 分组：同一棵子树算一组，挪的时候整组一起挪 */
+  const grid = new Map();               // "行,列" → 节点
+  const grpList = [];                   // grp → [节点]
+  const keyOf = (r, c) => r + ',' + c;
+  const cellsOf = g => grpList[g] || [];
+  const rebuildColEnd = () => {
+    colEnd.length = 0;
+    for (const nd of nodes) useCol(nd.col, nd.row);
+  };
+  /* 撞位处理（2026-10-19 用户定）：**动新的、不动老的** ——
+     新长出来的分支和已有分支撞上时，把**自己这条分支整组往右挪**，已有分支原地不动。
+     整组一起挪是为了让这条分支保持笔直：只挪撞上的那一格，线会半路拐个弯，
+     看着像又分叉了一次。返回挪好之后这一手该落的列。 */
+  const arrangeRight = (row, col, selfGrp) => {
+    if (!grid.has(keyOf(row, col))) return col;          // 没撞上 → 原样
+    if (!selfGrp) return allocCol(col + 1, row);         // 主线（0 组）不整组挪，兜底往右一格
+    for (let d = 1; d <= 40; d++) {                      // 40 是兜底，别在极端盘面上死循环
+      if (grid.has(keyOf(row, col + d))) continue;       // 目标格得空着
+      let ok = true;
+      for (const nd of cellsOf(selfGrp)) {
+        const o = grid.get(keyOf(nd.row, nd.col + d));
+        if (o && o.grp !== selfGrp) { ok = false; break; }
+      }
+      if (!ok) continue;
+      for (const nd of cellsOf(selfGrp)) grid.delete(keyOf(nd.row, nd.col));
+      for (const nd of cellsOf(selfGrp)) { nd.col += d; grid.set(keyOf(nd.row, nd.col), nd); }
+      rebuildColEnd();
+      return col + d;
+    }
+    return col;
+  };
+  let cut = 0, grpSeq = 0;
+
+  const add = (m, n, col, onLine, path, parent, grp) => {
+    if (nodes.length >= MOVE_ROWS_LIMIT) { cut++; return null; }
+    const nd = {
+      m, n, col, row: n, onLine, path, parent, grp,
+      draft: onLine > 0 && state.draft && onLine > state.draft.from,
+    };
+    nodes.push(nd);
+    if (typeof grp === 'number') {
+      (grpList[grp] = grpList[grp] || []).push(nd);
+      grid.set(keyOf(n, col), nd);
+    }
+    return nd;
+  };
+
+  if (!state.varRoot) {
+    /* 没有变化树（自己下的一局 / 手摆的题）：就是一列 */
+    let prev = null;
+    for (let i = 0; i < state.moves.length; i++) {
+      prev = add(state.moves[i], i + 1, 0, i + 1, null, prev);
+      if (!prev) break;
+    }
+  } else {
+    let tailDone = false;
+    /* 子树高度（这一手下面最多还有几行）—— 分配列时要**按整棵子树**占位，见 grow 里那句。 */
+    const hCache = new Map();
+    const hOf = nd => {
+      if (!nd) return 0;
+      if (hCache.has(nd)) return hCache.get(nd);
+      let best = 0;
+      for (const c of nd.children || []) if (c.move) best = Math.max(best, hOf(c));
+      const h = best + 1;
+      hCache.set(nd, h);
+      return h;
+    };
+    /* ★★ 分支的列**先按"行号从深到浅"排好**（2026-10-19 用户手绘那张图）：
+       深的分支贴近主线（列小），浅的分支被挤到右边。
+       例：第 4 手后分出两条 → 占 1、2 列；第 2 手后分出的那条（它一直长到第 6 行）→ 第 3 列。
+       为什么不能"边 DFS 边分配"：DFS 是浅的先分，第 2 手那个分支会先抢到第 1 列 ——
+       用户的图正好相反。父节点的列还不知道就先跳过，下一轮再排（最多按层级跑几轮）。 */
+    const parentOf = new Map();
+    const colAt = new Map();               // 分支起始节点 → 列
+    {
+      const starts = [];
+      const walk = (nd, row) => {
+        const kids = (nd.children || []).filter(c => c.move);
+        for (let i = 0; i < kids.length; i++) {
+          parentOf.set(kids[i], nd);
+          if (i > 0) starts.push({ nd: kids[i], row });
+          walk(kids[i], row + 1);
         }
-      } else if (typeof h === 'number' && !evalSettled(i + 1)) {
-        /* 还在算 → 给个占位，让用户知道这里会有数字（不是坏了） */
-        dl = '<span class="dl calc" title="这一手还在算，算准了才显示涨跌">…</span>';
+      };
+      walk(state.varRoot, 1);
+      /* 某个节点现在能不能定出列：顺着 children[0] 一路往上，碰到已分配的分支就取它，走到根 = 0 */
+      const colOf = nd => {
+        let cur = nd, guard = 0;
+        while (cur && cur !== state.varRoot && guard++ < 20000) {
+          if (colAt.has(cur)) return colAt.get(cur);
+          const p = parentOf.get(cur);
+          if (!p) return null;
+          const sibs = (p.children || []).filter(c => c.move);
+          if (sibs[0] !== cur) return null;      // 它自己就是没分配的分支
+          cur = p;
+        }
+        return 0;
+      };
+      starts.sort((a, b) => b.row - a.row);      // 深的先排
+      let pending = starts;
+      for (let pass = 0; pass < 40 && pending.length; pass++) {
+        const next = [];
+        for (const it of pending) {
+          const p = parentOf.get(it.nd);
+          const pc = (p === state.varRoot) ? 0 : colOf(p);
+          if (pc === null) { next.push(it); continue; }
+          const col = allocCol(pc + 1, it.row);
+          colAt.set(it.nd, col);
+          useCol(col, it.row + hOf(it.nd) - 1);
+        }
+        if (next.length === pending.length) { pending = next; break; }   // 没进展
+        pending = next;
+      }
+      /* 兜底：嵌套太深、父节点一直定不下来的，按从深到浅各取一列 */
+      for (const it of pending) {
+        const col = allocCol(1, it.row);
+        colAt.set(it.nd, col);
+        useCol(col, it.row + hOf(it.nd) - 1);
       }
     }
-    /* 试下（草稿）里下的手单独标出来 —— 免得过一会儿忘了自己在草稿里 */
-    const isDraft = state.draft && (i + 1) > state.draft.from;
-    html += `<li data-n="${i + 1}" class="${state.viewAt === i + 1 ? 'cur' : ''}${isDraft ? ' draft' : ''}">`
-      + `<span class="no">${i + 1}</span><span class="st">${side}</span>`
-      + `<span class="pt">${pt}</span>`
-      + (isDraft ? '<span class="dft">草</span>' : '')
-      + dl + '</li>';   // 「涨跌」靠 margin-left:auto 顶到最右，所以草稿标记要放它前面
+
+    const grow = (parent, kids, n, path, grp) => {
+      if (!kids.length) return;
+      /* ★ 两步走（2026-10-19 第二次修，别改回去）：
+         ① **先**给这一组兄弟占列 —— 同一手的几条走法必须**横着挨在一起**（0,1,2…），
+            所以先按顺序各取一个空列、并记下"这一列占到了第 n 行"；
+         ② 再逐个往下长。等到主线深处（比如第 9 手）又要分叉时，第 1 列虽然在第 6 行
+            被某条短分支占过，但那一列**到第 6 行就结束了** → 仍然可以复用。
+         只做①（先父后子）会让深层分叉抢走兄弟的列，只做②（纯 DFS）会让兄弟被挤到
+         更右边 —— 两个顺序都试过，必须是"①先占、②再长"。 */
+      const cols = [], grps = [];
+      for (let i = 0; i < kids.length; i++) {
+        let col, g;
+        if (i === 0) {
+          col = parent ? parent.col : 0;
+          g = parent ? parent.grp : 0;
+          /* 主链往下长，可能长到下面那条老分支的头上 → 把自己这条分支整组往右让 */
+          if (parent) col = arrangeRight(n, col, g);
+        } else {
+          /* 分支的列用上面排好的；万一没排上（极端嵌套）就退回现算 */
+          col = colAt.has(kids[i]) ? colAt.get(kids[i])
+            : allocCol((parent ? parent.col : -1) + 1, n);
+          g = ++grpSeq;
+        }
+        cols.push(col); grps.push(g);
+        /* ★ 占位要**按整棵子树的高度**留够（2026-10-19）。新分支现在可能只有一两手，
+           但用户随时会往下接着走；只占第一行的话，下面那条分支会被排进同一列，
+           两条就上下贴在一起（用户画的那张图就是这个）。 */
+        useCol(col, n + hOf(kids[i]) - 1);
+      }
+      for (let i = 0; i < kids.length; i++) {
+        const p = path.concat([kids[i]]);
+        const nd = add(kids[i].move, n, cols[i], curPath[n - 1] === kids[i] ? n : 0, p, parent, grps[i]);
+        if (!nd) continue;
+        /* 走到"当前这条线的最后一手" → 把用户在这份棋谱上**续下**的手接在后面。
+           ★ 树上这个位置若还有别的走法（你下了一手 SGF 里没有的棋），
+             那本身就是一条新变化 → 另起一列，跟别的分支一样折出去，不能压在原列上。 */
+        if (!tailDone && p.length === curPath.length) {
+          tailDone = true;
+          /* ★ 只有**真的还有续下的手**才排这一段（2026-10-19 修）：原来不管有没有，
+             都会先 `useCol(tcol, ...)` 白占一列 —— 于是同一棵树在切换主线/分支时列会整跳一格。 */
+          if (state.moves.length > curPath.length) {
+            let tcol = kids[i].children.some(c => c.move) ? allocCol(nd.col + 1, n + 1) : nd.col;
+            let prev = nd;
+            for (let k = curPath.length; k < state.moves.length; k++) {
+              tcol = arrangeRight(k + 1, tcol, nd.grp);   // 续下的手同样可能撞到别的分支
+              prev = add(state.moves[k], k + 1, tcol, k + 1, null, prev, nd.grp);
+              if (!prev) break;
+            }
+            useCol(tcol, state.moves.length);      // 这一段续下的手把这一列占到底
+          }
+        }
+        grow(nd, kids[i].children.filter(c => c.move), n + 1, p, grps[i]);
+      }
+    };
+    grow(null, state.varRoot.children.filter(c => c.move), 1, [], 0);
+    /* 树上一条线都没匹配上（比如刚清空手顺）：续下的手直接排第一列 */
+    if (!tailDone && state.moves.length) {
+      let prev = null;
+      for (let i = 0; i < state.moves.length; i++) {
+        prev = add(state.moves[i], i + 1, 0, i + 1, null, prev);
+        if (!prev) break;
+      }
+    }
   }
+
+  if (!nodes.length) {
+    ul.innerHTML = '<li class="empty">还没有落子</li>';
+    ul.style.height = '';
+    return;
+  }
+
+  let maxCol = 0, maxRow = 0;
+  for (const nd of nodes) {
+    nd.x = MV_PAD_X + nd.col * MV_COL;
+    nd.y = MV_PAD_Y + (nd.row - 1) * MV_ROW;
+    if (nd.col > maxCol) maxCol = nd.col;
+    if (nd.row > maxRow) maxRow = nd.row;
+  }
+  /* 「涨跌 / 目损」那一格统一摆在**整棵树的右边**：跟着圆圈走会正好压在
+     下一列的圆圈上（同一手的另一条分支就在那一列）。 */
+  const treeRight = MV_PAD_X + maxCol * MV_COL + MV_DOT;
+  const badgeX = treeRight + 8;
+  const h = maxRow * MV_ROW + MV_PAD_Y;
+
+  /* 折线：同一列 → 一笔竖线；换了列 → 竖-横-竖（横线走在两行之间） */
+  let paths = '';
+  for (const nd of nodes) {
+    const p = nd.parent;
+    if (!p) continue;
+    const px = p.x + MV_DOT / 2, py = p.y + MV_DOT;
+    const cx = nd.x + MV_DOT / 2, cy = nd.y;
+    const cls = nd.onLine ? ' class="on"' : '';
+    if (nd.col === p.col) {
+      paths += '<path' + cls + ' d="M' + px + ' ' + py + 'L' + cx + ' ' + cy + '"/>';
+    } else {
+      const mid = Math.round((py + cy) / 2);
+      paths += '<path' + cls + ' d="M' + px + ' ' + py + 'L' + px + ' ' + mid
+        + 'L' + cx + ' ' + mid + 'L' + cx + ' ' + cy + '"/>';
+    }
+  }
+
+  let html = '';
+  for (let k = 0; k < nodes.length; k++) {
+    const nd = nodes[k];
+    const m = nd.m;
+    const coord = m.pass ? '停一手' : GTP_COLS[m.x] + (N - m.y);
+    const bLeft = badgeX - nd.x;
+    html += '<li class="mv' + (nd.onLine ? ' on' : '')
+      + (nd.onLine > 0 && state.viewAt === nd.onLine ? ' cur' : '')
+      + (nd.draft ? ' draft' : '') + '" data-r="' + k + '" data-n="' + nd.n + '"'
+      + ' style="left:' + nd.x + 'px;top:' + nd.y + 'px"'
+      + ' title="第 ' + nd.n + ' 手 · ' + (m.color === 'b' ? '黑' : '白') + ' ' + coord + '">'
+      + '<span class="dot ' + (m.color === 'b' ? 'b' : 'w') + (nd.n >= 100 ? ' d3' : '') + '">'
+      + nd.n + '</span>'
+      + (nd.draft ? '<span class="dft" style="left:' + bLeft + 'px">草</span>' : '')
+      + (nd.onLine > 0 ? moveLossHtml(nd.onLine - 1, m, bLeft + (nd.draft ? 17 : 0)) : '')
+      + '</li>';
+  }
+  if (cut) {
+    html += '<li class="empty" style="position:absolute;left:6px;top:' + h
+      + 'px">（还有 ' + cut + ' 个分支没画出来 —— 太多了）</li>';
+  }
+
   ul.innerHTML = html;
-  ul.querySelectorAll('li[data-n]').forEach(li => {
-    li.onclick = () => gotoView(+li.dataset.n);
+  /* 折线层：用 div 包一次再取 svg，保证按 SVG 命名空间创建（直接给 div.innerHTML 也行，
+     但显式写 xmlns 更稳）。它**不是 li**，所以不影响任何按 li 数条目的判据。 */
+  const holder = document.createElement('div');
+  holder.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="tree-lines" width="'
+    + Math.max(treeRight + 4, 40) + '" height="' + (h + 4) + '">' + paths + '</svg>';
+  ul.insertBefore(holder.firstChild, ul.firstChild);
+  ul.style.height = h + 'px';
+
+  ul.querySelectorAll('li[data-r]').forEach(li => {
+    const nd = nodes[+li.dataset.r];
+    li.onclick = () => gotoTreeRow(nd);
+    /* 右键 → 删除这一手及以后（2026-10-19 用户要求）。只在有变化树时给菜单：
+       一局自己下到底、没有分支的时候没有"分支"可删，菜单也就没意义。 */
+    li.oncontextmenu = e => {
+      if (!state.varRoot || !nd || !nd.path) return;
+      e.preventDefault();
+      openMoveMenu(e.clientX, e.clientY, nd);
+    };
   });
 
-  /* 当前那一手滚进可视区（只在「看的那手」变化时滚，免得边算边刷新时一直把用户拽回来） */
+  /* 当前那一手滚进可视区（只在「看的那手」变化时滚，免得边算边刷时反复把用户拽回来） */
   const cur = ul.querySelector('li.cur');
   if (cur && lastScrolledAt !== state.viewAt) {
     cur.scrollIntoView({ block: 'nearest' });
     lastScrolledAt = state.viewAt;
   }
+}
+
+/* ---------------- 手数卡的右键菜单：删除分支（2026-10-19） ----------------
+   用户要求：右键点某一手 → 菜单「删除」→ 把**这一点和它以下的所有手**一起删掉。
+   删的是"这一手 + 它的整棵子树"；它的**兄弟分支不受影响**（那才是"删分支"的意思）。 */
+let mvMenuAt = null;
+
+function openMoveMenu(x, y, nd) {
+  const m = $('mv-menu');
+  if (!m) return;
+  mvMenuAt = nd;
+  const node = nd.path[nd.path.length - 1];
+  const kids = (node.children || []).filter(c => c.move).length;
+  const del = $('mv-del');
+  /* 菜单文字就两个字（2026-10-19 用户要求精简）；删几手放在悬停提示里 */
+  del.textContent = '删除';
+  del.title = '删掉第 ' + nd.n + ' 手及以后（共 ' + countSubtree(node) + ' 手）'
+    + (kids ? '，包括它下面的 ' + kids + ' 条分支' : '');
+  m.hidden = false;
+  /* 贴边时往里收一点，别跑出窗口 */
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.max(4, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
+  m.style.top = Math.max(4, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+}
+
+function closeMoveMenu() {
+  const m = $('mv-menu');
+  if (m) m.hidden = true;
+  mvMenuAt = null;
+}
+
+/* 这一手 + 它以下一共多少手 */
+function countSubtree(nd) {
+  let n = 1;
+  for (const c of nd.children || []) if (c.move) n += countSubtree(c);
+  return n;
+}
+
+/* 真正删：从树里摘掉这一手（连带整棵子树）。
+   ★ 如果删的是**当前这条线**上的手 → 线退到它的父节点（前面那些手留着），
+     并整条重建局面（applyVariationLine 会清掉分析 / 结果，再重新算）。
+     删的要是别的分支 → 当前这盘棋一点没动，只少了一条变体。 */
+function deleteMoveSubtree(nd) {
+  if (!nd || !nd.path || !nd.path.length || !state.varRoot) return;
+  const target = nd.path[nd.path.length - 1];
+  const parent = nd.path.length >= 2 ? nd.path[nd.path.length - 2] : state.varRoot;
+  const i = parent.children.indexOf(target);
+  if (i < 0) return;
+  const killed = countSubtree(target);
+  parent.children.splice(i, 1);
+  if (nd.onLine > 0) {
+    applyVariationLine(nd.path.slice(0, nd.path.length - 1), nd.onLine - 1);
+    flash('已删除第 ' + nd.n + ' 手及以后（共 ' + killed + ' 手）—— 现在停在它之前');
+  } else {
+    syncUI();
+    flash('已删除那条分支（共 ' + killed + ' 手），当前这盘棋没动');
+  }
+}
+
+$('mv-del').onclick = () => {
+  const nd = mvMenuAt;
+  closeMoveMenu();
+  if (nd) deleteMoveSubtree(nd);
+};
+/* 点别处 / 按 Esc / 滚动手数卡 → 收起菜单 */
+document.addEventListener('click', e => {
+  const m = $('mv-menu');
+  if (m && !m.hidden && !m.contains(e.target)) closeMoveMenu();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMoveMenu(); });
+window.addEventListener('resize', closeMoveMenu);
+
+/* 点树上的某一行：在当前这条线上 → 只是跳过去看；不在当前线 → 换成它那条线再看那一手。 */
+function gotoTreeRow(r) {
+  if (!r) return;
+  if (r.onLine) { gotoView(r.onLine); return; }
+  const line = r.path.slice();
+  let nd = r.path[r.path.length - 1];
+  for (;;) {
+    const nx = nd.children.find(c => c.move);
+    if (!nx) break;
+    line.push(nx); nd = nx;
+  }
+  applyVariationLine(line, r.path.length);
+  flash('已切到另一条分支 · 这条线共 ' + state.moves.length + ' 手');
+}
+
+/* ---------------- 棋谱变体：换线（2026-10-17） ----------------
+   数据模型很克制：`state.moves` 仍然是**当前这一条线**（分析 / 复盘 / 数子 / 导出全都只认它），
+   `state.varRoot` 只是那份棋谱的整棵树，用来① 在手数列表标出分支点 ② 换线。
+   换线 = 把 moves 整条重建成"另一个兄弟变体 + 它的主变化"，而不是维护一份"当前路径"状态
+   （少一份状态就少一处不一致）。 */
+
+/* ---------------- 对弈中「回看落子」= 开一条新分支（2026-10-19） ----------------
+   数据模型没变：`state.moves` 仍是**当前这条线**，树只是额外记着"别的走法"。
+   原来 `state.varRoot` 只有打开棋谱时才有；现在自己下的棋也能有 —— 第一次在历史局面
+   上落子时，先把当前这条线整条落进树里（ensureTree），此后每落一手就挂一个孩子
+   （noteTreeMove）。于是手数卡会画成分支树、导出也带着分支。 */
+
+/* 两个手顺是不是同一点（颜色 + 坐标；都是 pass 也算同一个） */
+function sameMove(a, b) {
+  if (!a || !b) return false;
+  if (!!a.pass !== !!b.pass) return false;
+  if (a.pass) return true;
+  return a.x === b.x && a.y === b.y;
+}
+
+/* 手里没有树 → 按**当前这条线**建一棵（线性的）。已有树就原样返回。 */
+function ensureTree() {
+  if (state.varRoot) return state.varRoot;
+  const root = { props: [], at: -1, end: -1, move: null, comment: '', children: [] };
+  let cur = root;
+  for (const m of state.moves) {
+    const nd = {
+      props: [], at: -1, end: -1, comment: '',
+      move: { color: m.color, x: m.x, y: m.y, pass: !!m.pass },
+      children: [],
+    };
+    cur.children.push(nd);
+    cur = nd;
+  }
+  state.varRoot = root;
+  return root;
+}
+
+/* 把第 at 手（0 = 还没落子）**之后**的 mv 挂进树。已经有一模一样的孩子就复用。
+   ★ 2026-10-19 用户要求：新分支挂在**右边**（push 到最后）—— 原来的走法留在主线那一列，
+     新下出来的一条算变体。所以这里不再区分 front。 */
+function attachTreeMove(at, mv) {
+  if (!mv) return null;
+  const root = ensureTree();
+  let nd = root;
+  for (let i = 0; i < at; i++) {
+    const m = state.moves[i];
+    const nx = nd.children.find(c => c.move && sameMove(c.move, m));
+    if (!nx) return null;                 // 树和手顺对不上（不该发生）→ 宁可不挂，别写歪
+    nd = nx;
+  }
+  let kid = nd.children.find(c => c.move && sameMove(c.move, mv));
+  if (!kid) {
+    kid = {
+      props: [], at: -1, end: -1, comment: '',
+      move: { color: mv.color, x: mv.x, y: mv.y, pass: !!mv.pass },
+      children: [],
+    };
+    nd.children.push(kid);
+  }
+  return kid;
+}
+
+/* 落完一手后调一下：树存在时把它挂上去（没有树就不用管，建树时会整条重建） */
+function noteTreeMove() {
+  if (!state.varRoot || !state.moves.length) return;
+  attachTreeMove(state.moves.length - 1, state.moves[state.moves.length - 1]);
+}
+
+/* 回看中要落子 / 停一手 → 把手顺截到当前看着的那一手，后面的手留在树上当分支。
+   返回 true 表示"这是一次新开分支"。习题练习与试下不掺和（各有各的规则）。 */
+function cutForBranch() {
+  if (state.viewAt === state.moves.length) return false;
+  const at = state.viewAt;
+  ensureTree();
+  state.moves = state.moves.slice(0, at);
+  truncateAnalysisTo(at);                 // 后面那些手的分析 / 走势 / 快照都作废
+  state.toMove = sideToMove(at);
+  state.koPoint = koFromBoard(boardAt(at), state.moves);
+  state.viewAt = at;
+  state.result = null;
+  state.pv = null;
+  flash('在第 ' + at + ' 手处新开一条分支 —— 原来后面的手留在「手数」卡的分支树里');
+  return true;
+}
+
+/* 当前手顺在树上对应的节点（下标 = 手数-1）。用户自己接着下的手不在树上 → 截到那里为止。 */
+function varPath() {
+  const root = state.varRoot;
+  if (!root) return [];
+  const path = [];
+  let nd = root;
+  for (let i = 0; i < state.moves.length; i++) {
+    const m = state.moves[i];
+    let next = null;
+    for (const c of nd.children) {
+      if (!c.move) continue;
+      if (!!c.move.pass !== !!m.pass) continue;
+      if (!m.pass && (c.move.x !== m.x || c.move.y !== m.y)) continue;
+      next = c; break;
+    }
+    if (!next) break;
+    path.push(next);
+    nd = next;
+  }
+  return path;
+}
+
+/* 第 n 手（1 起）是不是分支点。是 → { node, sibs, k }（k = 当前在兄弟里的序号）。 */
+function varAt(n) {
+  if (!state.varRoot || n < 1) return null;
+  const path = varPath();
+  const nd = path[n - 1];
+  if (!nd) return null;
+  const parent = n >= 2 ? path[n - 2] : state.varRoot;
+  const sibs = parent.children.filter(c => c.move);
+  if (sibs.length < 2) return null;
+  const k = sibs.indexOf(nd);
+  return k < 0 ? null : { node: nd, sibs, k };
+}
+
+/* Alt+←/→：在**当前看着的这一手**所在的兄弟变体之间循环切换。 */
+function switchVariation(dir) {
+  if (!state.varRoot) { flash('这份棋谱没有分支（分支来自 SGF 里的变体）'); return; }
+  const n = state.viewAt;
+  if (n < 1) { flash('先跳到某一手 —— 分支是从那一手分出来的'); return; }
+  const at = varAt(n);
+  if (!at) {
+    flash('这一手没有别的分支'
+      + (state.varRoot ? '（有分支的手，手数列表里带「变」标记）' : ''));
+    return;
+  }
+  const target = at.sibs[(at.k + dir + at.sibs.length) % at.sibs.length];
+  const path = varPath();
+  const line = path.slice(0, n - 1).concat([target]);
+  let nd = target;
+  for (;;) {                                   // 顺着这条变体的主变化走到头
+    const nx = nd.children.find(c => c.move);
+    if (!nx) break;
+    line.push(nx); nd = nx;
+  }
+  applyVariationLine(line, n);
+  flash('已切到另一条分支 · 这条线共 ' + state.moves.length + ' 手'
+    + '（第 ' + n + ' 手有 ' + at.sibs.length + ' 个分支）');
+}
+
+/* 用一条节点链替换当前手顺。分析数据整批作废 —— 换了条线，旧的胜率/目差不是这个局面的。 */
+function applyVariationLine(line, at) {
+  state.moves = line.map(x => ({
+    color: x.move.color, x: x.move.x, y: x.move.y, pass: !!x.move.pass,
+  }));
+  /* 解说词跟着这条线重建：comments[0] = 开局前，comments[i] = 第 i 手 */
+  const cm = [(state.sgfComments && state.sgfComments[0]) || ''];
+  line.forEach((x, i) => { if (x.comment) cm[i + 1] = x.comment; });
+  state.sgfComments = cm;
+  state.toMove = sideToMove(state.moves.length);
+  state.koPoint = koFromBoard(boardAt(state.moves.length), state.moves);
+  rebuildCapAt();
+  state.viewAt = Math.max(0, Math.min(state.moves.length, at));
+  state.candidates = []; state.candAt = -1;
+  state.ownership = null; state.ownAt = -1;
+  state.history = []; state.leads = []; state.histVisits = [];
+  state.review = null;      // 复盘是按原来那条线算的
+  state.pv = null;
+  state.result = null;
+  state.draft = null;
+  syncUI();
+  scheduleAnalysis(0, true);
 }
 
 /* ---------------- 解说词框（棋谱自带的 C[]，2026-10-06 用户要求） ----------------
@@ -4801,6 +7318,93 @@ function quizTxt() {
   return ` · ${q.total === 2 ? '第 ' + q.n + ' 题（共 2 题）' : '第 ' + q.n + ' 题 / 共 ' + q.total + ' 题'}`;
 }
 
+/* ---------------- 逐手分析明细（2026-10-18 用户要求） ----------------
+
+   人机对弈 / 双人摆棋时，右侧「解说词」卡显示**这一手的引擎分析**：
+     手数 118: W L14 / 分数 / 胜率 / 目数损失 / 推荐最佳选点 + PV / 直觉选点排名
+   数据全部来自 applyAnalysis 存下的 state.anaAt（第 at 手之前 + 之后各一份快照）。
+
+   ★ 三处口径必须说清（都是这个项目踩过的坑）：
+     ① 快照里的 win / lead 是**黑方视角**，本函数只在"走子方视角"时才乘 sgn；
+     ② 目数损失 = 最佳选点的期望目差 − 实际走完的目差（同一个走子方视角相减）；
+     ③ 「直觉选点」= 神经网络**先验**（moveInfos[].prior），不是搜索结论 ——
+        引擎只汇报前若干个候选，prior 是在**这些候选之间**归一化的，所以
+        "87%" 表示"在这几个候选里占 87%"，不是"全盘 87%"。 */
+
+/* PV 的写法：第一手带颜色字母，后面只写坐标（颜色交替）—— 例：WJ13 L14 J14 O17 */
+function pvText(pv, side) {
+  if (!Array.isArray(pv) || !pv.length) return '';
+  const firstIsBlack = side === 'b';
+  return pv.map((g, i) => {
+    if (g === 'pass') return i === 0 ? (firstIsBlack ? 'B' : 'W') + 'pass' : 'pass';
+    const isBlack = (i % 2 === 0) ? firstIsBlack : !firstIsBlack;
+    return i === 0 ? (isBlack ? 'B' : 'W') + g : g;
+  }).join(' ');
+}
+
+/* 领先方 + 目数，例：白+10.8 / 黑+1.5（参数是**黑方视角**的目差） */
+function leadText(lead) {
+  return (lead >= 0 ? '黑+' : '白+') + Math.abs(lead).toFixed(1);
+}
+
+/* 第 k 手那一块的文字。k = 手数（1 起）。 */
+function moveAnalysisText(k) {
+  const mv = state.moves[k - 1];
+  if (!mv) return '';
+  const post = state.anaAt[k] || null;        // 走完这一手之后的局面
+  const pre = state.anaAt[k - 1] || null;     // 走这一手之前的局面（推荐点/直觉/损失都看它）
+  const mover = mv.color;                     // 'b' / 'w'
+  const sgn = mover === 'b' ? 1 : -1;         // 黑方视角 → 走子方视角
+  const L = [];
+
+  L.push('手数 ' + k + ': ' + (mover === 'b' ? 'B' : 'W') + ' '
+    + (mv.pass ? 'pass' : toGTP(mv.x, mv.y)));
+
+  /* 分数 / 胜率：走完这一手之后的局面（引擎还没回来就写"还在算"） */
+  if (post) {
+    L.push('分数: ' + leadText(post.lead));
+    const w = post.lead >= 0 ? post.blackWin : 1 - post.blackWin;
+    L.push('胜率: ' + (post.lead >= 0 ? '黑' : '白') + ' ' + (w * 100).toFixed(1) + '%');
+  } else {
+    L.push('分数: （这一手还在算…）');
+    L.push('胜率: （这一手还在算…）');
+  }
+
+  if (!pre || !pre.best) {
+    L.push('目数损失: （这一手之前没有分析）');
+    L.push('推荐最佳选点: （这一手之前没有分析）');
+    return L.join('\n');
+  }
+
+  /* 目数损失：最佳选点的期望目差 − 实际走完的目差（同一视角相减，负数归零） */
+  if (post) {
+    const bestLead = pre.best.lead * sgn;
+    const actualLead = post.lead * sgn;
+    const loss = Math.max(0, bestLead - actualLead);
+    L.push('目数损失: ' + loss.toFixed(1));
+  } else {
+    L.push('目数损失: （这一手还在算…）');
+  }
+
+  L.push('推荐最佳选点 ' + pre.best.gtp + ' (' + leadText(pre.best.lead) + ')');
+  const pv = pvText(pre.best.pv, pre.side);
+  if (pv) L.push('PV: ' + pv);
+
+  /* 直觉选点 = 先验（prior）排名。只在候选之间比较 —— 见函数顶上第 ③ 条 */
+  const byPrior = pre.moves
+    .filter(m => typeof m.prior === 'number' && m.prior > 0)
+    .sort((a, b) => b.prior - a.prior);
+  if (byPrior.length) {
+    const gtp = mv.pass ? 'pass' : toGTP(mv.x, mv.y);
+    const hit = byPrior.findIndex(m => m.gtp === gtp);
+    L.push(hit >= 0
+      ? '直觉选点下该手棋是 #' + (hit + 1) + ' (' + (byPrior[hit].prior * 100).toFixed(2) + '%)'
+      : '直觉选点下该手棋不在候选里');
+    L.push('最佳直觉选点是 ' + byPrior[0].gtp + ' (' + (byPrior[0].prior * 100).toFixed(1) + '%)');
+  }
+  return L.join('\n');
+}
+
 function renderCommentBox() {
   const box = $('cbox');
   if (!box) return;
@@ -4808,6 +7412,35 @@ function renderCommentBox() {
   if (box.querySelector('textarea')) return;
 
   const at = state.viewAt;
+
+  /* ★ 2026-10-18 用户要求：人机对弈 / 双人摆棋时，这个框改成显示**这一手的分析明细**
+     （分数 / 胜率 / 目数损失 / 推荐选点 + PV / 直觉选点排名）。
+     打谱（fromRecord）仍显示棋谱自带的解说词；习题练习不掺和（那里看棋盘就够）。 */
+  const anaMode = !state.noGame && !state.fromRecord && !tsOn()
+    && (settings.mode === 'play' || settings.mode === 'free');
+  if (anaMode) {
+    const eb = $('cbox-edit');
+    eb.disabled = true;
+    eb.title = '这里是引擎逐手分析，不能编辑（解说词只在打开棋谱时可改）';
+    $('cbox-at').textContent = at === 0 ? '（引擎分析）' : '（第 ' + at + ' 手 · 引擎分析）';
+    box.classList.add('ana');
+    const ph2 = document.createElement('div');
+    ph2.className = 'ph';
+    if (at === 0) {
+      ph2.textContent = '下第一手之后，这里逐手显示引擎分析：分数 / 胜率 / 目数损失 / 推荐选点与 PV / 直觉选点排名。';
+      box.replaceChildren(ph2);
+      return;
+    }
+    const t0 = moveAnalysisText(at);
+    if (t0) { box.textContent = t0; return; }
+    ph2.textContent = engineReady
+      ? '这一手还没有分析数据。'
+      : '先把顶栏的「KataGo」灯点开 —— 这里逐手显示引擎分析（分数 / 胜率 / 目损 / 推荐选点）。';
+    box.replaceChildren(ph2);
+    return;
+  }
+  box.classList.remove('ana');
+
   const list = state.sgfComments || [];
   /* ★ 棋谱说明（根节点那段文字）：在「开局前」这一档显示。
      它不属于任何一手 —— 实测抽样 300 份真实棋谱里 116 份（38%）有这段。
@@ -4985,6 +7618,16 @@ window.addEventListener('keydown', e => {
      按 T 推荐点就没了（用户明确说过「弹窗外的背景不该还能点」，键盘同理）。
      注意判断的是 `.open` —— 遮罩本身是常驻 DOM，不加 .open 时是不可见的。 */
   if (document.querySelector('.modal-mask.open')) return;
+
+  /* ★ Alt+←/→：棋谱变体的兄弟切换（2026-10-17）。
+     位置很关键：必须在**输入框/弹窗两道检查之后**（上面那两处已经 return），
+     又在 `if (e.ctrlKey || e.metaKey)` 之前 —— 否则带修饰键的按键会被那条分支吃掉。 */
+  if (e.altKey && !e.ctrlKey && !e.metaKey
+      && (e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {
+    e.preventDefault();
+    switchVariation(e.code === 'ArrowRight' ? 1 : -1);
+    return;
+  }
 
   if (e.ctrlKey || e.metaKey) {
     if (e.code === 'KeyZ') { e.preventDefault(); $('btn-undo').click(); }

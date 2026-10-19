@@ -42,7 +42,11 @@ body {
   border-bottom: 1px solid var(--line);
 }
 .brand { font-size: 14px; font-weight: 600; letter-spacing: .3px; }
-.status { font-size: 12px; color: var(--text-dim); padding-left: 8px; border-left: 1px solid var(--line); }
+/* 局面摘要 / 动作反馈（flash）。2026-10-14 用户要求：从引擎灯左边挪到「刷新」右边，并改绿色。
+   padding-left + border-left 是顶栏通用的"分隔线"写法 —— 挪位后它正好把状态文字与「刷新」隔开。
+   ⚠️ 这句话**永远有内容**（syncUI 会写局面摘要，flash 会临时覆盖 1.8 秒），所以不会出现"空 span
+      只留一条竖线"的情况。 */
+.status { font-size: 12px; color: var(--accent); padding-left: 8px; border-left: 1px solid var(--line); }
 
 .field { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
 
@@ -122,8 +126,69 @@ body {
 /* 底栏那组开关注释同理：整组不许被压，组内每个控件也不许 */
 .toggles > * { flex: none; white-space: nowrap; }
 
-/* 顶栏里的「人机对弈 / 摆棋」切换：和旁边按钮同高 */
-#seg-mode button { height: 28px; padding: 0 12px; }
+/* ---------- 顶栏「对局模式」：单按钮 + 下拉菜单（2026-10-14 用户要求）----------
+   原来是人机对弈 / 双人摆棋 / 习题练习 三个按钮并排；现在合成一个按钮 + 下拉。
+   ★ 定位方式照抄底栏那个「显示 ▾」（.disp/.disp-menu）：父级 position:relative + 绝对定位，
+     这样不用 fixed 也不用 JS 算坐标。菜单贴着按钮**右对齐**（它在顶栏右侧，右对齐才不会出界）。 */
+.modepick { position: relative; flex: none; }
+/* 按钮宽度**跟文字自然宽**（用户要求：缩小到和原来那个按钮同样宽），内边距 0 12px 与原来那排
+   按钮（#seg-mode button{padding:0 12px}）一致。
+   ★ 也**不放三角**（用户要求去掉）。
+   ★★ 配色**用自己的浅绿胶囊**（2026-10-14 用户要求：浅绿底 / 无边框 / 深绿字）——
+      目的是让"当前处于哪种对弈模式"一眼可见：旁边那些按钮都是白底带边框，唯独它是绿的。
+      用的是全局那两支绿（--accent-soft 底 / --accent 字），跟主按钮、「新对局」、
+      引擎就绪灯同一套色。
+   ⚠️ 边框去掉后比同内边距的邻居窄 2px（那是 border 的宽度），是预期的。
+   ★ 宽度随文字自然宽 —— 改名后**三个模式名都是 4 个字**（人机对弈 / 双人摆棋 / 习题练习），
+     所以切换模式时按钮宽度**不变**（有一条"三名字等宽"的断言钉着）。谁再把某个名字改长，
+     它就会在切换时跳一下 —— 那时要么改名、要么给按钮定宽。 */
+#btn-mode {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
+  background: var(--accent-soft);
+  border: 0;
+  color: var(--accent);
+}
+/* 悬停 / 展开：底再深一点点（不然悬停没反馈，用户不知道点得动） */
+#btn-mode:hover { background: #dcebe6; }
+.modepick.open #btn-mode { background: #d2e5de; }
+.modemenu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 132px;
+  padding: 5px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .18);
+}
+/* ⚠️ 必须显式写这一条：.modemenu 是 display:flex，会把浏览器默认的 [hidden]{display:none}
+   压过去 —— 不写就是「菜单永远开着」。（同一个坑在本项目是第 6 次踩：
+   .verdict / .board-gate / .mrow / .clock-card / .disp-menu 都栽过。）dev/_lint_hidden.mjs 会盯着它。 */
+.modemenu[hidden] { display: none; }
+.modemenu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+}
+.modemenu button:hover { background: var(--accent-soft); }
+/* 当前模式那一项：高亮跟着**真实**模式走（面板里的预选不算），见 syncModeBtn() */
+.modemenu button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 
 button {
   height: 28px;
@@ -226,6 +291,20 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 /* 手数、分析讲解、推荐落点讲解按实际卡片高度分配 3:3:4。 */
 .left > .card { min-height: 0; }
+
+/* ★★ 2026-10-12 修：上面那 3 行是**按「左栏只有 3 张卡」写死的**。
+   习题练习把左栏变成 4 张卡之后就出事了 —— 两个症状**同一个病因**：
+     · 第 4 张卡落进"隐式行"，而前 3 行是 minmax(0,3fr)、**允许被压到 0**；
+     · 结果三张常驻卡的内容溢出、互相压在一起（用户报的「文字框相互重叠」）；
+     · 习题卡在 DOM 里排第一、占第 1 行，被压成 0 高 →
+       「开始解题」按钮整条被裁掉（用户报的「看不到开始解题」）。
+   → 有习题卡时把**第 1 行改成 auto**（按内容占高），后 3 行仍是 3:3:4。
+     用 :has() 判「习题卡是不是真的可见」：它隐藏时带 [hidden] 属性，
+     选择器不匹配 → 退回原来的 3 行布局，**其余模式一点不受影响**。
+     （:has() 要 Chromium 105+；本项目跑在 Electron 44 / Chrome 152 上。） */
+.left:has(> #ts-card:not([hidden])) {
+  grid-template-rows: auto minmax(0, 3fr) minmax(0, 3fr) minmax(0, 4fr);
+}
 
 /* 讲解卡的头：标题（占满剩余宽度）+ 右侧按钮 */
 .coach-head {
@@ -340,34 +419,80 @@ main { flex: 1; display: flex; min-height: 0; }
    renderCurve 读的就是 clientHeight，窗口 resize 会重绘（resize() 里调的）。 */
 #curve { width: 100%; height: 76px; display: block; }
 
-/* 手数列表（可滚动、可点击跳转） */
+/* 手数列表（可滚动、可点击跳转）—— 2026-10-18 第三次改版：
+   **棋子圆圈 + 折线分支树**。圆圈绝对定位（left/top 由 JS 算好），
+   连线是垫在下面的一层 SVG —— "从分枝点横着伸出去再往下拐"，
+   用 CSS 的 border/缩进画不出来（上一版就是那样，分支像一条贴在旁边的小尾巴）。 */
 .movelist {
-  list-style: none; flex: 1; min-height: 0; overflow-y: auto;
+  list-style: none; flex: 1; min-height: 0; overflow: auto;
+  position: relative;
   font-size: 12px; font-variant-numeric: tabular-nums;
 }
-.movelist li { display: flex; align-items: baseline; gap: 6px; padding: 2px 5px; border-radius: 4px; cursor: pointer; }
-.movelist li:hover { background: rgba(0, 0, 0, .05); }
-.movelist li.cur { background: rgba(47, 111, 94, .16); }
-.movelist .no { width: 30px; flex: none; text-align: right; color: var(--text-dim); }
-.movelist .st { flex: none; font-weight: 600; }
-/* ★ .pt（落点坐标）必须 flex:none —— 否则会被 flex 压缩，坐标被截断
-   （实测：「D16」显示成「D1」，用户报过）。.dl（涨跌）同理。 */
-.movelist .pt { color: var(--text-dim); flex: none; }
-.movelist .dl { margin-left: auto; font-size: 11px; flex: none; }
+.movelist .tree-lines { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; }
+.movelist .tree-lines path {
+  fill: none; stroke: rgba(112, 126, 140, .55); stroke-width: 1.4;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+/* 当前这条线上的连线稍微实一点 —— 一眼能顺着它看出"我正在走哪条线" */
+.movelist .tree-lines path.on { stroke: rgba(47, 111, 94, .78); stroke-width: 1.8; }
+
+.movelist li.mv {
+  position: absolute; width: 22px; height: 22px; box-sizing: border-box;
+  border-radius: 50%; cursor: pointer;
+}
+.movelist li.mv:hover .dot { filter: brightness(1.15); }
+/* ★ 圆圈 = 这一手是谁下的（黑子/白子），圈内是第几手；坐标不显示（悬停 title 里有）。
+   白子在浅色卡片上必须有描边，否则看不见。 */
+.movelist .dot {
+  width: 22px; height: 22px; border-radius: 50%; box-sizing: border-box;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; line-height: 1; font-variant-numeric: tabular-nums;
+}
+.movelist .dot.b { background: #16181c; color: #fff; }
+.movelist .dot.w { background: #fff; color: #1c1f24; border: 1px solid #9aa4b0; }
+.movelist .dot.d3 { font-size: 9.5px; }        /* 100 手以上三位数，缩一点 */
+/* 当前看的那一手：外面一道绿环。**别的圈不加环** —— 给白子套浅灰环会把白子弄浑，
+   "我在哪条线上"靠连线的颜色（绿 = 当前线）来区分。 */
+.movelist li.cur .dot { box-shadow: 0 0 0 2px var(--accent); }
+
+/* 「涨跌 / 目损」那一格：绝对定位在**整棵树右边**（left 由 JS 按布局算好）。
+   跟着圆圈走的话，会正好压在下一列那个圆圈上（同一手的另一条分支就在那一列）。 */
+.movelist .dl { position: absolute; top: 3px; font-size: 10px; white-space: nowrap; }
 .movelist .dl.bad { color: #c0392b; }
 /* 还在算的那一手：占位「…」压淡 —— 让用户知道这里会有数字，不是坏了。
    （2026-10-06 晚新增：数字必须等算准了才显示，见 app.js 的 evalSettled） */
 .movelist .dl.calc { color: var(--text-dim); opacity: .45; }
-/* 试下（草稿）里下的手：整体压淡 + 标个「草」，免得回头忘了自己在草稿里 */
-.movelist li.draft .no, .movelist li.draft .st, .movelist li.draft .pt { opacity: .5; }
+/* 试下（草稿）里下的手：圈压淡 + 标个「草」，免得回头忘了自己在草稿里 */
+.movelist li.draft .dot { opacity: .5; }
 .movelist .dft {
-  flex: none; font-size: 10px; line-height: 15px; padding: 0 4px; border-radius: 3px;
-  background: rgba(47, 111, 94, .14); color: var(--accent);
+  position: absolute; top: 3px; font-size: 10px; line-height: 14px; padding: 0 3px;
+  border-radius: 3px; background: rgba(47, 111, 94, .14); color: var(--accent);
 }
 
 /* 试下按钮：常态不填色，处于试下状态才填色 */
 #btn-draft.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 #btn-draft.on:hover { background: #2a6354; }
+/* 「暂停 / 继续」自动对弈：暂停中才填色（提示"现在停着"） */
+#btn-auto.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+#btn-auto.on:hover { background: #2a6354; }
+
+/* 手数卡的右键菜单（2026-10-19）：固定定位的小卡片，按钮一行一个。
+   ★ [hidden] 必须显式写 —— 这条 rules 里给了 display，不写就会被压过去（本项目踩过多次）。 */
+.ctxmenu {
+  position: fixed; z-index: 80; min-width: 150px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .18); padding: 4px;
+}
+.ctxmenu[hidden] { display: none; }
+.ctxmenu button {
+  display: block; width: 100%; height: 28px; padding: 0 10px;
+  text-align: left; background: none; border: none; border-radius: 5px; font-size: 12.5px;
+}
+.ctxmenu button:hover { background: rgba(0, 0, 0, .06); }
+
+/* 逐手分析明细（人机对弈 / 双人摆棋时，「解说词」框里的那 8 行）：
+   数字要能上下对齐，行距比棋谱解说紧一点（8 行要在一屏里看全）。 */
+.combox.ana { line-height: 1.62; font-variant-numeric: tabular-nums; }
 .movelist .empty { color: var(--text-dim); cursor: default; }
 
 /* 形势判断：两端各标一方，中间一条共用的胜率条（左黑右白） */
@@ -578,15 +703,9 @@ main { flex: 1; display: flex; min-height: 0; }
 .board-gate button:hover { filter: brightness(1.08); transform: translateY(-1px); }
 .board-gate button:active { transform: translateY(0); }
 
-/* 切换确认弹窗里那行「当前轮到 X 落子」—— 要一眼看见，所以给个浅底色 */
-.tk-turn {
-  font-size: 13px;
-  color: var(--text);
-  background: var(--accent-soft);
-  border-radius: 8px;
-  padding: 9px 11px;
-  margin: 0 0 14px;
-}
+/* （原来这里有一条 .tk-turn：给「摆棋 → AI 对弈」那个确认弹窗用的。
+   2026-10-14 那条弹窗退役了 —— 顶栏的模式按钮改成打开「新对局」设置面板，
+   「AI 执哪一方」就是面板里的「我执」那一行。样式一并删掉，免得留死代码。） */
 
 /* ---------- 新对局设置 ---------- */
 .modal-mask {
@@ -613,6 +732,11 @@ main { flex: 1; display: flex; min-height: 0; }
 .rec-modal { width: 580px; max-height: 78vh; display: flex; flex-direction: column; }
 .rec-modal h2 { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .rec-dir { font-size: 11px; font-weight: 400; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 棋谱库标题行：左「棋谱库」、右路径。★ 必须是 flex + 路径 min-width:0 ——
+   原来路径是普通 inline，nowrap 的它会把标题挤成「棋谱 / 库」两行（截图里见过）。 */
+.rec-head { display: flex; align-items: baseline; gap: 10px; }
+.rec-head .rec-title { flex: none; white-space: nowrap; }
+.rec-head .rec-dir { flex: 1; min-width: 0; }
 .reclist { list-style: none; flex: 1; overflow-y: auto; margin: 0 0 12px; min-height: 96px; max-height: 54vh; }
 
 /* 棋谱库顶部工具条：搜索框 + 「共 N 份 / 筛出 M 份」计数 */
@@ -632,6 +756,10 @@ main { flex: 1; display: flex; min-height: 0; }
 .reclist .rec-file { font-size: 10.5px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reclist .rec-meta { flex: none; font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .reclist li button { height: 24px; padding: 0 9px; font-size: 11.5px; flex: none; }
+/* 复盘按钮：两种标签（AI 复盘 / 复盘报告）**同宽**，否则一宽一窄地跳。
+   「复盘报告」是白底（常态按钮），「AI 复盘」是主题绿（.primary）。 */
+.reclist li button.rec-review { min-width: 68px; }
+.reclist li button.rec-review:not(.primary) { background: #fff; }
 .reclist .empty { display: block; text-align: center; padding: 26px 0; color: var(--text-dim); cursor: default; }
 /* 备注（改名）：就地展开的输入框 */
 .reclist li input {
@@ -848,10 +976,96 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .set-msg.bad { color: var(--danger); }
 
-/* 「新对局」面板里按对局类型显隐的行（摆棋/双人不需要「我执」「对手棋力」）。
+/* 「新对局」面板里按对局类型显隐的行（双人摆棋不需要「我执」「对手棋力」）。
    ⚠️ .mrow 是 display:flex，会把浏览器默认的 [hidden]{display:none} 压过去 ——
    必须显式写这条（本项目在 .verdict / .board-gate 上已经踩过两次）。 */
 .mrow[hidden], .level-note[hidden] { display: none; }
+
+/* ---------- 习题练习（2026-10-12 新增）----------
+   ★ .card[hidden] / .ts-group[hidden] 这两条**必须有**：
+     .card.col{display:flex} 和 .ts-group 自己的 display 会把浏览器默认的
+     [hidden]{display:none} 压过去 —— 表现是「练习卡永远显示」。
+     这不是假设：加完 HTML 跑 dev/_lint_hidden.mjs，它当场就把 #ts-card 报出来了。
+     （同一个坑在 .verdict / .board-gate / .mrow 上已经踩过三次。） */
+.card[hidden], .ts-group[hidden] { display: none; }
+/* ★ 同理：.seg 是 display:flex，被 .hidden 切换的开关组（如指定时的落子工具）
+   也必须显式压过 —— 这条同样是 dev/_lint_hidden.mjs 当场报出来的（#seg-tscolor）。 */
+.seg[hidden] { display: none; }
+/* ★ 再同理：.ts-row 也是 flex。2026-10-14 起**没有哪个 .ts-row 会被藏起来了**
+   （「我下两边」改成把里面的按钮置灰，为的是卡片高度不跳），这条留作兜底。 */
+.ts-row[hidden] { display: none; }
+
+/* ★ 2026-10-14 用户要求"练习卡高度任何时刻不变"，所以每行给一个统一的最小高度：
+   行里的控件高度不一（开关组是 26px 按钮、纯文字行只有 16px），而"交替摆棋"还会把
+   颜色按钮藏掉 —— 不给 min-height 的话，切摆法/切阶段都会让卡片上下跳。
+   28px = 按钮 26 + 余量；所有行于是恒为 28px。 */
+.ts-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 28px; margin-bottom: 6px; }
+.ts-row:last-of-type { margin-bottom: 0; }
+.ts-label { flex: none; min-width: 38px; font-size: 12px; color: var(--text-dim); }
+.ts-val { font-size: 12px; color: var(--text); }
+
+/* ---------- 练习卡：框架 + 框距 合并成一行（2026-10-14 用户要求缩减占用）----------
+   四组控件（框架 label + 开关 / 框距 label + − 4 +）要挤在卡片 ~240px 的宽度里。
+   两条一起才放得下，改任何一条都可能把最后的「+」顶到第二行去：
+     · .ts-row-frame → nowrap + 间距 6px（默认是 wrap + 8px）
+     · .seg-mini    → 按钮内边距 10px→7px
+   ⚠️ 这属于"看着差不多、实际卡在临界的排版"，所以 dev/_cdp_tsumego.mjs 里有一条
+      几何断言盯着它（同一行 + 不越卡片右边界）。改文案/字号后必须重跑。 */
+.ts-row-frame { flex-wrap: nowrap; gap: 6px; }
+.ts-row-frame .ts-label { min-width: 0; }
+/* 解题阶段的「对手 [KATAGO|我下两边]」这一行。
+   ★ 2026-10-16 起这一行**只剩 label + 开关**（题目目标挪去了常驻行 .ts-row-first），
+     宽度不再紧张 —— 但 nowrap 与"label 不限宽"照旧留着：
+     这两个按钮的文案（KATAGO / 我下两边）是全卡最长的，将来若再加东西还得靠它兜住。 */
+.ts-row-solve { gap: 6px; flex-wrap: nowrap; }
+.ts-row-solve .ts-label { min-width: 0; }
+/* ★ 2026-10-17 对手由 2 档变 3 档（按正解 / KATAGO / 我下两边）：
+   整行只剩 244px，原样的 10px 内边距会挤出去 → 这组收成 7px。
+   实测：label 26 + 按钮 56/66/53 + 两处 3px + 行内 6px ≈ 213px ≤ 244px。 */
+.ts-row-solve .seg { gap: 3px; }
+.ts-row-solve .seg button { padding: 0 7px; }
+/* ---------- 练习卡：先手（常驻一行）----------
+   一列两样（2026-10-17 起只剩一样）：`先手` + [黑先|白先]。
+   ⚠️ nowrap 留着 —— 一换行卡片高度就变（"高度恒定"那条铁律）。
+   （原来的「目标 净杀」那一格连同 #ts-goal-txt.m 随判定 / 提示一起删了。） */
+.ts-row-first { flex-wrap: nowrap; gap: 6px; }
+.ts-row-first .ts-label { min-width: 0; }
+.seg-mini { gap: 3px; }
+.seg-mini button { padding: 0 7px; }
+
+/* ---------- 练习卡：题集行（2026-10-14 新增，导入 SGF 习题）----------
+   一行里四样：`题集` + 题集名按钮 + ‹ + 12/347 + ›。
+   ⚠️ 题集名长短差别很大（「未打开」3 字 vs 「玄玄棋经(347题)」）：
+      不给名字按钮限宽 + 省略号，长名字会把 ‹ › 整个挤出卡片 —— 那样翻题就没法点了。
+      所以名字按钮 flex:1 + min-width:0 + 省略号，其余三样 flex:none。
+   ⚠️ 同样的道理：这一行绝不能 wrap（一换行卡片高度就变，违反"高度恒定"）。 */
+.ts-row-pset { flex-wrap: nowrap; gap: 6px; }
+.ts-row-pset .ts-label { min-width: 0; }
+#btn-pset { flex: 1 1 auto; min-width: 0; max-width: none; padding: 0 8px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+/* 打开了题集 → 名字按钮用主题绿（一眼看出"这题来自哪本练习册"）。
+   没打开时是普通按钮观感。 */
+#btn-pset.has-set { border-color: var(--accent); color: var(--accent); }
+#btn-ts-prev, #btn-ts-next { flex: none; min-width: 22px; padding: 0 5px; }
+#btn-ts-prev:disabled, #btn-ts-next:disabled { opacity: .4; }
+#pset-pos { flex: none; min-width: 40px; text-align: center; font-size: 11.5px; }
+
+/* ---------- 练习卡：解题阶段那排按钮（2026-10-14 起是 **5 个**）----------
+   加了「正解」之后，五个两字按钮默认内边距（0 10px）刚好卡在卡片宽度上
+   （5×44 + 4×6 = 244 = 内容宽），一有字体差异就会换行 → 卡片变高。
+   所以这一行单独把内边距收到 8px（5×40 + 4×6 = 224），留出 20px 余量。
+   ⚠️ 改了按钮文案（加字/减字）都要重跑 dev/_cdp_tsumego.mjs 里那条"不换行"断言。 */
+.ts-row-btns { flex-wrap: nowrap; gap: 6px; }
+.ts-row-btns button { flex: none; padding: 0 8px; }
+/* 「正解」正在展示时高亮（再按一次就是收起） */
+#btn-ts-answer.on { border-color: var(--accent); color: var(--accent); }
+
+/* 「新对局」面板里的框架距离输入框：一个窄数字框，跟在「框架」开关后面 */
+#row-tsframe #inp-tdist { flex: none; width: 58px; }
+
+/* 练习卡上的「框距 −/+」：只要一个字符的宽度，别把整行撑开、也别抢走 label 的位置 */
+#btn-ts-dist-less, #btn-ts-dist-more { flex: none; min-width: 26px; padding: 0 6px; }
+#ts-dist-txt { flex: none; min-width: 14px; text-align: center; }
 
 /* 底栏「计算深度」的标签（跟 .toggle 的文字一个观感，且不许被压缩） */
 .bottombar .vlabel {

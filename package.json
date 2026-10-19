@@ -38,7 +38,10 @@
         { "target": "zip", "arch": ["x64"] }
       ],
       "icon": "assets/app.ico",
-      "artifactName": "RapaceGo-win.${ext}"
+      "artifactName": "RapaceGo-win.${ext}",
+      "extraFiles": [
+        { "from": "下载讲解模型.bat", "to": "." }
+      ]
     },
     "mac": {
       "target": [
@@ -50,10 +53,8 @@
       "darkModeSupport": true,
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
+      "identity": null,
       "extraFiles": []
-    },
-    "extraFiles": [
-      { "from": "下载讲解模型.bat", "to": "." }
-    ]
+    }
   }
 }
