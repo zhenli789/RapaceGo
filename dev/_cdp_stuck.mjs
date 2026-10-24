@@ -95,7 +95,7 @@ const load = await js(`(async function(){
   return { 就绪: engineReady, 等了秒: Math.round((Date.now()-t0)/1000) };
 })()`, 200000);
 console.log('引擎 ' + JSON.stringify(load));
-if (!load || !load.就绪) { console.log('引擎没起来，放弃'); ws.close(); process.exit(1); }
+if (!load || !(load.就绪 || load.已就绪)) { console.log('引擎没起来，放弃'); ws.close(); process.exit(1); }
 
 const body = {
   /* A：回看旧手 → 回最新 → 悔棋 → 再下（最贴近用户的描述） */

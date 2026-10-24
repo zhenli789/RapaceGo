@@ -41,7 +41,6 @@ body {
   background: var(--panel);
   border-bottom: 1px solid var(--line);
 }
-.brand { font-size: 14px; font-weight: 600; letter-spacing: .3px; }
 /* 局面摘要 / 动作反馈（flash）。2026-10-14 用户要求：从引擎灯左边挪到「刷新」右边，并改绿色。
    padding-left + border-left 是顶栏通用的"分隔线"写法 —— 挪位后它正好把状态文字与「刷新」隔开。
    ⚠️ 这句话**永远有内容**（syncUI 会写局面摘要，flash 会临时覆盖 1.8 秒），所以不会出现"空 span
@@ -51,9 +50,22 @@ body {
 .field { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
 
 /* ★ 顶栏同底栏：按钮 / 下拉 / 标签都**不许被压窄**（否则文字挤成竖排）。
-   状态文字是次要信息，允许被压缩并用省略号截断 —— 优先保住右边的控件。 */
-.topbar button, .topbar select, .topbar .field, .topbar .brand { white-space: nowrap; flex: none; }
-.topbar .status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+   状态文字是次要信息，允许被压缩并用省略号截断 —— 优先保住右边的控件。
+   ★★ 2026-10-24 用户报障：一句长话会把顶栏挤成两行（宽度/高度临时变形）。
+      根因：`.topbar` 是 `flex-wrap: wrap`，**折行判断看的是 flex-basis**；
+      原来状态文字是 `flex: 0 1 auto`，它的**整句宽度**参与了折行计算 ——
+      右边「新对局 / 对局模式 / 对手棋力」就被推到第二行去了。
+      修法：`flex: 1 1 0` —— basis 为 0，折行判断时它「宽度视为 0」，
+      永远不会把别人挤下去；剩下的空间再由它**长**出来（原来那份留白交给 .spacer），
+      还不够就省略号（overflows 时 title 里能看到全文，见 app.js 的 flash / syncUI）。 */
+.topbar button, .topbar select, .topbar .field { white-space: nowrap; flex: none; }
+.topbar .status {
+  flex: 1 1 0; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 顶栏那份「把右侧按钮推到最右」的留白，现在由状态文字吃掉（它会长）。
+   别删它：其他几处 .spacer（弹窗里的）还要靠 `flex: 1` 撑开。 */
+.topbar > .spacer { flex: 0 1 0; }
 /* ---------- 引擎状态灯（顶栏，2026-10-05 新增） ----------
    两个小胶囊：KataGo / 讲解。圆点显示状态，点一下弹出操作菜单。
    为什么要有它：引擎改成**手动加载**了（打开软件不再自动吃显存），
@@ -278,45 +290,44 @@ main { flex: 1; display: flex; min-height: 0; }
 #btn-resign:hover { color: #a93226; }
 
 /* ---------- 侧栏 ---------- */
-/* ★ 左栏（2026-10-05 新增，用户要求）：手数列表 + 两个讲解框。
+/* ★ 左栏（2026-10-05 新增，用户要求）：手数列表 + 讲解框。
    宽度和右栏接近，棋盘两侧对称一点；内边距方向反过来（padding 在左，右为 0）。 */
 .left {
   width: 284px;
   flex: none;
   display: grid;
-  grid-template-rows: minmax(0, 3fr) minmax(0, 3fr) minmax(0, 4fr);
+  grid-template-rows: minmax(0, 3fr) minmax(0, 5fr);
   gap: 8px;
   padding: 12px 0 12px 14px;
   min-height: 0;
 }
-/* 手数、分析讲解、推荐落点讲解按实际卡片高度分配 3:3:4。 */
+/* ★ 2026-10-23：两张讲解卡**合并成一张**（用户要求），左栏从 3 张常驻卡变 2 张：
+   手数 : 讲解卡 = 3 : 5。原来两张卡各 180 / 240px，正文一多就要在小框里滚；
+   合并后那张卡 ≈ 380px（原来的两块加起来才 420，还各有各的滚动条）。 */
 .left > .card { min-height: 0; }
 
-/* ★★ 2026-10-12 修：上面那 3 行是**按「左栏只有 3 张卡」写死的**。
-   习题练习把左栏变成 4 张卡之后就出事了 —— 两个症状**同一个病因**：
-     · 第 4 张卡落进"隐式行"，而前 3 行是 minmax(0,3fr)、**允许被压到 0**；
-     · 结果三张常驻卡的内容溢出、互相压在一起（用户报的「文字框相互重叠」）；
+/* ★★ 2026-10-12 修：上面的行数是**按「左栏有几张常驻卡」写死的**。
+   习题练习会往左栏多塞一张卡（现在变 3 张），它就出过事 —— 两个症状**同一个病因**：
+     · 多出来的那张卡落进"隐式行"，而前面的行是 minmax(0,fr)、**允许被压到 0**；
+     · 结果常驻卡的内容溢出、互相压在一起（用户报的「文字框相互重叠」）；
      · 习题卡在 DOM 里排第一、占第 1 行，被压成 0 高 →
        「开始解题」按钮整条被裁掉（用户报的「看不到开始解题」）。
-   → 有习题卡时把**第 1 行改成 auto**（按内容占高），后 3 行仍是 3:3:4。
+   → 有习题卡时把**第 1 行改成 auto**（按内容占高），后面的行仍是 3:5。
      用 :has() 判「习题卡是不是真的可见」：它隐藏时带 [hidden] 属性，
-     选择器不匹配 → 退回原来的 3 行布局，**其余模式一点不受影响**。
+     选择器不匹配 → 退回原来的 2 行布局，**其余模式一点不受影响**。
      （:has() 要 Chromium 105+；本项目跑在 Electron 44 / Chrome 152 上。） */
 .left:has(> #ts-card:not([hidden])) {
-  grid-template-rows: auto minmax(0, 3fr) minmax(0, 3fr) minmax(0, 4fr);
+  grid-template-rows: auto minmax(0, 3fr) minmax(0, 5fr);
 }
 
-/* 讲解卡的头：标题（占满剩余宽度）+ 右侧按钮 */
+/* 讲解卡的头：标题（占满剩余宽度）+「看全盘」小链接
+   ★ 2026-10-23：三个动作按钮挪到卡**下方**（.coach-acts），这里只剩标题，
+     所以标题不再需要和按钮抢宽度，「看全盘」也不会被挤没了。 */
 .coach-head {
   display: flex; align-items: center; gap: 6px;
   flex: none; margin-bottom: 6px;
 }
 .coach-head .card-title { margin-bottom: 0; flex: 1; min-width: 0; }
-.coach-head button { height: 24px; padding: 0 9px; font-size: 11.5px; flex: none; }
-/* 卡片标题后面的小字副标题（如「KataGo 选点 · LoGos 讲道理」）——
-   用来点明「谁选点、谁解释」，避免读成"LoGos 自己推荐"（2026-10-07 用户要求）。
-   窄栏里要能换行，不能把标题挤没。 */
-.card-title-sub { display: block; margin-top: 1px; font-size: 10.5px; font-weight: 400; color: var(--text-dim); line-height: 1.4; }
 .pick-context { flex: none; font-size: 10.5px; line-height: 1.5; color: #787874; margin-bottom: 6px; }
 .pick-context.is-stale { color: #96704a; }
 /* ---------- 全盘讲解的进度条（2026-10-05）----------
@@ -340,11 +351,36 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .bb-txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .batch-bar button { height: 21px; padding: 0 8px; font-size: 11px; flex: none; }
-/* 讲解正文：内部滚动；保留换行（模型给的是一段段带换行的话） */
-.coach-body {
+/* ---------- 讲解卡（2026-10-23 合并成一张；2026-10-24 改成「一块正文区、三个页」）----------
+   #explain-body（讲解这手 / 全盘讲解）和 #pick-sec（推荐落点讲解）**互斥显示**，
+   JS 里用 hidden 切换（见 renderCoachPanels）。
+   ★ 滚动条只在这一层（.coach-scroll）—— 换个页仍是一条滚动条，
+     不会「两个小框各滚各的」（那正是 2026-10-23 要消掉的东西）。 */
+.coach-scroll {
   flex: 1; min-height: 0; overflow-y: auto;
+}
+/* 讲解正文：不再自己滚（父级 .coach-scroll 滚）；保留换行（模型给的是一段段带换行的话） */
+.coach-body {
+  min-height: 0;
   font-size: 12px; line-height: 1.75; color: var(--text);
   white-space: pre-wrap; word-break: break-word;
+}
+/* 推荐落点那一页：不再需要和上一段之间的虚线分隔（它现在是独立的一页）。
+   ★ 但 [hidden] 必须显式兜底 —— 这里一旦给它写了 display，浏览器默认的
+     [hidden]{display:none} 就压不过类选择器（本项目踩过四次）。 */
+.coach-sec[hidden] { display: none; }
+/* 卡下方的三个动作按钮：全盘讲解 / 讲解这手 / 推荐落点讲解
+   ★ 宽度**不能三等分**：「推荐落点讲解」6 个字比另外两个（4 字）长，
+     等分会让它折行（内容宽只有 242px）。用 1 1 auto 按文字长短分，
+     nowrap 兜底 —— 改字号/文案要重量一次总宽别超 242。 */
+.coach-acts {
+  flex: none; display: flex; gap: 6px;
+  margin-top: 8px; padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.coach-acts button {
+  flex: 1 1 auto; min-width: 0; height: 26px; padding: 0 8px;
+  font-size: 11.5px; white-space: nowrap;
 }
 .coach-body .ph { color: var(--text-dim); }          /* 占位提示 */
 .coach-body .src { color: var(--text-dim); font-size: 11px; }   /* 「来自 KataGo」之类的小字 */
@@ -353,6 +389,29 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .coach-body .pnt:first-child { margin-top: 0; }
 .coach-body .vok { color: var(--accent); }            /* 「和 AI 首选一致」这类好话 */
+/* 「看全盘 / 返回」—— 塞在卡片标题里的小链接（2026-10-22）。
+   ★ 不另开按钮：这一行的宽度是「标题 + 全盘讲解 + 讲解这手」，296px 的侧栏里
+     再放第三个按钮就会把标题挤没（实测标题只剩 106px）。 */
+.all-link {
+  display: inline-block; margin-left: 6px; font-size: 10.5px; font-weight: 400;
+  color: var(--accent); cursor: pointer; letter-spacing: 0;
+}
+.all-link[hidden] { display: none; }
+.all-link:hover { text-decoration: underline; }
+/* 「全盘」视图：整盘逐手讲解连成一页。
+   ★ .coach-body 自己是 pre-wrap（照顾正文换行），列表容器要改回 normal；
+     正文那段 .all-body 再显式 pre-wrap —— 两处都要写，漏一个就整段挤成一行。 */
+.coach-body.all-list { white-space: normal; }
+/* ★ 不要用负外边距做整行底色：那样行会比容器宽 6px，
+   在 227px 的窄栏里会直接长出**横向滚动条**（实测 scrollWidth 233 > 227，截图里那条灰杠）。 */
+.coach-body .all-row {
+  padding: 4px 6px; margin: 0 0 4px; border-radius: 6px; cursor: pointer;
+}
+.coach-body .all-row:hover { background: rgba(0, 0, 0, .045); }
+/* 当前这一手：左边一条竖线（比整块底色更轻，读长文时不刺眼） */
+.coach-body .all-row.cur { background: rgba(47, 111, 94, .075); box-shadow: inset 2px 0 0 var(--accent); }
+.coach-body .all-row .pnt { margin-top: 0; }
+.coach-body .all-body { white-space: pre-wrap; }
 /* 讲解「按字出」：每个新字带一次淡入（用户要求：新出现的字由淡转实）。
    JS 侧是 makeTyper —— 自己按固定速度放字，不直接贴流式片段
    （网络会把几个 token 攒成一块，贴上去就是「一顿一顿地跳」）。 */
@@ -818,10 +877,16 @@ main { flex: 1; display: flex; min-height: 0; }
 /* 复盘搜索量选档（点「AI 复盘」后先让他选，默认 500） */
 .rv-picks { margin-bottom: 10px; }
 .rv-picks button { height: 28px; padding: 0 11px; font-variant-numeric: tabular-nums; }
+/* 复盘范围（只算当前这条线 / 剩下没算的 / 全部分支）—— 只有带分支的棋谱才出现。
+   和搜索量那一排拉开一点距离，免得看成同一组（两组是不同维度）。 */
+.rv-scope { margin: -2px 0 10px; }
+.rv-scope button { height: 28px; padding: 0 11px; }
 .rv-pick-note {
   font-size: 12px; color: var(--accent); line-height: 1.6;
   margin: 0 0 14px; min-height: 19px;
 }
+/* 走势卡标题里那句「· 3 条分支 / · 未复盘」：不换行、不挤掉右边的胜率/目差开关 */
+#curve-line { font-style: normal; white-space: nowrap; margin-left: 2px; }
 
 /* 四张指标卡 */
 .rv-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }

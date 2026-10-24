@@ -47,7 +47,7 @@ const load = await js(`(async function(){
   return { 就绪: engineReady, 等了秒: Math.round((Date.now()-t0)/1000) };
 })()`, 200000);
 console.log('引擎 ' + JSON.stringify(load));
-if (!load || !load.就绪) { ws.close(); process.exit(1); }
+if (!load || !(load.就绪 || load.已就绪)) { ws.close(); process.exit(1); }
 
 const run = await js(`(async function(){
   const sleep = ms => new Promise(r => setTimeout(r, ms));

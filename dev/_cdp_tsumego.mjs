@@ -336,7 +336,9 @@ const out = await js(`(async function(){
   /* ---------- 1.5 左栏布局 + 状态栏（2026-10-12 用户报的两个界面问题）----------
      ★ 项目纪律：视觉问题必须**量真实几何**，不能只查 hidden === false
        （不然"提示浮层盖在棋盘正中间"那种会被"✓ 通过"放过去）。
-       这里量四张卡的真实矩形、两两判重叠；再量「开始解题」按钮是否真在视口里。 */
+       这里量每张卡的真实矩形、两两判重叠；再量「开始解题」按钮是否真在视口里。
+     ★ 2026-10-23：两张讲解卡合并成一张 → 左栏可见卡从 4 张变 3 张
+       （习题练习 / 手数 / 讲解卡）。卡数写死在这里，再拆再合都要跟着改。 */
   step('进模式时状态栏没有冒说明文字',
     !/先在棋盘上摆出题目的初始局面/.test($('status').textContent),
     JSON.stringify(($('status').textContent || '').slice(0, 40)));
@@ -351,9 +353,9 @@ const out = await js(`(async function(){
     for (let i = 0; i < bx.length; i++) for (let j = i + 1; j < bx.length; j++) {
       if (bx[i].top < bx[j].bottom && bx[j].top < bx[i].bottom) hits.push(bx[i].n + '↔' + bx[j].n);
     }
-    step('左栏 4 张卡都在且互不重叠', bx.length === 4 && hits.length === 0,
+    step('左栏 3 张卡都在且互不重叠', bx.length === 3 && hits.length === 0,
       bx.map(b => b.n + '=' + Math.round(b.h) + 'px').join(' · ') + (hits.length ? ' ★重叠:' + hits.join(',') : ''));
-    step('每张卡高度都够（没有被压扁）', bx.length === 4 && bx.every(b => b.h >= 40),
+    step('每张卡高度都够（没有被压扁）', bx.length === 3 && bx.every(b => b.h >= 40),
       bx.length ? Math.min.apply(null, bx.map(b => Math.round(b.h))) + 'px 最小' : '（没量到卡）');
     const sb = $('btn-ts-start').getBoundingClientRect();
     step('「开始解题」按钮可见且在视口内',

@@ -132,13 +132,18 @@ const state = {
   moves: [],
   viewAt: 0,
   toMove: 'b',
-  /* ★ 这份棋是「打开棋谱」来的（＝打谱）—— 选点讲解对它禁用：
-     那是别人的棋，不该替人支招。由 applyRecord 置真、applyNewGame 清掉。 */
+  /* ★ 这份棋是「打开棋谱」来的（＝打谱）。由 applyRecord 置真、applyNewGame 清掉。
+     ★ 2026-10-24：三个讲解按钮**打谱时都能用**（原来「推荐落点讲解」在这里被禁用；
+       现在它会自己借复盘 / 现场算一批点，并画到盘上 —— 见 pickCandidatesAt）。 */
   fromRecord: false,
   /* ★ 当前打开的棋谱文件名（含 .sgf）—— 全盘讲解要**存回这份棋谱名下**
      （存成 <棋谱名>.coach.json，见 main.js 的 coachPath）。
      新对局时清空：没有棋谱就没地方存。 */
   recName: '',
+  /* ★ 这一局**已经导出过的文件名**（2026-10-22 用户要求：同一局别存一堆副本）。
+     `saveToRecords()` 第一次导出后记在这里，之后再点导出就**覆盖这一份**，
+     不再按当前时间新起一个名字。换棋谱 / 开新局时清空。 */
+  exportName: '',
   /* 棋谱自带的解说词（SGF 的 C[]，只取主分支）：下标 = 第几手（0 = 开局前）。
      只在「打谱」（state.fromRecord）时有内容；新开局的棋谱没有解说词。 */
   /* 棋谱的整棵变化树（2026-10-17）。null = 没有分支（新对局 / 自己摆的棋）。
@@ -166,9 +171,27 @@ const state = {
          所以只存一份，并记下它对应第几手 —— 显示时标出来，免得和眼前的局面混淆。
        · busy.x —— 正在生成的那一手（-1 = 空闲），避免刷新时把打字机的内容抹掉。 */
   coach: { explain: {}, pick: null, busy: { explain: -1, pick: -1 },
+           /* ★ 2026-10-24 用户要求：三个按钮**共用一块正文区** —— 点哪个显示哪个。
+              'explain' = 讲解这手（或 allView 时的全盘列表），'pick' = 推荐落点讲解。
+              只控制「显示哪一页」，不影响数据怎么存（explain 按手、pick 按局面快照）。 */
+           view: 'explain',
+           /* ★ 推荐落点讲解的缓存：同一个局面讲过一次就不再问 LoGos。
+              键 = pickPositionKey(at)（棋盘/规则/贴子/摆子/前 at 手），值 = 那份快照。
+              pick 仍指「眼下该显示的那一份」—— 老代码只认它，不用改。 */
+           picks: {},
            /* 全盘讲解进行中时是 { done, total }（否则 null）——
               用来① 挡住重复点击 ② 决定按钮是否可点。见 runBatchCoach。 */
-           batch: null },
+           batch: null,
+           /* ★ 2026-10-22 用户报障：跑完「全盘讲解」，右边框里只有当前那一手，
+              看着像「只讲了一步」。→ 跑完（或本来就已经讲全）自动切到「全盘」视图：
+              整盘每一手的讲解连成一页。allView 就是那个开关（标题旁「看全盘 / 返回」）。 */
+           allView: false,
+           /* ★★ 2026-10-23 用户报障（有分支的棋谱）：讲解原来**只按手号存**，切到另一条分支，
+              同一个手号拿到的还是上一条线的文字，而且「全盘讲解」会把它当"已讲过"跳过。
+              现在按**线指纹**存：lines[<lineKey>] = { n, list }，形状和 `.coach.json` 里一模一样。
+              ★ state.coach.explain 永远**指向**当前这条线那一项的 list（同一个对象）——
+                所有老代码写 explain 就等于写进 lines，不用到处改。 */
+           lines: {}, curKey: '' },
   /* ★ 未开局（2026-10-04 用户要求）：软件打开时**不直接进对局**，而是停在
      一个「什么都还没定」的中性状态 ——
        · 棋盘点不动（tryPlay 直接挡掉）
@@ -223,6 +246,14 @@ const state = {
      ⚠️ 里面的 win / lead **一律是黑方视角**（applyAnalysis 里换算过）——
         引擎原值是「轮到走棋那一方」，轮到白走时符号会反（纪律 11）。 */
   anaAt: {},
+  /* ★ 离开某条分支时，把它那一条线的分析快照**留一份**（2026-10-22 用户要求
+     「导出时把所有分支的 AI 分析都存下来」）。
+     键 = 线指纹，值 = { key, moves: ["BQ16",…], at: {回合: anaAt 快照} }。
+     为什么不能只靠 anaAt：它只装**当前这条线**（换线就截断），
+     不另存的话，导出时别的分支早就没数据了 —— 想存也存不出来。 */
+  anaLines: {},
+  /* 本次会话里「已经问过要不要复盘」的线指纹（避免每次切到同一条未复盘的分支都弹窗） */
+  noAskKeys: new Set(),
   /* 双方都由 KATAGO 走（自我对弈）。autoPaused = 暂停中（人按了「暂停」） */
   autoBoth: false,
   autoPaused: false,
@@ -232,8 +263,13 @@ const state = {
   lastEval: null,    // 最近一次分析的 { blackWin, lead } —— AI 判断要不要认输要用
   /* AI 复盘结果（整盘逐手重算后填）：
      { losses: [每手目损], stats: {...}, name: 棋谱文件名, at: 手数 }
-     null = 当前局面没有复盘数据（手数列表/走势图就不画目损） */
+     null = 当前局面没有复盘数据（手数列表/走势图就不画目损）
+     ★ 2026-10-22：一份棋谱可能有**好几条分支线**，每条各一份复盘 ——
+       `review` 永远只装**当前这条线**的那份（换线时由 syncReviewForLine 重新挑）。 */
   review: null,
+  /* 整份复盘文件（v3）：{ v:3, name, updated, lines: { <线指纹>: {…} } } —— 一条线一项。
+     界面上所有地方都读 state.review（按线挑好的那份），这里只当"仓库"。 */
+  reviewDoc: null,
   /* ★ 习题练习的运行时状态（2026-10-12）。settings.mode !== 'tsumego' 时是 null。
      由 makeTsumego() 建、exitTsumego() 清。字段含义见 makeTsumego 的注释。 */
   tsumego: null,
@@ -654,7 +690,7 @@ function tryPlay(x, y, byAI) {
      ⚠️ 不复用下面 play 那条判断：play 的"对方"是段位对手，这里的"对方"是防守方，语义不同。 */
   if (!byAI && !state.draft && tsOn() && tsPhase() === 'solve'
       && state.tsumego.defend !== 'both' && !isMyTurn()) {
-    flash('轮到对手（它执' + (tsAIColor() === 'b' ? '黑' : '白') + '）—— 想自己走两边，把「对手」切成「我下两边」');
+    flash('轮到对手（它执' + (tsAIColor() === 'b' ? '黑' : '白') + '）—— 想两边自己走就切「我下两边」');
     return false;
   }
 
@@ -666,7 +702,7 @@ function tryPlay(x, y, byAI) {
   if (!byAI && tsOn() && tsPhase() === 'solve') {
     const fr = frameRect();
     if (fr && (x < fr.x0 || x > fr.x1 || y < fr.y0 || y > fr.y1)) {
-      flash('这一手在题目范围外 —— 要扩大范围就把练习卡上的「框距」调大，或把「框架」关掉');
+      flash('这一手在框外 —— 调大练习卡上的「框距」，或把「框架」关掉');
       return false;
     }
   }
@@ -887,22 +923,25 @@ function syncUI() {
      必须分开提示，否则用户只会看到「AI 不动」而不知道卡在哪。
      ★ 2026-10-05 起引擎**默认不加载**：「没加载」是正常状态，不再说成「启动中」——
        只在真出错、或正在加载时说一句；平时状态由顶栏那两盏灯负责。 */
+  /* ★ 2026-10-24：顶栏只有一行，省两个省略号（各 ~12px）—— 状态词本身就是"进行中"。 */
   const engTxt = engineNote ? '引擎异常'
-    : engineReloading ? '引擎重启中…'
+    : engineReloading ? '引擎重启中'
       : ((engStates.analyze === 'loading' || (settings.mode === 'play' && engStates.play === 'loading'))
-        ? '引擎加载中…' : '');
+        ? '引擎加载中' : '');
   const head = state.noGame
-    ? '未开局 · 点棋盘中央的「新建对局」开始'
+    ? '未开局 · 点棋盘中间「新建对局」开始'
     : total === 0
       ? `${sizeTxt}${hcTxt}${koTxt}`
       : `${sizeTxt}${hcTxt}${state.viewAt === total ? '进行中' : '回看中'} · 第 ${state.viewAt} 手 · 轮${sideToMove(state.viewAt) === 'b' ? '黑' : '白'}走` + quizTxt();
   /* 试下（草稿）期间状态栏必须一直提醒 —— 否则过一会儿就忘了自己在草稿里，
      回头还以为「明明下过怎么会没了」。 */
-  const draftTxt = state.draft ? '试下中（草稿 · 不影响正式对局）' : '';
+  const draftTxt = state.draft ? '试下中' : '';
   /* 拟人落子开着时要常驻提示 —— 否则过一会儿就忘了 AI 正在「按人类概率挑手」，
      会觉得它怎么突然变弱、或下了怪手。 */
   const humanTxt = settings.humanLike ? '拟人落子' : '';
-  $('status').textContent = [head, engTxt, draftTxt, humanTxt].filter(Boolean).join(' · ');
+  const statusTxt = [head, engTxt, draftTxt, humanTxt].filter(Boolean).join(' · ');
+  $('status').textContent = statusTxt;
+  $('status').title = statusTxt;
 
   /* ★ 顶栏那个模式按钮的文字 + 菜单高亮。放在 syncUI 里 = **唯一出口**：
      模式在好几处被改（applyNewGame / continueCurrentGame / enterTsumego / cancelNewGame），
@@ -1079,6 +1118,9 @@ let flashTimer = null;
 function flash(msg) {
   const el = $('status');
   el.textContent = msg;
+  /* ★ 2026-10-24：顶栏状态只占**一行**（style.css 的 .topbar .status），
+     极窄窗口下放不下就打省略号 —— 全文挂 title 上，鼠标停上去能看全。 */
+  el.title = msg;
   clearTimeout(flashTimer);
   flashTimer = setTimeout(syncUI, 1800);
 }
@@ -1179,6 +1221,15 @@ function scheduleScore(delay) {
 }
 
 async function runScore(silent) {
+  /* ★★ 复盘 / 全盘讲解跑着的时候**一律不数子**（2026-10-21 用户实测报障的根因）。
+     这条守卫看着只是「让一让」，实际是必须的：runScore 一进门就 `window.api.cancel()`
+     （见下面「终局查询优先」那句），而 cancel 会把**正在跑的那一块复盘**当成
+     「用户点了停止」结算掉 —— 主进程 settleCollect(aborted) 只交回引擎已经算完的几手。
+     用户看到的就是「复盘报告：只算了前 4 / 294 手」。
+     触发路径很隐蔽：打开一份**下完的**棋谱 → syncUI 见 isTerminal() → 700ms 后自动数子
+     → 正好落在复盘第一块请求发出之后。短棋谱（夹具 24 手，没终局）不会触发，所以
+     之前那套测试全绿。复盘结束后 finally 里会补一次（见 runReview）。 */
+  if (reviewBusy) return;
   /* ★ 正在数子时又点了一次 → **排队等前一次跑完**，而不是静默忽略。
      （被忽略的表现是「点了没反应」，用户会以为按钮坏了。实测踩过一次。） */
   let waited = 0;
@@ -1546,22 +1597,51 @@ function buildSGF() {
          （analysisNoteFor 只给"当前线上"的手算，而且有原生解说时自己会返回空）。
        原来这里一律不写 C[]，于是导出的棋谱再打开，解说词卡是一片空白。 */
     const path = varPath();
-    const noteOf = new Map();
-    path.forEach((nd, i) => {
-      const t = analysisNoteFor(i + 1);
-      if (t) noteOf.set(nd, t);
-    });
-    const mvSGF = nd => {
+    /* ★★ 2026-10-22 用户报障：导出后**只有最后站的那条分支**的解说词进了 C[]，
+       别的分支一片空白。根因：这里原来只按「当前这条线」的路径算备注
+       （`analysisNoteFor` 读的是 `state.anaAt` —— 它只装当前线）。
+       现在改成**给树上每个节点找它自己那条线**的分析：
+         ① 当前线用 `curLineAnaAt()`（留档 + 现在的；★ 只读 anaAt 会缺后半段）；
+         ② 其它分支用 `state.anaLines`（离开那条线时留的档，键 = 线指纹，见 archiveAnaLine）。
+       同一个节点可能被几条线共用（共享前缀）→ 先到先得；那本来就是**同一个局面**，
+       取谁的快照都一样。原生解说（节点自带的 C[]）一律不覆盖，这是老规矩。 */
+    const curAt = curLineAnaAt();
+    const noteOf = new Map();                       // 节点 → 备注文字
+    const curMoves = movesOfNodePath(path);
+    const noteAt = (moves, at, k, nd) => {
+      if (!nd || nd.comment) return '';             // 有原生解说 → 不动它
+      if (!at || !at[k] || !at[k - 1]) return '';   // 前后两个局面都分析过才有意义
+      return moveAnalysisTextAt(moves, at, k);
+    };
+    const putNode = (nd, text) => { if (text && nd && !noteOf.has(nd)) noteOf.set(nd, text); };
+    for (let i = 1; i <= path.length; i++) {
+      putNode(path[i - 1], noteAt(curMoves, curAt, i, path[i - 1]));
+    }
+    for (const key of Object.keys(state.anaLines || {})) {
+      const e = state.anaLines[key];
+      const p2 = e && linePathOfList(e.moves);
+      if (!p2) continue;                            // 这条线已经不在树上了（分支被删过）
+      const mv2 = movesOfNodePath(p2);
+      for (let i = 1; i <= p2.length; i++) {
+        putNode(p2[i - 1], noteAt(mv2, e.at, i, p2[i - 1]));
+      }
+    }
+    const mvSGF = (nd, extra) => {
       const m = nd.move;
       let out = ';' + (m.color === 'b' ? 'B' : 'W')
         + (m.pass ? '[]' : '[' + SGF_COLS[m.x] + SGF_COLS[m.y] + ']');
-      const c = noteOf.get(nd) || nd.comment || '';
+      const c = noteOf.get(nd) || extra || nd.comment || '';
       if (c) out += 'C[' + sgfValue(c) + ']';
       return out;
     };
-    /* 树上没匹配上的尾巴 = 用户自己接着下的手（草稿之前的部分），没有备注 */
-    const tail = state.moves.slice(path.length, upto)
-      .map(m => mvSGF({ move: m, comment: '' })).join('');
+    /* 树上没匹配上的尾巴 = 用户自己接着下的手（草稿之前的部分）。
+       它们的备注仍然取**当前线**的分析（curAt 里就有）。 */
+    const tail = state.moves.slice(path.length, upto).map((m, j) => {
+      const k = path.length + j + 1;
+      const t = (curAt[k] && curAt[k - 1])
+        ? moveAnalysisTextAt(state.moves, curAt, k) : '';
+      return mvSGF({ move: m, comment: '' }, t);
+    }).join('');
     const tailNode = path.length ? path[path.length - 1] : state.varRoot;
     const walk = nd => {
       let out = nd.move ? mvSGF(nd) : '';
@@ -2081,13 +2161,16 @@ function applyRecord(rec, srcName) {
      用户以为在改新棋谱，实际在改旧的。 */
   exitCommentEdit();
   state.recName = String(srcName || '');
+  /* 换了一份棋谱 → 上一局「导出到哪」的记录作废，否则导出会写进上一份棋谱里去。
+     清空后导出仍可能写回**这份**棋谱（仅当它是本软件导出的，见 saveToRecords ②）。 */
+  state.exportName = '';
   settings.size = [9, 13, 19].indexOf(rec.size) >= 0 ? rec.size : 19;
   settings.rules = RULES[rec.rules] ? rec.rules : 'chinese';
   settings.komi = (rec.komi !== null && !isNaN(rec.komi)) ? rec.komi : RULES[settings.rules].komi;
   settings.handicap = 0;                 // 让子 / 座子由 setup 表达
   settings.mode = 'free';                // 打开棋谱按「摆棋」看：两边都能接着摆
   state.noGame = false;                  // ★ 打开棋谱就是「有内容了」：解除未开局状态
-  state.fromRecord = true;               // ★ 打谱：选点讲解对它禁用（别人的棋，不替人支招）
+  state.fromRecord = true;               // ★ 打谱：讲解三件套都能用（推荐落点会自己找点，见 pickCandidatesAt）
   clearCoachPanels();                    // 换了棋谱 → 两个框清空（「全盘讲解」按钮这时才露出来）
   N = settings.size;
   state.setup = [
@@ -2129,8 +2212,10 @@ function applyRecord(rec, srcName) {
   state.draft = null;
   state.lastEval = null;
   state.review = null;          // 换了棋谱 → 上一次的复盘数据作废
+  state.reviewDoc = null;       // 复盘文件也作废（随后 autoLoadReviewDoc 按新棋谱读）
   state.pv = null;              // 变化图也收掉（候选点马上就变了）
   state.anaAt = {};             // 逐手分析快照：换了一份棋，旧的张冠李戴
+  state.anaLines = {};          // 各分支的分析存档也跟着作废（导出时要按线写报告）
   state.autoBoth = false;       // 打谱没有"双方自动"这回事（模式固定成双人摆棋）
   state.autoPaused = false;
   setSeg('seg-mode', 'free');
@@ -2141,6 +2226,10 @@ function applyRecord(rec, srcName) {
   /* ★ 这份棋谱以前做过「全盘讲解」的话，把讲解读回来（用户要求：
      结果跟棋谱一起保存，下次打开还要能看到）。异步读、不挡打开。 */
   if (state.recName) loadCoachForRecord(state.recName);
+  /* ★ 2026-10-22：顺手把这份棋谱已经存过的复盘拉回来 —— 自己导出的棋局带着 AI 分析，
+     一打开手数列表里就有目损，不用再点「复盘报告」。
+     gen 取现在的代：期间换了棋谱就作废（见 autoLoadReviewDoc 的守卫）。 */
+  if (state.recName) autoLoadReviewDoc(state.recName, gameGen);
 }
 
 /* 存进棋谱库 */
@@ -2178,24 +2267,64 @@ function recordFileName() {
 }
 
 async function saveToRecords() {
-  let name = recordFileName();
-  /* ★ 2026-10-19：文件名只到**分钟**，同一分钟内连存两局就会撞名 ——
-     而 records:save 撞名是**覆盖**（只留一份 .bak）。所以先看一眼棋谱库，
-     撞上了就加 ` (2)`、` (3)`…（老命名带秒，几乎撞不上，改成分钟后这是必须的）。 */
-  try {
-    const all = (await window.api.records.list()) || [];
-    const stem = name.replace(/\.sgf$/i, '');
-    if (all.some(it => it.name === name)) {
-      let i = 2;
-      while (all.some(it => it.name === stem + ' (' + i + ').sgf')) i++;
-      name = stem + ' (' + i + ').sgf';
-    }
-  } catch (e) { /* 拿不到列表就按原名存（覆盖时主进程会留 .bak 兜底） */ }
+  /* ★★ 2026-10-22 用户报障：同一局棋反复点「导出棋谱」会存出一堆副本
+     （原来每次都按当前时间新起名字 → 棋谱库里 `…-2055.sgf`、`…-2058.sgf` 一长串）。
+     现在按优先级挑目标文件：
+       ① 这一局**已经导出过**（`state.exportName`）→ 覆盖那一份；
+       ② 这一局是从棋谱库打开的、而且**这份棋谱本来就是本软件导出的**（SGF 头里有
+          `AP[RapaceGo:…]`）→ 写回原来那份。改解说词本来就是直接写回原文件，导出也该一致。
+          ★ 为什么只认自家棋谱：`buildSGF()` 是**重建**整份棋谱，导入的外来棋谱
+          （古谱、别的软件导出的）里的 GN/DT/CP/自定义属性会在写回时丢掉 —— 那种只能另存。
+       ③ 都不是（刚下完的新局 / 外来棋谱）→ 按「黑 vs 白-时间」新起名字，撞名再加 ` (2)`。
+     ★ 覆盖不会丢原件：主进程 `records:save` 在**第一次**覆盖前留 `<名字>.bak`（有就不再动）。 */
+  let target = state.exportName || '';
+  let writeBack = false;
+  if (!target && state.recName) {
+    try {
+      const rd = await window.api.records.read(state.recName);
+      if (rd && rd.ok && /AP\[RapaceGo/i.test(String(rd.text || '').slice(0, 400))) {
+        target = state.recName; writeBack = true;
+      }
+    } catch (e) { /* 读不到就另存一份（宁多一份副本，也别弄坏别人的棋谱） */ }
+  }
+  const reusing = !!target;
+  let name = target || recordFileName();
+  if (!reusing) {
+    /* 文件名只到**分钟**，同一分钟内连存两局就会撞名 ——
+       而 records:save 撞名是**覆盖**（只留一份 .bak）。所以先看一眼棋谱库，
+       撞上了就加 ` (2)`、` (3)`…（老命名带秒，几乎撞不上，改成分钟后这是必须的）。 */
+    try {
+      const all = (await window.api.records.list()) || [];
+      const stem = name.replace(/\.sgf$/i, '');
+      if (all.some(it => it.name === name)) {
+        let i = 2;
+        while (all.some(it => it.name === stem + ' (' + i + ').sgf')) i++;
+        name = stem + ' (' + i + ').sgf';
+      }
+    } catch (e) { /* 拿不到列表就按原名存（覆盖时主进程会留 .bak 兜底） */ }
+  }
   const r = await window.api.records.save(name, buildSGF());
   if (!r || r.error) { flash('保存失败：' + ((r && r.error) || '未知')); return null; }
-  flash('已存进棋谱库 · ' + r.name + '（顶栏「棋谱库」里能看到）');
+  const savedName = r.name || name;
+  state.exportName = savedName;               // 下次导出还覆盖这一份
+  /* ★★ 2026-10-23 用户要求：导出**只存棋谱本身**，不再把对弈过程中边下边算的 AI 结果
+     一起落成复盘文件（`.review.json`）。
+     理由（用户原话）：「不要保存对弈过程中的 ai 计算结果，如果用户需要复盘，
+     在棋谱库直接点击相应的棋谱进行 ai 复盘就行」——
+     那批数据的每手搜索量从 3 到 507 参差（AI 思考与后台分析混着），胜率/目损前后不可比，
+     存下来还会被当成正式复盘、界面上得额外解释「毛糙」。要复盘就让复盘做：统一档位整盘算。
+     ★ **SGF 里的解说词（C[]）照旧写** —— 那是这份棋谱的内容（每条分支每手一条），
+       第 4 轮用户明确要求过；它和「分析报告」不是一回事。 */
+  flash((writeBack ? '已写回 · ' : (reusing ? '已更新棋谱库 · ' : '已存进棋谱库 · ')) + savedName
+    + (writeBack ? '（同一份，没另存副本）' : (reusing ? '（覆盖原局）' : ''))
+    + ' · 要复盘就在「棋谱库」点它');
   return r;
 }
+
+/* ★ 2026-10-23 删掉了 saveLiveReviewFor()（«导出时把对弈过程的分析摊成复盘»）：
+   用户明确要求导出只留棋谱本身，分析要另做就点「AI 复盘」。
+   老文件里 source='live' 的报告仍会被读出来（showReviewReport 有专门的说法），
+   只是不再新写。 */
 
 $('btn-save').onclick = () => { saveToRecords(); };   // 原先下载到系统，现在改存进棋谱库
 
@@ -2288,7 +2417,7 @@ async function refreshRecords() {
         const { list } = parseProblemSet(rd.text);
         const stones = list.reduce((a, p) => a + p.setup.length, 0);
         if (!list.length || !stones) {
-          flash('这份棋谱里没有摆子（不像习题集）—— 习题的初始局面是用摆子写出来的，普通对局没有');
+          flash('这份棋谱没有摆子（不像习题集）—— 习题的初始局面是用摆子写的');
           return;
         }
         const r = await window.api.puzzles.importRecord(it.name);
@@ -2306,7 +2435,7 @@ async function refreshRecords() {
          两者是同一件事的两端，用一个按钮表达"现在该做哪一步"最清楚。 */
       (() => {
         const b = it.hasReview
-          ? mk('复盘报告', '打开已存的复盘报告（最新的那一份 · 会载入这份棋谱）',
+          ? mk('复盘报告', '打开已存的复盘报告（显示当前这条分支的那一份 · 会载入这份棋谱）',
             () => openSavedReview(it.name, it.note))
           : mk('AI 复盘', '整盘逐手重算，出一份报告（点开会先让你选搜索量）',
             () => openReviewSetup(it));
@@ -2448,7 +2577,9 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => (
    并把每手的「目损」标到右下角手数列表和胜率走势图上。
 
    ★ 为什么不逐手发请求：KataGo 的 analysis 支持 analyzeTurns 数组，
-     一次请求就能把整盘每一手都算完（实测 ≈ 0.6 秒/手），逐手发会慢一个数量级。 */
+     一次请求就能把整盘每一手都算完，逐手发会慢一个数量级（每手一次往返 + 每手重新建树）。
+   ⚠️ 但「一整盘一次请求」本身也不是没问题：中途拿不到任何已完成结果，出一丁点差错就全丢。
+   2026-10-21 起改成**分块**（每 10 手一块 + 落盘 + 断点续算），见 runReview。 */
 
 /* 复盘每手的搜索量。
    历程：写死 200（快但糙）→ 跟随底栏「计算深度」→ ★ 2026-10-04 用户拍板
@@ -2458,10 +2589,48 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => (
    就把目损算得太糙 —— 复盘该算多深，由点的那一刻决定。 */
 function reviewVisits() { return settings.reviewVisits || 500; }
 
-/* 复盘耗时估算（给选档面板看的参考）。实测约 0.4 秒/手（500 visits），按比例换算。 */
+/* 复盘耗时估算 —— ★ 2026-10-21 重做：改成「按这台机器的实测速度算」。
+   原来写死 0.4 秒/手（那是在小权重 b18c384 上量的）。换到 b40c768 这类重权重后，
+   实测只有 ~31 次评估/秒 → 500 步要 16~20 秒一手，一盘 294 手要 **80 分钟**，
+   而面板上还写着「约 2 分钟」，进度窗里还写着「0.3~0.6 秒/手」——
+   用户当然会以为程序卡死了（这就是那次报障）。
+   现在：每跑一次复盘就把真实速度（visits/秒）记下来，键里带权重文件名；
+   换权重后旧数字自动失效（不同权重的速度差 4 倍以上，见 2026-10-21 实测：
+   b18c384 = 139 v/s、b40c768 = 31.9 v/s）。没有记录就如实说"还没测过"。 */
+const REVIEW_RATE_KEY = 'rapacego.reviewRate';
+let analyzeModelName = '';        // 分析权重的文件名（由引擎状态带出来，见 applyEngineStatus）
+
+function reviewRate() {
+  try {
+    const o = JSON.parse(localStorage.getItem(REVIEW_RATE_KEY) || 'null');
+    if (!o || !(o.vps > 0)) return null;
+    /* 换了权重 → 旧速度不算数（同一台机上 b18 和 b40 差 4 倍） */
+    if (analyzeModelName && o.model && o.model !== analyzeModelName) return null;
+    return o;
+  } catch (e) { return null; }
+}
+function saveReviewRate(vps) {
+  if (!(vps > 0)) return;
+  try {
+    localStorage.setItem(REVIEW_RATE_KEY,
+      JSON.stringify({ model: analyzeModelName, vps: Math.round(vps * 10) / 10 }));
+  } catch (e) { /* 存不下不影响功能，只是下次还得重新量 */ }
+}
+
+/* 秒 → 「1 小时 12 分钟」这种给人看的说法 */
+function fmtDur(sec) {
+  sec = Math.max(1, Math.round(sec));
+  if (sec < 90) return sec + ' 秒';
+  if (sec < 3600) return Math.round(sec / 60) + ' 分钟';
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  return h + ' 小时' + (m ? ' ' + m + ' 分钟' : '');
+}
+
+/* 整盘复盘大约要多久；速度还没测过 → null（调用方必须如实说"不知道"，别瞎给数） */
 function reviewEta(nMoves, visits) {
-  const sec = Math.max(1, Math.round(nMoves * 0.4 * (visits / 500)));
-  return sec < 60 ? '约 ' + sec + ' 秒' : '约 ' + (sec / 60).toFixed(1) + ' 分钟';
+  const r = reviewRate();
+  if (!r) return null;
+  return fmtDur(nMoves * visits / r.vps);
 }
 
 /* 失误分级 —— 档位照抄 KaTrain 的 12 / 6 / 3 / 1.5 / 0.5 目 */
@@ -2629,7 +2798,18 @@ function buildReview(nMoves, turns) {
 const RV_MASK = $('review');
 
 /* 最近一次的进度（重开进度窗要用 —— 见 showReviewAgain） */
-let lastReviewProgress = { done: 0, total: 0 };
+let lastReviewProgress = { done: 0, total: 0, info: null };
+/* 本次复盘的实测状态：
+     t0       起算时刻（算「每秒多少次评估」用）
+     visits   每手的搜索量
+     visitsDone 已经算完的搜索次数（估速度）
+     total    整盘要算多少个回合（n+1）
+     doneSet  已经算完的回合号 —— ★ 全局进度**只认它**：
+               引擎的进度消息是按「这一次请求」算的（分块后一块只有 10 手），
+               直接拿它的 done/total 会让进度条每块从头再来一遍（测试踩到过）。 */
+let rvRun = null;
+/* 用户点了「停止」→ 分块循环下一次检查时收手（见 runReview / stopReview） */
+let reviewAbort = false;
 
 /* 复盘还在跑时又被点（AI 复盘 / 复盘报告 / 重新复盘 / 点遮罩）——
    把进度窗**重新打开**，而不是只弹一句提示：看不到进度会让人以为卡死了。 */
@@ -2637,18 +2817,141 @@ function showReviewAgain() {
   /* ★ 全盘讲解跑的也是这条「整盘逐手」通路 —— 别把复盘那个进度窗弹出来（审查发现）。 */
   if (state.coach.batch) { flash('全盘讲解正在跑 —— 它跑了整盘分析，等它完再复盘'); return; }
   RV_MASK.classList.add('open');
-  showReviewProgress(lastReviewProgress.done, lastReviewProgress.total);
+  showReviewProgress(lastReviewProgress.info);
   flash('AI 正在复盘，算完会自动出报告');
 }
 
-function showReviewProgress(done, total) {
-  lastReviewProgress = { done: done || 0, total: total || 0 };
-  RV_MASK.classList.add('open');
+/* 建一次 DOM，之后每秒只改数字/宽度。
+   ★ 不能每次进度都重写 innerHTML：那样「停止」按钮每秒重建一次，点击正好落在
+     重建那一瞬间就会丢（复核时踩到的老毛病，别再写回去）。 */
+function ensureReviewProgressDom() {
+  if ($('rv-fill')) return;
   $('review-body').innerHTML =
     '<div class="rv-wait">AI 正在逐手重算…</div>'
-    + '<div class="rv-bar"><i style="width:' + (total ? Math.round(done / total * 100) : 0) + '%"></i></div>'
-    + '<div class="rv-wait-sub">' + done + ' / ' + total + ' 手 · 每手 ' + reviewVisits() + ' 次搜索</div>'
-    + '<div class="rv-wait-tip">实测约 0.3~0.6 秒/手（一盘 200 手约 1~2 分钟）。期间请不要落子 —— 整盘算完才会出报告。</div>';
+    + '<div class="rv-bar"><i id="rv-fill" style="width:0%"></i></div>'
+    + '<div class="rv-wait-sub" id="rv-hand">准备中…</div>'
+    + '<div class="rv-wait-sub" id="rv-eta"></div>'
+    + '<div class="rv-wait-tip" id="rv-tip"></div>'
+    + '<div class="mfoot"><div class="spacer"></div>'
+    + '<button id="rv-stop">停止</button></div>';
+  const b = $('rv-stop');
+  if (b) b.onclick = () => stopReview();
+}
+
+/* 进度窗。info = 引擎最新一条 { live, at, visits, maxVisits }
+             live=true：第 at 手正在搜，已搜到 visits/maxVisits。
+   ★★ 为什么要有 info（2026-10-21）：原来进度只按「整手算完」推进，
+   而重权重上一手要 15~20 秒 —— 进度条半分钟才动一格，看起来就是卡死。
+   现在拿引擎每秒推的中途报告画本手的细进度，条子一直在动。 */
+function showReviewProgress(info) {
+  const total = (rvRun && rvRun.total) || lastReviewProgress.total || 0;
+  /* ★ 多分支连算时，「已算完」= 前面几条线的合计（doneBase）+ 当前这条线的回合数。
+     doneSet 只记**当前这条线**的（它同时被断点续算和进度条用来算 ETA）。 */
+  const done = rvRun ? ((rvRun.doneBase || 0) + rvRun.doneSet.size) : (lastReviewProgress.done || 0);
+  const maxV = (info && info.maxVisits) || (rvRun && rvRun.visits) || reviewVisits();
+  const curV = (info && info.visits) || 0;
+  const sub = (info && info.live && maxV) ? Math.min(1, curV / maxV) : 0;
+  lastReviewProgress = { done, total, info: info || null };
+  RV_MASK.classList.add('open');
+  ensureReviewProgressDom();
+
+  /* 1) 进度条：整手部分 + 本手的比例 */
+  const frac = total ? Math.min(1, (done + sub) / total) : 0;
+  const fill = $('rv-fill');
+  if (fill) fill.style.width = (frac * 100).toFixed(1) + '%';
+
+  /* 2) 第几手 / 本手搜到多少（多分支时再报一句「第几条线」——
+        不然用户看到总数 260 手、而这条线只有 118 手，会以为算错了对象） */
+  const hand = $('rv-hand');
+  if (hand) {
+    let s = '第 ' + Math.min(done + 1, total) + ' / ' + total + ' 手';
+    if (rvRun && rvRun.lineCount > 1) {
+      s += ' · 第 ' + (rvRun.lineIdx + 1) + ' / ' + rvRun.lineCount + ' 条分支';
+    }
+    if (info && info.live && maxV) s += ' · 本手已搜 ' + curV + ' / ' + maxV;
+    else if (done > 0) s += ' · 已完成 ' + done + ' 手';
+    hand.textContent = s;
+  }
+
+  /* 3) 已用 / 剩余：速度优先用**本次实测**，没有才用上次记的。
+     ★ 算速度的分子必须用「全局已算完的手数 × 每手搜索量」——
+     第一次写成「分块累加的 visitsDone」时，头 10 手一直不更新，
+     于是面板上显示「57 秒/手」这种离谱数字（测试里当场抓出来）。 */
+  let vps = 0;
+  if (rvRun && rvRun.t0) {
+    const sec = (Date.now() - rvRun.t0) / 1000;
+    const dv = done * maxV + (info && info.live ? curV : 0);
+    if (sec > 3 && dv > 0) vps = dv / sec;
+  }
+  const rec = reviewRate();
+  if (!vps && rec) vps = rec.vps;
+  const eta = $('rv-eta');
+  if (eta) {
+    if (vps > 0) {
+      const used = rvRun && rvRun.t0 ? (Date.now() - rvRun.t0) / 1000 : 0;
+      const left = Math.max(0, total - done) * maxV / vps;
+      eta.textContent = (used > 3 ? '已用 ' + fmtDur(used) + ' · ' : '')
+        + '剩余约 ' + fmtDur(left) + '（实测 ' + (maxV / vps).toFixed(1) + ' 秒/手）';
+    } else {
+      eta.textContent = '正在量这台机器的速度，稍后给出剩余时间…';
+    }
+  }
+
+  /* 4) 脚注：说清「能停、停了不白算」—— 这是这次报障里用户最需要的两句话 */
+  const tip = $('rv-tip');
+  if (tip) {
+    tip.textContent = '每手 ' + maxV + ' 次搜索，逐手算完才有报告。'
+      + '可以点「停止」：已经算完的手会保留，下次接着算，不用从头来。';
+  }
+}
+
+/* 复盘「暂停」面板（停止 / 引擎卡住之后）。
+   ★ 为什么不直接弹报告：见 runReview 收尾那段。用户的观感差别很大 ——
+   「这份报告没算完整盘，只算了前 4 / 294 手」像是程序坏了；
+   「已算完 4 手，存好了，还剩 290 手」才是他能理解、能继续的状态。 */
+function showReviewPaused(done, total, why, scope) {
+  RV_MASK.classList.add('open');
+  const maxV = (rvRun && rvRun.visits) || reviewVisits();
+  const left = Math.max(0, total - done);
+  const rec = reviewRate();
+  const etaTxt = (rec && rec.vps > 0 && left > 0)
+    ? '按这台机器的实测速度，剩下 ' + left + ' 手大约还要 ' + fmtDur(left * maxV / rec.vps)
+    : '';
+  const pct = total ? (done / total * 100) : 0;
+  const nLine = (rvRun && rvRun.lineCount) || 1;
+  $('review-body').innerHTML =
+    '<h2>复盘暂停了</h2>'
+    + '<div class="rv-sub">' + esc(why) + ' · 已算完 <b>' + done + ' / ' + total + '</b> 手'
+    + (nLine > 1 && rvRun ? '（' + nLine + ' 条分支合计，当前在第 ' + (rvRun.lineIdx + 1) + ' 条）' : '')
+    + '</div>'
+    + '<div class="rv-bar"><i style="width:' + pct.toFixed(1) + '%"></i></div>'
+    + '<div class="rv-wait-sub">已经算完的手都<b>存在盘上了</b>，接着算只补剩下的，不会从头来。</div>'
+    + (etaTxt ? '<div class="rv-wait-sub">' + esc(etaTxt) + '</div>' : '')
+    + '<div class="mfoot"><button id="rv-continue" class="primary">接着算（还剩 ' + left + ' 手）</button>'
+    + '<button id="rv-peek">先看已算的这部分</button>'
+    + '<div class="spacer"></div><button id="rv-close">关闭</button></div>';
+  const go = $('rv-continue');
+  if (go) go.onclick = () => {
+    /* ★ 接着算必须沿用**同一次的范围**（选了「全部分支」就别只补当前这条线），
+       文件名也从 rvRun 拿 —— state.review 可能在多线场景里是空的（当前线不在目标里）。 */
+    const nm = (rvRun && rvRun.name) || (state.review && state.review.file) || state.recName || '';
+    if (!nm) { RV_MASK.classList.remove('open'); return; }
+    runReview(nm, { scope: scope || 'line' });     // 会读中间文件，只补没算的手
+  };
+  const pk = $('rv-peek');
+  if (pk) pk.onclick = () => showReviewReport();
+  const cl = $('rv-close');
+  if (cl) cl.onclick = () => RV_MASK.classList.remove('open');
+}
+
+/* 「停止」：把已算完的手留下来（main.js 的 cancel 会把 turns 交回来），
+   并且真的让引擎停下 —— 不是只把前端弹窗关掉。 */
+async function stopReview() {
+  if (!reviewBusy) return;
+  reviewAbort = true;
+  const b = $('rv-stop');
+  if (b) { b.disabled = true; b.textContent = '正在停止…'; }
+  try { await window.api.cancel(); } catch (e) { /* 引擎没响应也照样往下走 */ }
 }
 
 function showReviewReport() {
@@ -2658,24 +2961,67 @@ function showReviewReport() {
   const f = v => (v === null || v === undefined || isNaN(v)) ? '—' : v.toFixed(1);
   const n = state.moves.length;
   /* 这份报告是**按多少步搜索**算出来的 —— 从报告自己身上读（而不是读当前设置的档位），
-     这样看旧的报告时显示的也永远是它当时的真实档位。 */
-  const rv = R.visits || reviewVisits();
+     这样看旧的报告时显示的也永远是它当时的真实档位。
+     ★ 「下棋时攒的实时分析」（source='live'）没有统一档位：visits 记 0，文字另说。 */
+  const live = R.source === 'live';
+  const rv = live ? 0 : (R.visits || reviewVisits());
   const segRange = k => {          // 该段覆盖的手数区间（给用户看的）
     const a = Math.floor(n * [0, 0.3, 0.75][k]) + 1;
     const b = Math.floor(n * [0.3, 0.75, 1][k]);
     return a + '–' + b + ' 手';
   };
+  /* 这份报告是「当前这条分支」的 —— 有分支的棋谱里必须写出来，
+     否则用户会以为这是整盘（主分支）的成绩。 */
+  const nLines = (state.reviewDoc && state.reviewDoc.lines)
+    ? Object.keys(state.reviewDoc.lines).length : 1;
 
   let h = '';
   h += '<h2>AI 复盘 <span class="rv-name">' + esc(R.name || '') + '</span></h2>';
-  h += '<div class="rv-sub">共 ' + n + ' 手 · 每手 ' + rv + ' 次搜索 · <b>黑白分开统计</b></div>';
+  h += '<div class="rv-sub">共 ' + n + ' 手 · '
+    + (live ? '下棋时的实时分析（每手搜索量不统一）' : '每手 ' + rv + ' 次搜索')
+    + ' · <b>黑白分开统计</b>'
+    + (nLines > 1 ? ' · 这是<b>当前这条分支</b>的报告（共 ' + nLines + ' 条分支算过）' : '')
+    + '</div>';
+  /* ★ 下棋时攒的分析：诚实标注口径 —— 它和「整盘统一搜索量重算」不是一回事。
+     ★★ 2026-10-22 第二版（用户追问「区别到底在哪」）：原来只写「目损会毛糙一些」，
+        没说为什么。实测同一盘棋（12 手）下棋攒的快照搜索量是 3 / 67 / 177 / 179 / 188 /
+        333 / 456 / 507 次，正式复盘每回合都是 506~507 —— 差别是**有的手没算完**，不是算式不同
+        （两边都走 buildReview）。所以这里改成说清机制 + 报出这份报告**实际**的搜索量范围。 */
+  if (live) {
+    const lo = R.visitsLo, hi = R.visitsHi;
+    h += '<div class="rv-warn">这份报告是<b>你下棋时边下边算</b>攒下来的（导出棋谱时一并存下）。'
+      + '同一盘棋里各手的搜索量并不一样'
+      + (typeof lo === 'number' && typeof hi === 'number' && hi > 0
+        ? '（这份报告实际是 <b>' + lo + '~' + hi + ' 次</b>）' : '')
+      + '：轮到你走、你多看了几秒的那几手能算满，'
+      + 'AI 刚应手你就落子的那几手往往只算了几十次就<b>被下一手打断</b>了。'
+      + '目损 = 前后两个局面的目差，只要有一端没算完，那个数字就会飘'
+
+      + (typeof R.analyzed === 'number' && R.analyzed < n + 1
+        ? '，其中 <b>' + (n + 1 - R.analyzed) + ' 手</b>对局时没来得及分析（那些手是空的）' : '')
+      + '。想要口径统一的一份，点下面「重新复盘」即可（会用同一档搜索量重算）。</div>';
+  }
+  /* ★ 没算完整盘（停止 / 卡住）→ 报告里的平均目损只代表算过的那部分，
+     不说清楚的话，用户会拿一份「只算了前 30 手」的报告判断整盘水平。
+     ★ 按钮直接给在这儿：只写一句「再点 AI 复盘会接着算」，用户还得先关掉弹窗、
+       回棋谱库找那颗按钮 —— 大多数人到这一步就以为「只能从来一遍」了。 */
+  if (R.partial && R.partial.done < R.partial.total) {
+    h += '<div class="rv-warn">只算了前 <b>' + R.partial.done + ' / ' + R.partial.total
+      + '</b> 手（中间停过或引擎卡住了），下面的数字只覆盖这部分。已算完的手都存在盘上，'
+      + '接着算不会重来。'
+      + '<div style="margin-top:8px"><button id="rv-continue2" class="primary">接着算（还剩 '
+      + (R.partial.total - R.partial.done) + ' 手）</button></div></div>';
+  }
 
   /* ★ 旧版报告（v1 把黑白混算，口径已经变了）—— 不显示那份数据，直接请用户重算。
      拿错口径的数字下判断比没有数字更糟。 */
   if (!R.sides || !R.sides.b || !R.sides.w) {
+    /* ★ 耗时按**这台机器的实测速度**给（reviewEta 没测过就返回 null → 如实说不知道）。
+       原来这里写死「一盘约 1 分钟」，那是小权重上的数，重权重上差 40 倍。 */
+    const etaOld = reviewEta(n, rv);
     h += '<div class="rv-warn">这份报告是<b>旧版算法</b>生成的（黑白双方混在一起算），'
       + '数据口径已经变了，所以这里<b>不再显示</b>。点下面的「重新复盘」按新算法重算一份就行'
-      + '（每手 ' + rv + ' 步，一盘约 1 分钟）。</div>';
+      + '（每手 ' + rv + ' 步' + (etaOld ? '，按这台机器的速度约 ' + etaOld : '') + '）。</div>';
     h += '<div class="mfoot"><button id="review-again" class="primary">重新复盘</button>'
       + '<div class="spacer"></div><button id="review-close">关闭</button></div>';
     $('review-body').innerHTML = h;
@@ -2740,11 +3086,14 @@ function showReviewReport() {
   h += '<div class="rv-note">「估算水平」是按<b>该方自己的平均目损</b>粗略换算的启发式，仅供参考 —— '
     + 'KataGo 的段位档是「模仿某段位棋手」，官方并没有给出与真实段位的换算表。'
     + '想知道准的，挑一档跟 AI 下几盘看胜负更实在。目损本身是数值估计，'
-    + rv + ' 次搜索时有零点几目的噪声。</div>';
+    + (live ? '搜索量低的时候' : rv + ' 次搜索时') + '有零点几目的噪声。</div>';
 
-  /* 这次的结果已经写进 records/<棋谱名>.review.json —— 下次不用重算，点「复盘报告」直接看 */
+  /* 这次的结果已经写进 records/<棋谱名>.review.json —— 下次不用重算，点「复盘报告」直接看。
+     ★ 有分支的棋谱：这个文件里按「线」存多份，同一条线重算才覆盖它自己那份。 */
   h += '<div class="rv-sub" style="margin:10px 0 0;color:var(--text-dim)">这份报告已经存下来了：'
-    + '关掉后想再看，到棋谱库点这份棋谱的「复盘报告」就行（新复盘会覆盖这一份）。</div>';
+    + '关掉后想再看，到棋谱库点这份棋谱的「复盘报告」就行'
+    + (nLines > 1 ? '（别的分支各存各的，切到哪条线就看哪一份）。' : '（重新复盘会覆盖这一份）。')
+    + '</div>';
 
   h += '<div class="mfoot"><button id="review-again" title="换个搜索量重新算一遍（会覆盖已存的报告）">重新复盘</button>'
     + '<div class="spacer"></div><button id="review-close">关闭</button></div>';
@@ -2759,6 +3108,13 @@ function bindReviewReport(R, v2) {
   if (again) again.onclick = () => {
     /* 重新复盘 = 回到选档面板（用户要求搜索量在点的时候定） */
     openReviewSetup({ name: R.file || (R.name + '.sgf'), note: R.name, hasReview: true });
+  };
+  /* 「接着算」（只在这份报告没算完整盘时存在）：直接续算，不用再绕一圈选档面板 ——
+     搜索量和权重没变，中间文件的签名对得上，runReview 会把已算的手全部复用。 */
+  const cont = $('rv-continue2');
+  if (cont) cont.onclick = () => {
+    const nm = R.file || ((R.name || '') + '.sgf');
+    if (nm) runReview(nm);
   };
   if (!v2) return;
   $('review-body').querySelectorAll('.rv-bl li[data-n]').forEach(li => {
@@ -2776,13 +3132,97 @@ function openReviewSetup(it) {
   const note = (it && it.note) || '';
   const hasReview = !!(it && it.hasReview);
   /* 读一下棋谱，只为在手数上给出「整盘大概多久」的估算 */
-  window.api.records.read(name).then(rd => {
+  window.api.records.read(name).then(async rd => {
     const p = (rd && !rd.error) ? parseSGF(rd.text) : null;
-    renderReviewSetup(name, note, (p && p.ok && p.moves) ? p.moves.length : 0, hasReview);
+    const nMain = (p && p.ok && p.moves) ? p.moves.length : 0;
+    /* ★★ 2026-10-22：同一份棋谱**已经开着**时，手数必须用「**当前这条线**」的。
+       有分支的棋谱里 `state.moves` 可能不是主分支 —— 用户站在一条 118 手的变体上，
+       面板却写「这盘 110 手」，点下去实际要算 118 手：估时错、连"这条线"是哪条都说不清。
+       （`state.varRoot` 是当前打开的这棵树；没打开时才看解析出来的 `p.tree`。） */
+    const openNow = state.recName === name;
+    const nMoves = openNow ? state.moves.length : nMain;
+    const branched = !!(openNow ? state.varRoot : (p && p.tree));
+    /* ★ 顺手看一眼有没有**上次没算完的进度**（停止 / 卡住留下的中间文件）。
+       不说这一句的话，用户以为「开始复盘」= 从头再等 50 分钟，干脆不点了 ——
+       而实际上已算完的手全部会被复用。只有搜索量和上次一致时才提示（不一致会全量重算）。 */
+    let part = null;
+    let partLines = {};
+    try {
+      const r = await window.api.records.readReviewPart(name);
+      if (r && r.text) {
+        const o = JSON.parse(r.text);
+        /* ★ v3 的中间文件是「一条线一项」—— 以前只数 o.turns，
+           新版永远数出 0，于是「上次已算 N 手」这句提示整个消失（静默）。
+           两种形状都认。 */
+        if (o && o.lines) {
+          for (const k of Object.keys(o.lines)) {
+            const cnt = Object.keys((o.lines[k] || {}).turns || {}).length;
+            if (cnt) partLines[k] = cnt;
+          }
+          const tot = Object.values(partLines).reduce((a, b) => a + b, 0);
+          /* v3 没单独存 visits —— 它在环境签名里（'e1|500|6.5|chinese|19|…'的第二段） */
+          const anyL = o.lines[Object.keys(o.lines)[0]] || {};
+          const envV = parseInt(String(o.env || anyL.env || '').split('|')[1], 10);
+          if (tot) part = { n: tot, visits: envV || 0 };
+        } else {
+          const cnt = (o && o.turns) ? Object.keys(o.turns).length : 0;
+          if (cnt) part = { n: cnt, visits: o.visits || 0 };
+        }
+      }
+    } catch (e) { /* 没有中间文件就算了 */ }
+
+    /* ★ 有分支时：把每条线的回合数、哪几条已经有报告都算出来（2026-10-22 用户要求
+       「复盘时能选只算当前分支 / 全部分支 / 剩下没算的」）。
+       这几个数决定面板上显示什么，缺一个就没法如实告诉用户"这次要算多少手"。 */
+    let lines = [], doneKeys = {}, curKey = '';
+    if (branched) {
+      const root = openNow ? state.varRoot : (p && p.tree);
+      const seenK = new Set();
+      for (const path of linesOfTree(root)) {
+        const l = lineGtpOf(movesOfNodePath(path));
+        const k = lineKeyOfList(l);
+        if (seenK.has(k)) continue;
+        seenK.add(k);
+        lines.push({ n: l.length, key: k });
+      }
+      if (openNow) {
+        const curL = lineGtpOf(state.moves);
+        curKey = lineKeyOfList(curL);
+        const hit = lines.find(x => x.key === curKey);
+        if (hit) hit.cur = true;
+        else lines.unshift({ n: curL.length, key: curKey, cur: true });
+      }
+      try {
+        const rv = await window.api.records.readReview(name);
+        if (rv && rv.text) {
+          const o = JSON.parse(rv.text);
+          if (o && o.lines) doneKeys = o.lines;
+        }
+      } catch (e) { /* 还没有报告文件 = 一条都没算过 */ }
+    }
+    renderReviewSetup(name, note, nMoves, hasReview, part,
+      { branched, openNow, nMain, lines, doneKeys, curKey, partLines });
   }).catch(() => renderReviewSetup(name, note, 0, hasReview));
 }
 
-function renderReviewSetup(name, note, nMoves, hasReview) {
+function renderReviewSetup(name, note, nMoves, hasReview, part, extra) {
+  const ex = extra || {};
+  const lines = Array.isArray(ex.lines) ? ex.lines : [];
+  const docKeys = ex.doneKeys || {};
+  const curKey = ex.curKey || '';
+  /* 只有「真的有分支」才给范围选择：一条线的棋谱多一个选项只会让人犹豫 */
+  const multi = !!ex.branched && lines.length > 1;
+  const doneCnt = lines.filter(l => docKeys[l.key]).length;
+  const missLines = lines.filter(l => !docKeys[l.key]);
+  /* 从棋谱库直接点「AI 复盘」（这份棋谱还没打开）时没有「当前线」——
+     点下去会先打开它、站在主分支上，所以这里就拿主分支的手数。 */
+  const curLine = lines.find(l => l.key === curKey) || (ex.openNow ? null : (lines[0] || null));
+  /* 默认 = 只算当前这条线（和以前一样）；当前线已经算过时，默认落到「还没算过的」——
+     否则用户点「AI 复盘」十有八九是想补别的分支，却又被算了一遍当前线。 */
+  let scope = 'line';
+  if (multi && !missLines.length) scope = 'line';
+  else if (multi && curLine && docKeys[curKey] && missLines.length) scope = 'missing';
+
   RV_MASK.classList.add('open');
   const cur = reviewVisits();
   const labelOf = v => (VISIT_OPTS.find(o => o[0] === v) || ['', ''])[1];
@@ -2799,10 +3239,39 @@ function renderReviewSetup(name, note, nMoves, hasReview) {
   h += '<div class="rv-sub">整盘逐手重算' + (nMoves ? '（共 ' + nMoves + ' 手）' : '')
     + ' —— 每手算多少步由你定：越大越准，也越慢。</div>';
   h += seg;
+  /* ★★ 范围选择（2026-10-22 用户要求）：有分支时自己挑「这条 / 全部 / 剩下的」。
+     这三颗按钮只在**真的有分支**时出现，单线棋谱的流程一个字都没变。 */
+  if (multi) {
+    const totalAll = lines.reduce((s, l) => s + l.n + 1, 0);
+    const totalMiss = missLines.reduce((s, l) => s + l.n + 1, 0);
+    h += '<div class="seg rv-scope" id="rv-scope" data-all="' + totalAll + '" data-miss="' + totalMiss + '">'
+      + '<button data-s="line"' + (scope === 'line' ? ' class="on"' : '') + '>'
+      + '当前这条线' + (curLine ? '（' + curLine.n + ' 手）' : '') + '</button>'
+      + '<button data-s="missing"' + (scope === 'missing' ? ' class="on"' : '')
+      + (missLines.length ? '' : ' disabled') + '>'
+      + '还没算过的 ' + missLines.length + ' 条</button>'
+      + '<button data-s="all"' + (scope === 'all' ? ' class="on"' : '') + '>'
+      + '全部分支（' + lines.length + ' 条）</button>'
+      + '</div>';
+  }
   h += '<p class="rv-pick-note" id="rv-pick-note"></p>';
+  /* ★★ 有分支的棋谱：把「这次算的是哪条线」说到明处（2026-10-22 用户问
+     「没看到复盘这条分支按钮」—— 其实这个面板就是那个入口，只是原来一个字都没提分支，
+     用户没法知道点下去只算当前这条线、更不知道换线是 Alt+←/→）。
+     不新增按钮：棋谱库那行只留一个按钮（2026-10-18 用户拍板），说明放在这里最省地方。 */
+  if (ex.branched) {
+    h += '<div class="rv-sub" style="margin:0 0 12px;color:var(--text-dim)">'
+      + '这份棋谱<b>有分支</b>，一共 <b>' + lines.length + '</b> 条线，已经算过 '
+      + '<b>' + doneCnt + '</b> 条。'
+      + (ex.openNow && ex.nMain && ex.nMain !== nMoves
+        ? '（主分支是 ' + ex.nMain + ' 手 —— 你现在不在主线上。）' : '')
+      + '想换到某条分支：跳到分叉的那一手、按 <b>Alt+← / Alt+→</b>。'
+      + '每条线各存各的，不会互相覆盖。</div>';
+  }
   if (hasReview) {
     h += '<div class="rv-sub" style="margin:0 0 12px;color:var(--text-dim)">'
-      + '这份棋谱已经有一份报告了；重新复盘会用新结果<b>覆盖</b>它。'
+      + '这份棋谱已经有一份报告了；重新复盘<b>算完整盘</b>才会覆盖<b>它那条线</b>的那份'
+      + '（中途停下不算，旧报告原样留着；别的分支也各存各的）。'
       + '只想再看看上次的结果 → 点「看已存报告」。</div>';
   }
   h += '<div class="mfoot">'
@@ -2814,10 +3283,46 @@ function renderReviewSetup(name, note, nMoves, hasReview) {
   $('review-body').innerHTML = h;
 
   const noteEl = $('rv-pick-note');
+  const goBtn = $('rv-go');
+  const chosenMoves = () => {
+    if (!multi || scope === 'line') return nMoves || 0;
+    const box = $('rv-scope');
+    return scope === 'missing' ? +box.dataset.miss : +box.dataset.all;
+  };
   const refresh = v => {
-    const eta = reviewEta(nMoves || 200, v);
-    noteEl.textContent = '每手 ' + v + ' 步' + (labelOf(v) ? '（' + labelOf(v) + '）' : '')
-      + ' · ' + (nMoves ? '这盘 ' + nMoves + ' 手，整盘 ' + eta : '一盘 200 手大约 ' + eta);
+    const label = labelOf(v) ? '（' + labelOf(v) + '）' : '';
+    let s = '每手 ' + v + ' 步' + label;
+    if (multi && scope !== 'line') {
+      const k = scope === 'missing' ? missLines.length : lines.length;
+      const tot = chosenMoves();
+      s += ' · ' + k + ' 条线合计 ' + tot + ' 手';
+      const eta = reviewEta(tot, v);
+      s += eta ? '，最多约 ' + eta : '';
+      s += '（前面共享的手会直接复用，通常明显更快）';
+      if (part && part.n && part.visits === v) s += ' · 上次算过 ' + part.n + ' 手会复用';
+    } else if (nMoves) {
+      /* ★ 只有这台机器量过速度（跑过一次复盘）才给数字 —— 宁可说不知道，也别瞎估。
+         以前这里写死「0.4 秒/手」，在重权重上差了 40 倍，用户以为程序卡死了。 */
+      const eta = reviewEta(nMoves, v);
+      s += eta ? ' · 这盘 ' + nMoves + ' 手，整盘 ' + eta
+        : ' · 这盘 ' + nMoves + ' 手（这台机器还没量过速度，跑完一次就有准数）';
+      /* ★ 上次没算完的进度：只有搜索量和上次一样时才说「接着算」——
+         改过搜索量的话中间文件签名对不上，runReview 会整盘重算，
+         这时候还说「已有 4 手」就是骗人。 */
+      if (part && part.n && part.visits === v) {
+        s += ' · 上次已算 ' + part.n + ' 手（点「开始复盘」是接着算，不从头来）';
+      }
+    } else {
+      const eta = reviewEta(200, v);
+      s += eta ? ' · 一盘 200 手大约 ' + eta : ' · （还没量过这台机器的速度）';
+    }
+    noteEl.textContent = s;
+    if (goBtn) {
+      goBtn.textContent = !multi ? ((ex.branched && ex.openNow) ? '复盘这条线' : '开始复盘')
+        : (scope === 'line' ? '复盘这条线'
+          : (scope === 'all' ? '全部复盘（' + lines.length + ' 条）'
+            : '算剩下的 ' + missLines.length + ' 条'));
+    }
   };
 
   let pick = cur;
@@ -2829,6 +3334,18 @@ function renderReviewSetup(name, note, nMoves, hasReview) {
       refresh(pick);
     };
   });
+  const scopeBox = $('rv-scope');
+  if (scopeBox) {
+    scopeBox.querySelectorAll('button').forEach(b => {
+      b.onclick = () => {
+        if (b.disabled) return;
+        scopeBox.querySelectorAll('button').forEach(x => x.classList.remove('on'));
+        b.classList.add('on');
+        scope = b.dataset.s;
+        refresh(pick);
+      };
+    });
+  }
   refresh(pick);
 
   $('rv-cancel').onclick = () => RV_MASK.classList.remove('open');
@@ -2836,45 +3353,511 @@ function renderReviewSetup(name, note, nMoves, hasReview) {
   if (vw) vw.onclick = () => openSavedReview(name, note);
   $('rv-go').onclick = () => {
     settings.reviewVisits = pick;      // 记住这次的选择，下次默认就是它
-    runReview(name);
+    runReview(name, { scope });
   };
 }
 
 /* 打开**已存的复盘报告**（棋谱库每行的「复盘报告」按钮 / 选档面板里的「看已存报告」）。
-   ★ 永远只有最新一份：新复盘会覆盖旧的（main.js 的 records:saveReview 直接写同一个文件）。 */
+   ★ 一份文件里可能存着**好几条分支线**的报告（v3）：显示哪一份，取决于**当前站在哪条线上**。
+     所以这里先看「这份棋谱是不是已经开着」——开着就**不动局面**（用户可能正站在某条分支上），
+     只有从棋谱库另开一份时才 applyRecord。
+   ★ 只有**整盘算完**才会写进报告文件（中途停下的那次只留在中间文件里，
+     否则会把上一份完整报告覆盖成残缺的 —— 那是最坏的情况）。 */
 async function openSavedReview(name, note) {
   if (reviewBusy) { showReviewAgain(); return; }
   const cached = await window.api.records.readReview(name);
-  if (!cached || !cached.text) { flash('这份棋谱还没有复盘报告 —— 先点「AI 复盘」算一份'); return; }
-  let rv = null;
-  try { rv = JSON.parse(cached.text); } catch (e) { rv = null; }
-  if (!rv || !Array.isArray(rv.losses)) { flash('报告文件读不出来，请重新复盘'); return; }
+  if (!cached || !cached.text) {
+    /* ★ 2026-10-22：这句话要说清「复盘是按线的」，否则用户会以为「报告没了」。
+       有分支的棋谱里，报告**可能只存在于另一条分支**上（那也要先有文件才有得看）。 */
+    flash('这份棋谱还没有复盘报告 —— 先点「AI 复盘」'
+      + (state.varRoot ? '（只算当前这条线）' : ''));
+    return;
+  }
+  let raw = null;
+  try { raw = JSON.parse(cached.text); } catch (e) { raw = null; }
+  if (!raw) { flash('报告文件读不出来，请重新复盘'); return; }
 
-  const rd = await window.api.records.read(name);
-  if (!rd || rd.error) { flash('读取棋谱失败：' + ((rd && rd.error) || '未知')); return; }
-  const p = parseSGF(rd.text);
-  if (!p || !p.ok) { flash('棋谱解析失败，看不了报告'); return; }
-
-  REC_MASK.classList.remove('open');
-  applyRecord(p, name);                 // 载入棋谱（会清掉旧复盘），报告里「跳到那一手」才能用
-  state.review = rv;
-  if (!state.review.name) state.review.name = note || name.replace(/\.sgf$/i, '');
-  state.review.file = name;
-  if (Array.isArray(rv.history)) state.history = rv.history;
-  if (Array.isArray(rv.leads)) state.leads = rv.leads;      // 旧报告没有这一项 → 目差模式会提示重算
-  /* ★ 复盘的每一手都是同一档搜索量一起算的 → 精度标记统一按报告里记的那一档填。
-     旧报告没记这一项的话退回「已够准」，免得它被随手一次粗算改写掉。 */
-  if (Array.isArray(rv.history)) state.histVisits = rv.history.map(() => rv.visits || reviewVisits());
+  if (state.recName !== name) {
+    const rd = await window.api.records.read(name);
+    if (!rd || rd.error) { flash('读取棋谱失败：' + ((rd && rd.error) || '未知')); return; }
+    const p = parseSGF(rd.text);
+    if (!p || !p.ok) { flash('棋谱解析失败，看不了报告'); return; }
+    REC_MASK.classList.remove('open');
+    applyRecord(p, name);               // 载入棋谱（会清掉旧复盘），报告里「跳到那一手」才能用
+  }
+  state.reviewDoc = normalizeReviewDoc(raw, state.moves);
+  if (state.reviewDoc && !state.reviewDoc.name) {
+    state.reviewDoc.name = note || name.replace(/\.sgf$/i, '');
+  }
+  const got = syncReviewForLine();
   renderMoveList();
   renderCurve();
-  showReviewReport();
+  if (got) { showReviewReport(); return; }
+  showReviewNoLine(name);               // 这条分支还没算过 → 说明情况 + 一键开算
+}
+
+/* 「当前这条分支还没复盘」面板。
+   ★ 不能只弹一句「没有报告」：用户刚刚才看过报告，会觉得程序把数据弄丢了。
+     实际是**报告属于另一条分支** —— 把「差在第几手」说清楚，
+     再给一个「复盘这条分支」按钮（前面的共享部分会直接复用，不用重算）。 */
+function showReviewNoLine(name) {
+  const nm = name || state.recName || '';
+  const doc = state.reviewDoc || emptyReviewDoc(nm);
+  const mine = lineGtpOf(state.moves);
+  let best = null, bestL = -1;
+  for (const k of Object.keys(doc.lines || {})) {
+    const e = doc.lines[k];
+    if (!e || !Array.isArray(e.moves)) continue;
+    const L = sharedPrefixLen(e.moves, mine);
+    if (L > bestL) { bestL = L; best = e; }
+  }
+  RV_MASK.classList.add('open');
+  let h = '<h2>这条分支还没复盘</h2>';
+  h += '<div class="rv-sub">' + esc(nm.replace(/\.sgf$/i, '')) + ' · 当前这条线共 '
+    + state.moves.length + ' 手</div>';
+  if (best && bestL > 0) {
+    h += '<div class="rv-note">已存的报告是<b>另一条分支</b>的（第 ' + (bestL + 1)
+      + ' 手起走的不是同一条线）。这条分支可以<b>从第 ' + (bestL + 1)
+      + ' 手接着算</b> —— 前面的 ' + bestL + ' 手是同一个局面，直接复用，不会重算。</div>';
+  } else if (best) {
+    h += '<div class="rv-note">已存的报告是<b>另一条分支</b>的，而且这条分支从第一手就不一样 —— '
+      + '得从头算一遍。</div>';
+  } else {
+    h += '<div class="rv-note">这份棋谱还没有任何一条分支的复盘。</div>';
+  }
+  /* 换线的手势写在按钮上面（2026-10-22 用户问「没看到复盘这条分支按钮」——
+     一部分原因就是不知道换线怎么换：面板只说"另一条分支"，没说怎么回去）。 */
+  if (state.varRoot) {
+    h += '<div class="rv-sub" style="margin:10px 0 0;color:var(--text-dim)">'
+      + '换线：跳到分叉的那一手，按 <b>Alt+← / Alt+→</b>；手数列表里带「变」标记的就是分叉点。</div>';
+  }
+  h += '<div class="mfoot">'
+    /* ★ 2026-10-22：能定位到那条分支就再给一个「跳过去看」——
+       用户的诉求常常只是"我报告呢"，而不是"帮我把这条也算一遍"。
+       跳过去比解释"怎么按 Alt+←"直白得多。 */
+    + (best ? '<button id="rv-line-jump">跳到有报告的那条分支</button>' : '')
+    + '<button id="rv-line-go" class="primary">复盘这条分支</button>'
+    + '<div class="spacer"></div><button id="review-close">关闭</button></div>';
+  $('review-body').innerHTML = h;
+  $('review-close').onclick = () => RV_MASK.classList.remove('open');
+  const jump = $('rv-line-jump');
+  if (jump) jump.onclick = () => {
+    const path = linePathOfList(best.moves || []);
+    if (!path) { flash('那条分支在当前的树里定位不到（可能已经被删了）'); return; }
+    state.viewAt = Math.min(state.moves.length, bestL); syncUI();
+    applyVariationLine(path, bestL);
+    if (state.review) { showReviewReport(); return; }
+    flash('已跳到那条分支，但它那份报告没读出来');
+  };
+  const go = $('rv-line-go');
+  if (go) go.onclick = () => runReview(nm, { scope: 'line' });
+}
+
+/* ---------------- 切到「还没复盘」的分支时问一句（2026-10-22 用户要求） ----------------
+   ★ 为什么要有：用户复盘了主线，切到另一条分支一看，走势/目损全空 ——
+     不知道是"程序坏了"还是"这条还没算"。问一句「要不要现在算」比什么都不说好。
+   ★ 什么时候**不问**（否则会变成骚扰）：
+     · 这份棋谱还没存过任何一条线的报告（那就不是"漏了一条"，是压根没复盘过）；
+     · 正在复盘 / 复盘弹窗开着（别盖住进度或刚弹出的报告）；
+     · 这条线这次会话里已经问过、用户点了「暂不」；
+     · 用户在对话框里勾了「别再自动问」。
+   ★ 也不在新局的棋盘上问：只有「从棋谱库打开的棋谱」（state.recName）
+     才可能是"有报告、但这条线没有"的情形。 */
+let askReviewTimer = null;
+function scheduleAskReviewLine() {
+  clearTimeout(askReviewTimer);
+  if (reviewBusy || !state.recName) return;
+  const doc = state.reviewDoc;
+  if (!doc || !doc.lines || !Object.keys(doc.lines).length) return;
+  if (localStorage.getItem('rapacego.noAskLine') === '1') return;
+  const key = lineKeyOfMoves(state.moves);
+  if (doc.lines[key]) return;
+  if (state.noAskKeys && state.noAskKeys.has(key)) return;
+  if (state.moves.length < 2) return;
+  askReviewTimer = setTimeout(() => {
+    if (reviewBusy || RV_MASK.classList.contains('open')) return;
+    showAskReviewLine(state.recName);
+  }, 400);
+}
+
+function showAskReviewLine(name) {
+  if (reviewBusy) return;
+  const doc = state.reviewDoc;
+  const key = lineKeyOfMoves(state.moves);
+  if (!doc || !doc.lines || doc.lines[key]) return;
+  /* 「还剩几条没算」= 包含当前这条在内（它是没复盘的那条） */
+  const miss = reviewTargets('missing', doc);
+  /* 「另一条分支」的共享前缀 —— 决定这一条能不能接着算，而不是从头 */
+  const mine = lineGtpOf(state.moves);
+  let bestL = 0;
+  for (const k of Object.keys(doc.lines)) {
+    const e = doc.lines[k];
+    if (!e || !Array.isArray(e.moves)) continue;
+    bestL = Math.max(bestL, sharedPrefixLen(e.moves, mine));
+  }
+  RV_MASK.classList.add('open');
+  let h = '<h2>这条分支还没复盘</h2>';
+  h += '<div class="rv-sub">' + esc(String(name || '').replace(/\.sgf$/i, ''))
+    + ' · 当前这条线共 ' + state.moves.length + ' 手 · 这份棋谱已经算过 '
+    + Object.keys(doc.lines).length + ' 条分支</div>';
+  h += '<div class="rv-note">' + (bestL > 0
+    ? '前面 <b>' + bestL + ' 手</b>和已复盘的分支是同一个局面，会<b>直接复用</b>，只算第 '
+      + (bestL + 1) + ' 手往后。'
+    : '这条分支从第一手就和别的不一样，得整条算一遍。')
+    + ' 算完和别的分支存在同一个复盘文件里，切回哪条线就看哪一份。</div>';
+  h += '<div class="mfoot">'
+    + (miss.length > 1 ? '<button id="ra-more">剩下的 ' + miss.length + ' 条一起算</button>' : '')
+    + '<label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-dim)">'
+    + '<input type="checkbox" id="ra-mute"> 别再自动问</label>'
+    + '<div class="spacer"></div>'
+    + '<button id="ra-no">暂不</button>'
+    + '<button id="ra-go" class="primary">复盘这条分支</button>'
+    + '</div>';
+  $('review-body').innerHTML = h;
+  const mute = $('ra-mute');
+  const close = () => RV_MASK.classList.remove('open');
+  $('ra-no').onclick = () => {
+    state.noAskKeys.add(key);          // 这条线这次不再问（切走再切回来也不烦）
+    if (mute && mute.checked) localStorage.setItem('rapacego.noAskLine', '1');
+    close();
+  };
+  $('ra-go').onclick = () => {
+    if (mute && mute.checked) localStorage.setItem('rapacego.noAskLine', '1');
+    runReview(name, { scope: 'line' });
+  };
+  const more = $('ra-more');
+  if (more) more.onclick = () => {
+    if (mute && mute.checked) localStorage.setItem('rapacego.noAskLine', '1');
+    runReview(name, { scope: 'missing' });
+  };
 }
 
 /* 真正跑复盘（选档面板点「开始复盘」后进来）。
-   ★ 不再自动用缓存：报告由「复盘报告」按钮负责看；点「AI 复盘」就是要重算一份新的。 */
-async function runReview(name) {
+   ★ 不再自动用缓存：报告由「复盘报告」按钮负责看；点「AI 复盘」就是要重算一份新的。
+
+   ★★ 2026-10-21 改成**分块 + 断点续算**，为什么：
+     ① 一整盘一次发出去，在重权重上要几十分钟，中途「停止 / 关窗口 / 引擎崩了」
+        就**全丢** —— 用户报的「卡住」里有一半是这种：等不下去、关掉、又得从头来；
+     ② 一条巨型请求出问题时（某手非法、引擎半死），整盘一个字都拿不到。
+     分块之后：每块（REVIEW_CHUNK 手）算完就落盘到 <棋谱名>.review.part.json，
+     下次只补缺的手。分块本身**不会**让结果变差 —— 每手照样是同一档搜索量、
+     同一个权重；KataGo 的 analysis 换手时本来就不保留搜索树。 */
+const REVIEW_CHUNK = 10;
+
+/* ---------------- 分支感知的复盘：一条线一份，全存同一个 json ----------------
+
+   背景（2026-10-22 用户要求）：一份棋谱可以有好几条分支（SGF 变体 / 回看中落子开的分支）。
+   原来复盘只认「打开时那条主线」，一换线数据整批作废 —— 想复盘另一条分支只能从头再算，
+   可两条线前 100 手明明是**同一个局面**。
+
+   做法：
+     · 每条线用一个「手顺指纹」lineKey 标识（颜色+坐标序列的哈希 + 手数）；
+     · 同一个 <棋谱名>.review.json 里按 lineKey 存多份（v3 结构，旧的 v2 读的时候自动升级）；
+     · 换到别的分支时：① 这条线算过 → 直接显示它那份；
+                       ② 没算过 → **复用共享前缀**那几手的引擎输出，只补后面分叉的部分；
+     · 打开棋谱 / 切分支 / 看报告，一律按「当前这条线」挑报告（syncReviewForLine）。
+
+   ★ 每条线还存一份 `turns`（slim 过的逐回合数据）：换分支时共享前缀直接拿来用。
+     只留 buildReview 真正要用的字段（root 三项 + 候选点的 move/order + actualMove），
+     一手约 100 字节；原始报文带 8 条 PV，是它的十几倍。 */
+
+function hash32(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+/* 手顺 → ["BQ16", "WD4", "Wpass"]。两种输入都吃：state.moves（对象）/ 引擎请求（数组）。 */
+function lineGtpOf(moves) {
+  const out = [];
+  for (const m of moves || []) {
+    if (!m) continue;
+    if (Array.isArray(m)) out.push((m[0] === 'W' ? 'W' : 'B') + String(m[1] || 'pass'));
+    else out.push((m.color === 'w' ? 'W' : 'B') + (m.pass ? 'pass' : toGTP(m.x, m.y)));
+  }
+  return out;
+}
+
+/* 线的指纹：手顺一致 + 手数一致才是同一条线（只看手数会把不同分支当成同一条）。 */
+function lineKeyOfList(list) { return hash32((list || []).join(',')) + '-' + (list || []).length; }
+function lineKeyOfMoves(moves) { return lineKeyOfList(lineGtpOf(moves)); }
+
+/* 两条线共享开头多少手（= 这些回合的局面完全相同，引擎结果可以直接复用） */
+function sharedPrefixLen(a, b) {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+}
+
+/* 树上所有「根→叶」的线（每条叶子算一条）。节点形状对 `state.varRoot`
+   和 parseSGF 交出来的 `p.tree` 完全一样（move / children），所以两处共用一个。
+   ★ 上限 40 条：变体多到离谱的棋谱（上千个叶子）不该把引擎和界面压死；
+     真到那一步，报出来的「全部」也只是前 40 条 —— 面板上会写明。 */
+const MAX_LINES = 40;
+function linesOfTree(root) {
+  const out = [];
+  if (!root) return out;
+  const walk = (nd, path) => {
+    if (out.length >= MAX_LINES) return;
+    const kids = (nd.children || []).filter(c => c.move);
+    if (!kids.length) { if (path.length) out.push(path); return; }
+    for (const k of kids) walk(k, path.concat([k]));
+  };
+  walk(root, []);
+  return out;
+}
+function movesOfNodePath(path) {
+  return (path || []).map(x => ({
+    color: x.move.color, x: x.move.x, y: x.move.y, pass: !!x.move.pass,
+  }));
+}
+
+/* 反过来：一串手顺（GTP 字符串）→ 树上那条节点链。找不到 = null（手顺不在树里）。 */
+function linePathOfList(list) {
+  const root = state.varRoot;
+  if (!root || !Array.isArray(list) || !list.length) return null;
+  const path = [];
+  let nd = root;
+  for (const g of list) {
+    const want = String(g);
+    const next = (nd.children || []).find(c => {
+      if (!c.move) return false;
+      const color = c.move.color === 'w' ? 'W' : 'B';
+      const pt = c.move.pass ? 'pass' : toGTP(c.move.x, c.move.y);
+      return (color + pt) === want;
+    });
+    if (!next) return null;
+    path.push(next); nd = next;
+  }
+  return path;
+}
+
+/* 这次复盘要算哪几条线（scope）：
+     'line'    = 当前这条线（默认，和原来完全一样）
+     'all'     = 树上所有分支（按手顺指纹去重）
+     'missing' = 只算还没存过报告的那些
+   返回 [{ list, key, n, cur }]。scope 不是 line 时，**当前线排第一**
+   （用户点的就是「复盘」，第一眼要看到自己站的这条）。 */
+function reviewTargets(scope, doc) {
+  const curList = lineGtpOf(state.moves);
+  const cur = { list: curList, key: lineKeyOfList(curList), n: curList.length, cur: true };
+  if (scope !== 'all' && scope !== 'missing') return [cur];
+  const has = k => !!(doc && doc.lines && doc.lines[k]);
+  const seen = new Set();
+  const list = [];
+  const push = t => { if (!t.list.length || seen.has(t.key)) return; seen.add(t.key); list.push(t); };
+  if (!(scope === 'missing' && has(cur.key))) push(cur);
+  for (const path of linesOfTree(state.varRoot)) {
+    const l = lineGtpOf(movesOfNodePath(path));
+    const k = lineKeyOfList(l);
+    if (scope === 'missing' && has(k)) continue;
+    push({ list: l, key: k, n: l.length, cur: false });
+  }
+  return list;
+}
+
+/* 把「当前这条线」的分析快照留一份到 state.anaLines（换线 / 开分支之前调）。
+   ★ 必须在**截断 anaAt 之前**调 —— 否则删掉的就是要留的那些。
+   ★★ 同一个线指纹可能被留档多次，**必须合并、不能覆盖**（2026-10-22 实测踩到）：
+     进出一条分支会各留一次；第二次手里往往只有共享前缀（后面被截掉了），
+     直接覆盖就把第一次那份完整数据换成了残的 —— 导出时那条线的报告只剩前几手。
+     合并规则：按回合取并集（同一个回合的局面是同一个，取哪份都对）。 */
+function archiveAnaLine() {
+  const list = lineGtpOf(state.moves);
+  if (!list.length) return;
+  const key = lineKeyOfList(list);
+  const prev = state.anaLines[key];
+  const at = Object.assign({}, (prev && prev.at) ? prev.at : {});
+  let added = 0;
+  for (const k in state.anaAt) {
+    const i = +k;
+    if (i > list.length) continue;          // 比这条线还长 → 属于别的线（理论上不该有）
+    if (!at[k]) added++;
+    at[k] = state.anaAt[k];
+  }
+  if (!added && prev) return;               // 没有新东西就别动
+  state.anaLines[key] = { key, moves: list, at };
+}
+
+/* 当前这条线的**完整**分析快照（★ 2026-10-22 第二处坑）。
+   `state.anaAt` 只装「这次站上来之后算过的」：从别的分支切回来时，它已经被截成共享前缀了，
+   后半段还躺在 `state.anaLines[本线指纹]` 里。导出时只读 anaAt 就会把这条线导成半截
+   （解说词缺后半段）—— 所以两边合一下：
+   **留档打底、当前覆盖**（同一个回合是同一个局面，当前那份更新）。
+   ★ 2026-10-23：`liveLineBundles()` 随「导出不再存分析」一起删了，这个函数现在只服务
+     buildSGF 的解说词（每条分支都要自己的那份快照）。 */
+function curLineAnaAt() {
+  const key = lineKeyOfList(lineGtpOf(state.moves));
+  const arch = state.anaLines && state.anaLines[key];
+  return Object.assign({}, (arch && arch.at) ? arch.at : {}, state.anaAt);
+}
+
+/* 「环境签名」= 搜索量 / 贴目 / 规则 / 棋盘 / 摆子 / 权重。
+   ★ 和「手顺」分开是必须的：换分支时环境没变，共享前缀才敢复用；
+     混在一起（老写法）会让每条线的签名都不同，前缀复用就失效了。 */
+function reviewEnvSig(req, model) {
+  const stones = (req.initialStones || []).map(s => s[0] + s[1]).join(',');
+  return ['e1', req.maxVisits, req.komi, req.rules, req.size, hash32(stones), model || ''].join('|');
+}
+
+/* 「环境核心」= 上面那个签名**去掉搜索量**之后剩下的部分（贴目/规则/棋盘/摆子/权重）。
+   ★★ 2026-10-23 用户报障：「已经有 AI 复盘结果的棋局，点全盘讲解还要用 KataGo 算一遍」。
+   查下来根因就在这：`env` 里带着 `maxVisits`，而复盘默认档会变（老的复盘文件是 100 次，
+   现在的默认是 500 次）—— 一比对就不等，**整盘一个回合都借不到**，于是白算一遍
+   （294 手 × 500 步 = 几十分钟，用户当然炸）。
+   搜索量只影响**精度**，不影响「这是不是一个局面」：同一个局面上不管搜 100 还是 500，
+   它都是那个局面。所以能不能借看"核心"，借的时候**整盘沿用那份复盘的搜索量**
+   （见 coachTurnsForLine 的 useVisits）—— 精度统一，不混着用。
+   ⚠️ 权重 / 贴目 / 规则 / 棋盘 / 摆子不一样就真的不能借（评估标准都变了）。 */
+function reviewEnvCore(req, model) {
+  const stones = (req.initialStones || []).map(s => s[0] + s[1]).join(',');
+  return ['e1', req.komi, req.rules, req.size, hash32(stones), model || ''].join('|');
+}
+/* 从存盘的完整签名里取「核心」那一段（形状必须和 reviewEnvCore 完全一致） */
+function envCoreOf(sig) {
+  const a = String(sig || '').split('|');
+  if (a.length < 7) return '';
+  return [a[0], a[2], a[3], a[4], a[5], a[6]].join('|');
+}
+
+/* 一条线自己的完整签名（中间文件用它校验「这份数据是不是这条线、这一档搜索量」） */
+function reviewSignature(req, model) {
+  return reviewEnvSig(req, model) + '|' + lineKeyOfMoves(req.moves || []);
+}
+
+/* 逐回合数据瘦身（存盘用）：buildReview 只读 root 三项、候选点的 move/order、actualMove。
+   ★ 2026-10-22 多存一个候选点胜率 `winrate`：「全盘讲解」复用复盘数据时要说
+     「AI 当时想下的是 X（胜率 47.6%）」，原来那版瘦身把它丢了，只能整盘重算。
+     一个候选点约 20 字节，300 手的棋谱多 40KB 左右 —— 换来「复盘过的盘不用再算一遍」。 */
+function slimTurn(t) {
+  if (!t) return null;
+  const r = t.root || {};
+  return {
+    turn: typeof t.turn === 'number' ? t.turn : 0,
+    root: { currentPlayer: r.currentPlayer, winrate: r.winrate,
+            scoreLead: r.scoreLead, visits: r.visits },
+    moves: (t.moves || []).slice(0, 8).map(m => ({ move: m.move, order: m.order, winrate: m.winrate })),
+    actualMove: t.actualMove || null,
+  };
+}
+function slimTurns(obj) {
+  const out = {};
+  for (const k of Object.keys(obj || {})) { const v = obj[k]; if (v) out[k] = slimTurn(v); }
+  return out;
+}
+
+/* 走势两条曲线（胜率 / 目差，都换算成黑方视角）—— 复盘和「下棋时攒的分析」共用 */
+function seriesFromTurns(arr) {
+  const isWhiteTurn = x => String(((x && x.root) || {}).currentPlayer || '').toUpperCase() === 'W';
+  const history = (arr || []).map(x => {
+    const wr = x && x.root && x.root.winrate;
+    if (typeof wr !== 'number') return undefined;
+    return isWhiteTurn(x) ? 1 - wr : wr;
+  });
+  const leads = (arr || []).map(x => {
+    const sl = x && x.root && x.root.scoreLead;
+    if (typeof sl !== 'number') return undefined;
+    return isWhiteTurn(x) ? -sl : sl;
+  });
+  return { history, leads };
+}
+
+function emptyReviewDoc(name) {
+  return { v: 3, name: String(name || '').replace(/\.sgf$/i, ''), updated: 0, lines: {} };
+}
+
+/* 读到的报告 → v3（旧版 v2 是"一个文件一份报告、只对应主分支"，就按当前这条线收编） */
+function normalizeReviewDoc(raw, moves) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (raw.lines && typeof raw.lines === 'object') {
+    raw.v = 3;
+    if (!raw.name) raw.name = '';
+    return raw;
+  }
+  if (!Array.isArray(raw.losses)) return null;
+  const list = lineGtpOf(moves || []);
+  const key = lineKeyOfList(list);
+  const doc = emptyReviewDoc(raw.name || '');
+  doc.lines[key] = {
+    key, moves: list, n: list.length, env: '', sig: '',
+    visits: raw.visits || 0, source: 'review',
+    report: raw, history: raw.history || null, leads: raw.leads || null,
+  };
+  return doc;
+}
+
+async function loadReviewDoc(name, moves) {
+  try {
+    const r = await window.api.records.readReview(name);
+    if (!r || !r.text) return emptyReviewDoc(name);
+    return normalizeReviewDoc(JSON.parse(r.text), moves) || emptyReviewDoc(name);
+  } catch (e) { return emptyReviewDoc(name); }
+}
+
+function reviewEntryFor(doc, moves) {
+  if (!doc || !doc.lines) return null;
+  return doc.lines[lineKeyOfMoves(moves)] || null;
+}
+
+/* 把「当前这条线」的复盘装进 state（没有就清掉）。
+   换线 / 打开报告 / 复盘结束都走这里 —— 保证界面上看到的目损、走势、报告
+   永远是**眼前这条线**的，而不是上一次打开时那条主线的。 */
+function syncReviewForLine() {
+  const doc = state.reviewDoc;
+  const entry = reviewEntryFor(doc, state.moves);
+  if (!entry) {
+    state.review = null;
+    state.history = []; state.leads = []; state.histVisits = [];
+    return false;
+  }
+  const rep = entry.report || {};
+  state.review = Object.assign({}, rep, {
+    file: state.recName || rep.file || '',
+    name: rep.name || (doc && doc.name) || String(state.recName || '').replace(/\.sgf$/i, ''),
+    visits: typeof entry.visits === 'number' ? entry.visits : (rep.visits || 0),
+    source: entry.source || rep.source || 'review',
+    partial: entry.partial || rep.partial || null,
+    lineKey: entry.key, lineN: entry.n, lineMoves: entry.moves || null,
+  });
+  state.history = Array.isArray(entry.history) ? entry.history.slice()
+    : (Array.isArray(rep.history) ? rep.history.slice() : []);
+  state.leads = Array.isArray(entry.leads) ? entry.leads.slice()
+    : (Array.isArray(rep.leads) ? rep.leads.slice() : []);
+  state.histVisits = state.history.map(() => state.review.visits || reviewVisits());
+  return true;
+}
+
+/* 打开棋谱时顺手把复盘拉回来（异步、不挡打开）：
+   这样自己导出的棋谱一打开，手数列表里就有目损，不用先去点「复盘报告」。
+   ★ 三道守卫：复盘正在跑 / 期间换过棋谱 / 期间换了另一份，都不许覆盖当前界面。 */
+async function autoLoadReviewDoc(name, gen) {
+  if (!name) return;
+  const doc = await loadReviewDoc(name, state.moves);
+  if (reviewBusy || gen !== gameGen || state.recName !== name) return;
+  if (!doc || !doc.lines || !Object.keys(doc.lines).length) return;
+  state.reviewDoc = doc;
+  if (syncReviewForLine()) { renderMoveList(); renderCurve(); return; }
+  /* ★ 2026-10-22：当前这条线没有、但**别的分支**有报告 → 说一句。
+     不说的话用户会以为「我明明复盘过，报告丢了」（其实报告在另一条线上）。
+     有分支的棋谱最容易踩：自己下的棋导出后重开默认回到主线，
+     而复盘报告属于当时站的那条分支（见 dev/_cdp_review_branch.mjs 的 ⑦）。 */
+  const nk = Object.keys(doc.lines || {}).length;
+  if (nk) {
+    flash('这份棋谱的另' + (nk > 1 ? '外 ' + nk + ' 条分支' : '一条分支') + '有复盘 —— '
+      + '跳到分叉处，Alt+←/→ 切过去看');
+  }
+}
+
+/* 复盘 = 「一条线一份报告」。opts.scope 决定这一次算哪几条：
+     'line'（默认）  只算**当前这条线**
+     'missing'       只算还没存过报告的（剩下的）
+     'all'           树上所有分支
+   ★ 2026-10-22 用户要求：点「AI 复盘」时能选「只算当前分支 / 全部分支 / 剩下没算的」。
+     scope='line' 时的行为与以前**一模一样**（进度、暂停、断点续算都不变）。 */
+async function runReview(name, opts) {
   if (reviewBusy) { showReviewAgain(); return; }
   if (!engineReady) { needEngine('analyze', '复盘'); return; }
+  const scope = (opts && opts.scope) || 'line';
   /* ★ 进门取号（2026-10-06 审查发现 + 定的修法）。
      原来判定与上锁之间隔着一个 await（读棋谱文件），那几毫秒里再点一次
      「开始复盘」会**真的开第二遍**（两份整盘请求、还会互相覆盖同一份报告文件）。
@@ -2889,73 +3872,353 @@ async function runReview(name) {
   const p = parseSGF(rd.text);
   if (!p || !p.ok || !p.moves.length) { flash('这份棋谱里没有手顺，复盘不了'); return; }
 
-  REC_MASK.classList.remove('open');
-  applyRecord(p, name);                 // 载入棋谱（顺便切摆棋模式、清掉上一次复盘）
-  const n = state.moves.length;
+  /* ★★ 2026-10-22：**同一份棋谱已经开着**时不再 applyRecord。
+     为什么：有分支的棋谱里，用户可能正站在某条分支上点「复盘这条分支」——
+     applyRecord 会把局面拉回打开时那条主线，于是复盘算的是**另一条线**，
+     结果还会存到那条线的名下（用户看到的报告"不是我这盘"）。
+     同一份棋谱开着时，尺寸 / 规则 / 贴目 / 变化树 / 当前手顺都已经是它的，直接用最稳。 */
+  const sameOpen = state.recName === name;
+  if (!sameOpen) {
+    REC_MASK.classList.remove('open');
+    applyRecord(p, name);               // 载入棋谱（顺便切摆棋模式、清掉上一次复盘）
+    /* ★ applyRecord 里 syncUI 见 isTerminal() 会**排一个 700ms 后的自动数子**。
+       那个数子一进门就 cancel()，会把复盘第一块掐死（详见 runScore 开头的注释）。
+       runScore 那边已经加了 reviewBusy 守卫，这里再清掉已经排上的定时器 ——
+       两道都留着：守卫挡「之后排的」，clearTimeout 挡「之前就排好的」。 */
+    clearTimeout(scoreTimer);
+  }
   const gen = gameGen;                  // ★ 这次复盘属于哪一局（applyRecord 刚把它 +1 过）
 
-  reviewBusy = true;
-  showReviewProgress(0, n + 1);
-  const req = {
+  /* 引擎请求的公共部分 —— **不含手顺**：每条线各填各的（见 reviewLineJob）。
+     ★ 也正因为它不含手顺，换分支时 envSig 一致，共享前缀才敢复用。 */
+  const base = {
     initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
-    moves: state.moves.map(m => [m.color === 'b' ? 'B' : 'W', m.pass ? 'pass' : toGTP(m.x, m.y)]),
     rules: (RULES[settings.rules] || RULES.chinese).kata,
     komi: settings.komi,
     size: N,
     maxVisits: reviewVisits(),
-    /* 0..n：多算一个「最后一手之后」的回合 —— 最后一手的目损只能从它算出来 */
-    analyzeTurns: Array.from({ length: n + 1 }, (_, i) => i),
   };
-  let res;
-  try { res = await window.api.review(req); }
-  catch (e) { res = { error: String(e) }; }
-  reviewBusy = false;
-  /* 复盘期间分析是被压住的（runAnalysis 见了 reviewBusy 直接 return）→ 复盘一结束就补一次，
-     让棋盘的胜率条 / 推荐点重新长出来（force：复盘把 history 整盘重写了，当前局面得重算）。 */
-  scheduleAnalysis(0, true);
+  const envSig = reviewEnvSig(base, analyzeModelName);
 
-  /* ★ 复盘期间用户换了局（点了新对局 / 又打开了另一份棋谱）→ 这次复盘整体作废：
-     否则会把**上一份棋谱的目损**画到当前这盘上，报告还会存到别的棋谱名下。 */
-  if (gen !== gameGen) { RV_MASK.classList.remove('open'); return; }
+  reviewBusy = true;
+  reviewAbort = false;
+  rvRun = {
+    t0: Date.now(), visitsDone: 0, visits: base.maxVisits,
+    total: 0, doneSet: new Set(), doneBase: 0,
+    lineIdx: 0, lineCount: 1, scope, name,
+  };
+  $('review-body').innerHTML = '';        // 丢掉上一份报告的 DOM，重建进度窗
+  showReviewProgress(null);
 
-  if (!res || res.error) { RV_MASK.classList.remove('open'); flash('复盘失败：' + ((res && res.error) || '未知')); return; }
-  const turns = res.turns || [];
-  if (turns.length < 2) { RV_MASK.classList.remove('open'); flash('复盘没拿到足够数据'); return; }
+  /* ★★ 整段包在 try/finally 里（不是审美问题）：
+     reviewBusy 是「分析引擎被复盘占着」的闸门，**漏放一次就永久锁死** ——
+     自动分析再也不发请求，界面上的胜率条、候选点全部停摆，只能重启软件。
+     所以释放只有一个出口：finally。中间任何 return / 异常都绕不过它。 */
+  try {
 
-  state.review = buildReview(n, turns);
-  state.review.name = name.replace(/\.sgf$/i, '');
-  /* 顺手把胜率走势也填满：复盘每个回合都带 winrate（同样是「当前走棋方视角」，
-     要换算成黑方胜率）。这样打开一份旧棋谱复盘后，走势图也是完整的一整盘。 */
-  /* 走势数据：胜率和目差**各填一份**（都换算成黑方视角）—— 曲线两种纵轴要用 */
-  const isWhiteTurn = x => String((x && x.root || {}).currentPlayer || '').toUpperCase() === 'W';
-  state.history = turns.map(x => {
-    const wr = x.root && x.root.winrate;
-    if (typeof wr !== 'number') return undefined;
-    return isWhiteTurn(x) ? 1 - wr : wr;
-  });
-  state.leads = turns.map(x => {
-    const sl = x.root && x.root.scoreLead;
-    if (typeof sl !== 'number') return undefined;
-    return isWhiteTurn(x) ? -sl : sl;
-  });
-  /* ★ 整盘复盘的每一手都是**同一档搜索量**一起算出来的 → 精度标记统一填上。
-     填了它，rememberEval 之后就不会用零散的中间报告去改写这些格
-     （否则复盘完再随手看一下某手，那一手的涨跌就会被一次粗算覆盖掉）。 */
-  state.histVisits = turns.map(() => reviewVisits());
-  renderMoveList();      // 手数列表要标目损
-  renderCurve();         // 走势图要标失误点
-  if (res.incomplete) flash('复盘提前结束（超时），数据可能不全');
-  /* ★ 把结果存下来（含胜率走势 + 这次用的搜索量）——
-     records/<棋谱名>.review.json，**同一个文件直接覆盖** → 永远只有最新一份（用户要求）。
-     以后点「复盘报告」就能直接看，不用重算。 */
-  state.review.file = name;
-  state.review.visits = reviewVisits();     // 报告里要显示「这是按多少步算出来的」
-  state.review.history = state.history.slice();
-  state.review.leads = state.leads.slice();
-  try { await window.api.records.saveReview(name, JSON.stringify(state.review)); }
-  catch (e) { /* 存不下也不影响本次查看 */ }
-  refreshRecords();      // 让棋谱库里的「已复盘」标记和「复盘报告」按钮立刻变亮
-  showReviewReport();
+    /* ---------- ① 把这的棋谱已有的报告 / 中间结果读进来 ---------- */
+    const doc = await loadReviewDoc(name, state.moves);
+    state.reviewDoc = doc;
+
+    /* 目标线。★ 'missing' 要知道哪些已经有报告，所以必须等 doc 读回来之后再算。 */
+    const targets = reviewTargets(scope, doc);
+    if (!targets.length) {
+      RV_MASK.classList.remove('open');
+      flash('每条分支都复盘过了 —— 想重算就选「当前这条线」或「全部分支」');
+      return;
+    }
+    rvRun.lineCount = targets.length;
+    /* 多线时总数 = 各线回合数之和（多条线共享的前缀会直接复用，所以这是**上限**估算）。
+       单线时 = n+1，和以前完全一致。 */
+    rvRun.total = targets.reduce((s, t) => s + t.n + 1, 0);
+    showReviewProgress(null);
+
+    let partObj = null;
+    try {
+      const pr = await window.api.records.readReviewPart(name);
+      if (pr && pr.text) partObj = JSON.parse(pr.text);
+    } catch (e) { /* 读不出来就当没有，全量重算 */ }
+    /* 中间文件也是「一条线一项」（v3）。老版本是一份文件一条线，字段对不上 → 直接当没有：
+       丢掉的是上一次跑了一半的数据，比重算错了好。 */
+    const partLines = (partObj && partObj.lines && typeof partObj.lines === 'object') ? partObj.lines : {};
+
+    /* ---------- ② 一条一条线算 ---------- */
+    let doneAll = 0, wholeAll = 0, stopped = false, stopWhy = '', engineErr = '';
+    for (let i = 0; i < targets.length; i++) {
+      if (reviewAbort) { stopped = true; stopWhy = '你点了停止'; break; }
+      const one = await reviewLineJob({
+        name, doc, partLines, t: targets[i], idx: i, base, envSig, gen,
+      });
+      doneAll += one.done || 0;
+      rvRun.doneBase = doneAll;
+      if (one.error) engineErr = one.error;
+      if (one.whole) wholeAll++;
+      if (one.aborted) { stopped = true; stopWhy = one.why || ''; break; }
+      if (gen !== gameGen) break;
+      if (one.error && !one.done) break;
+    }
+
+    /* ★ 复盘期间用户换了局（点了新对局 / 又打开了另一份棋谱）→ 这次复盘整体作废：
+       否则会把**上一份棋谱的目损**画到当前这盘上，报告还会存到别的棋谱名下。
+       （中间结果已经按这份棋谱的文件名落盘了，不会串到别的棋谱上。） */
+    if (gen !== gameGen) { RV_MASK.classList.remove('open'); return; }
+
+    /* 实测速度记下来：下次开选档面板 / 画剩余时间就有准数（见 reviewRate） */
+    const elapsed = (Date.now() - rvRun.t0) / 1000;
+    if (elapsed > 5 && rvRun.visitsDone > 0) saveReviewRate(rvRun.visitsDone / elapsed);
+
+    if (engineErr && !doneAll) { RV_MASK.classList.remove('open'); flash('复盘失败：' + engineErr); return; }
+    if (!doneAll) { RV_MASK.classList.remove('open'); flash('复盘没拿到足够数据'); return; }
+
+    /* ★★ 没算完整盘**不直接弹报告**（2026-10-21 用户实测报障）。
+       原来的行为：点停止 → 立刻弹一份「AI 复盘」报告，页眉写着
+       「这份报告没算完整盘：只算了前 4 / 294 手」—— 用户的感受是
+       「复盘坏了 / 程序只肯算 4 手」，而不是「我停下来了，可以接着算」。
+       现在改成专门的「暂停」面板：说清已经存盘、还剩多少、大约还要多久，
+       并且「接着算」的按钮就在手边（不用再绕回棋谱库点 AI 复盘）。
+       ⚠️ 这里**不能先 syncReviewForLine**：残缺的报告不在 doc.lines 里
+          （只有整盘算完才写文件），一 sync 就把刚算出来的部分清掉了 ——
+          暂停面板上「先看已算的这部分」于是变成空白（2026-10-22 实测到）。
+          reviewLineJob 已经把「当前这条线」的那份装在 state.review 上了。 */
+    if (stopped || !wholeAll) {
+      renderMoveList();    // 手数列表要标目损
+      renderCurve();       // 走势图要标失误点
+      showReviewPaused(doneAll, rvRun.total, stopWhy || '这次没算完', scope);
+      return;
+    }
+
+    /* 全部目标线整盘算完 → 按**当前这条线**重新装一份（中途换了线也不会画错） */
+    const got = syncReviewForLine();
+    renderMoveList();    // 手数列表要标目损
+    renderCurve();       // 走势图要标失误点
+
+    if (got) { showReviewReport(); return; }
+    /* 算完了，但**当前站的这条线**不在这次的目标里（选了「只算没算过的」，或中途切走） */
+    if (scope === 'line') {
+      flash('那条分支的复盘算完了，已经存进这份棋谱的复盘文件');
+      RV_MASK.classList.remove('open');
+      return;
+    }
+    showReviewDone(targets.length, doneAll);
+  } finally {
+    reviewBusy = false;
+    /* 复盘期间分析是被压住的（runAnalysis 见了 reviewBusy 直接 return）→ 复盘一结束就补一次，
+       让棋盘的胜率条 / 推荐点重新长出来（force：复盘把 history 整盘重写了，当前局面得重算）。 */
+    scheduleAnalysis(0, true);
+    /* 复盘期间数子也被压住了（见 runScore 开头的守卫）→ 这盘要是已经下完，
+       把当时被挡掉的那次数子补回来，否则结果条会一直空着。延迟一点，
+       让 scheduleAnalysis 那个请求先发出去（数子一进门就 cancel，会把它掐掉）。 */
+    if (!state.draft && isTerminal() && !state.result) scheduleScore(1200);
+  }
+}
+
+/* 算**一条线**：断点续算（含别的分支的共享前缀）→ 分块请求 → 整盘算完才写报告。
+   返回 { done, whole, aborted, why, error }。
+   ★ 界面上的「装不装」由调用方判断：算的时候用户可能已经切到别的分支了，
+     那就只落盘、不改界面（拿 A 线的目损看 B 线，比没有数字糟得多）。 */
+async function reviewLineJob(o) {
+  const { name, doc, partLines, t, idx, base, envSig, gen } = o;
+  const myList = t.list;
+  const myKey = t.key;
+  const n = t.n;
+  const reqMoves = myList.map(g => [g[0] === 'W' ? 'W' : 'B', String(g).slice(1)]);
+  const sig = reviewSignature(Object.assign({}, base, { moves: reqMoves }), analyzeModelName);
+
+  rvRun.lineIdx = idx;
+  rvRun.doneSet = new Set();
+
+  /* ---------- ① 断点续算：上一次（停止 / 崩溃 / 卡住）已经算完的手直接复用 ---------- */
+  /* ★★ 复用已有数据：① 这条线自己的中间结果；② **别的分支的共享前缀**。
+     ②是 2026-10-22 用户要求的核心 —— 换个分支复盘时，前 N 手明明是同一批局面，
+     没有理由让引擎再算一遍（重权重上每手十几秒）。 */
+  const have = {};
+  let fromOther = 0;
+  const trySeed = (line, key) => {
+    if (!line || !line.turns) return;
+    /* 环境不同（换了搜索量 / 权重 / 贴目 / 规则）→ 一个数都不能借 */
+    if (line.env && line.env !== envSig) return;
+    const L = sharedPrefixLen(line.moves || [], myList);
+    for (let tt = 0; tt <= L; tt++) {
+      const v = line.turns[tt];
+      if (!v) continue;
+      const c = Object.assign({}, v);
+      /* ★ 共享前缀里的**最后一回合**，它后面那一手正是分叉的那一手：
+         别的线走 a、我们走 b，直接沿用会把「实际手」算到别人头上，
+         于是「与 AI 首选一致」这条统计就串线了。改成这条线自己的手。 */
+      if (tt === L && L < myList.length) c.actualMove = myList[tt] ? myList[tt].slice(1) : null;
+      if (!have[tt]) { have[tt] = c; if (key !== myKey) fromOther++; }
+    }
+  };
+  if (partLines[myKey]) trySeed(partLines[myKey], myKey);
+  for (const k of Object.keys(partLines)) if (k !== myKey) trySeed(partLines[k], k);
+  for (const k of Object.keys(doc.lines || {})) {
+    const e = doc.lines[k];
+    /* 下棋时攒的实时分析搜索量不统一 → 不当复盘数据复用（要复用就重算一遍） */
+    if (!e || e.source === 'live') continue;
+    trySeed(e, k);
+  }
+  /* 别的线可能更长 → 超出本线的回合（理论上不该有）一律丢掉，别把 n+1 以外的东西算进去 */
+  for (const k of Object.keys(have)) if (+k > n) delete have[k];
+
+  const resumeN = Object.keys(have).length;
+  if (idx === 0 && resumeN > 1 && fromOther > 1) {
+    flash('这条分支复用前面共享的 ' + fromOther + ' 手，只算分叉之后的部分');
+  } else if (idx === 0 && resumeN > 1) {
+    flash('接着上次算：已有 ' + resumeN + ' 手，只补剩下的');
+  }
+
+  const missing = [];
+  for (let tt = 0; tt <= n; tt++) if (!have[tt]) missing.push(tt);
+  rvRun.visitsDone += resumeN * base.maxVisits;
+  rvRun.doneSet = new Set(Object.keys(have).map(k => Number(k)));
+  showReviewProgress(null);
+
+  /* ---------- ② 分块算 ---------- */
+  let turns = have, aborted = false, stalled = false, engineErr = '';
+  let pos = 0, retries = 0;
+  while (pos < missing.length) {
+    /* ★ 换分支也算「走了」：复盘算的是发请求那一刻那条线；用户切走之后再往
+       state.moves 上写结果，就会把 A 线的目损画到 B 线上（而且要白烧 GPU）。
+       ⚠️ 这条判据只对**当前线**成立 —— 多线连算时 state.moves 本来就停在别的线上。 */
+    if (reviewAbort || gen !== gameGen || (t.cur && lineKeyOfMoves(state.moves) !== myKey)) {
+      aborted = true; break;
+    }
+    const chunk = missing.slice(pos, pos + REVIEW_CHUNK);
+    let res;
+    try { res = await window.api.review(Object.assign({}, base, { moves: reqMoves, analyzeTurns: chunk })); }
+    catch (e) { res = { error: String(e) }; }
+
+    if (res && res.aborted) { aborted = true; }           // 「停止」→ 已算完的那些还在 res.turns 里
+    if (res && res.error) { engineErr = res.error; }
+    /* ★★ 两种回包形状都收（2026-10-22）：
+       `{turns:[...]}` = 整盘逐手的收集模式；单个 payload = 只有一个回合时主进程
+       曾经回的那个形状（collect 判据写错的那一版 —— 见 main.js analyze() 里的注释）。
+       只认前一种的话，形状对不上就是**静默漏手**：一条都收不到、也不报错。
+       现在兜住：收不齐还有下面的空块检查兜底。 */
+    const got = (res && res.turns) ? res.turns
+      : ((res && typeof res.turn === 'number') ? [res] : []);
+    for (const tt of got) turns[tt.turn] = tt;
+
+    /* 每块落盘 —— 这就是「下次接着算」的锚点，也是崩溃时的止损点。
+       ★ 按线存：A 线算了一半去切 B 线，A 的进度不会丢（回来接着算）。 */
+    if (res && !res.error) {
+      rvRun.visitsDone += chunk.length * base.maxVisits;
+      try {
+        partLines[myKey] = {
+          key: myKey, moves: myList, n, env: envSig, sig,
+          turns: slimTurns(turns),
+        };
+        await window.api.records.saveReviewPart(name,
+          JSON.stringify({ v: 3, env: envSig, lines: partLines }));
+      } catch (e) { /* 存不下不阻止继续算 */ }
+    }
+    if (gen !== gameGen) break;
+    if (res && res.error) break;
+    if (aborted) break;
+    /* ★ 引擎卡住（主进程的 stall 心跳超时）→ **同一块当场重试一次**。
+       卡住多半是偶发（GPU 被别的程序抢、系统睡眠、驱动抽风），而 KataGo
+       已经把这块算过一部分 —— 重发同一批 analyzeTurns 会接着那棵树往下算，
+       通常几秒就补齐。直接认输的话用户拿到的就是「只算了前 4 手」这种残缺报告
+       （2026-10-21 用户实测报的正是这个）。重试只给一次，真挂了别在这儿打转。 */
+    if (res && res.incomplete) {
+      stalled = true;
+      if (retries < 1) { retries++; continue; }   // 不推进 pos = 重算同一块
+      break;
+    }
+    /* ★★ 请求了 N 个回合、一条结果都没回来 → **不许当成「这块过去了」**。
+       踩过的样子（2026-10-22 用户实测）：110 手的棋谱算到「110 / 111 手」停住，
+       面板说「这次没算完」，点「接着算」还是同一块、还是空手，永远补不上。
+       根因在主进程的 collect 判据（单回合的最后一块被当成单局面请求），但**前端也得兜**：
+       没有这条检查，漏手是完全静默的（不报错、不算卡住、pos 照样前进）。
+       处置与「卡住」一致：当场重试一次；还空就停在这里并说清原因。 */
+    if (chunk.length && !got.length) {
+      stalled = true;
+      engineErr = engineErr || '引擎这一块没回结果';
+      if (retries < 1) { retries++; continue; }
+      break;
+    }
+    stalled = false;
+    pos += REVIEW_CHUNK;                          // 只有正常才算「这一块过去了」
+  }
+
+  /* 把「回合号 → 报告」摊成 0..n 的数组（缺的手留 null：没算到就是没算到，
+     别拿邻居的值顶上去 —— 目损是差值，顶一个假数会让相邻两手都错）。 */
+  const arr = Array.from({ length: n + 1 }, (_, i) => turns[i] || null);
+  const doneN = arr.filter(Boolean).length;
+  const whole = doneN === n + 1;
+  if (engineErr && doneN < 2) return { done: doneN, whole: false, aborted, why: '', error: engineErr };
+  if (doneN < 2) return { done: doneN, whole: false, aborted, why: '', error: engineErr || '' };
+
+  const rep = buildReview(n, arr);
+  rep.name = name.replace(/\.sgf$/i, '');
+  /* 走势：胜率和目差**各填一份**（都换算成黑方视角）—— 曲线两种纵轴要用 */
+  const series = seriesFromTurns(arr);
+  rep.file = name;
+  rep.visits = reviewVisits();              // 报告里要显示「这是按多少步算出来的」
+  rep.history = series.history.slice();
+  rep.leads = series.leads.slice();
+  rep.partial = whole ? null : { done: doneN, total: n + 1 };
+  rep.lineKey = myKey;
+  rep.lineN = n;
+
+  /* ★★ 只有**整盘算完**才写报告文件。
+     没算完就写会把上一份完整报告覆盖成残缺的一份 —— 那是最坏的情况：
+     用户点一次「重新复盘」、中途停了，结果连旧报告都没了。
+     ★ 2026-10-22：写进去的是 **v3 文档**（这条线一项），别的分支的报告原样保留 ——
+       这正是「换分支复盘，结果存到同一个 json」的落地方式。 */
+  if (whole) {
+    doc.lines[myKey] = {
+      key: myKey, moves: myList, n, env: envSig, sig,
+      visits: rep.visits, source: 'review',
+      report: rep,
+      history: series.history.slice(), leads: series.leads.slice(),
+      turns: slimTurns(turns),
+    };
+    doc.name = doc.name || name.replace(/\.sgf$/i, '');
+    doc.updated = Date.now();
+    try { await window.api.records.saveReview(name, JSON.stringify(doc)); }
+    catch (e) { /* 存不下也不影响本次查看 */ }
+    /* 这条线完成了 → 它在中间文件里的那份数据没用了（留着会让下次误以为还没算完） */
+    delete partLines[myKey];
+    try {
+      if (Object.keys(partLines).length) {
+        await window.api.records.saveReviewPart(name, JSON.stringify({ v: 3, env: envSig, lines: partLines }));
+      } else {
+        await window.api.records.deleteReviewPart(name);
+      }
+    } catch (e) { /* 没中间文件就算了 */ }
+    refreshRecords();    // 让棋谱库里的「已复盘」标记和「复盘报告」按钮立刻变亮
+  }
+
+  /* 只有**现在还站在这条线上**才装进界面（用户中途切走 → 只落盘） */
+  if (lineKeyOfMoves(state.moves) === myKey) {
+    state.reviewDoc = doc;
+    state.review = rep;
+    state.history = series.history;
+    state.leads = series.leads;
+    /* ★ 整盘复盘的每一手都是**同一档搜索量**一起算出来的 → 精度标记统一填上。
+       填了它，rememberEval 之后就不会用零散的中间报告去改写这些格
+       （否则复盘完再随手一看某手，那一手的涨跌就会被一次粗算覆盖掉）。 */
+    state.histVisits = arr.map(() => reviewVisits());
+  }
+  return {
+    done: doneN, whole, aborted,
+    why: aborted ? '你点了停止' : (stalled ? '引擎那边卡住了' : '这次没算完'),
+    error: engineErr,
+  };
+}
+
+/* 多分支一起算、全都算完之后，如果用户站的这条线不在目标里（选了「只算没算过的」
+   或中途切走），给个收尾面板 —— 别让弹窗就这么空着，也别假装「什么都没发生」。 */
+function showReviewDone(nLines, doneTurns) {
+  RV_MASK.classList.add('open');
+  $('review-body').innerHTML =
+    '<h2>' + nLines + ' 条分支都算完了</h2>'
+    + '<div class="rv-sub">共 ' + doneTurns + ' 手 · 报告已经存进这份棋谱的复盘文件</div>'
+    + '<div class="rv-note">你<b>现在站的这条分支</b>这次不在目标里。'
+    + '跳到分叉那一手、按 <b>Alt+← / Alt+→</b> 换过去，就能看到它那份报告。</div>'
+    + '<div class="mfoot"><div class="spacer"></div><button id="review-close">关闭</button></div>';
+  $('review-close').onclick = () => RV_MASK.classList.remove('open');
 }
 
 /* 点遮罩空白处关掉复盘弹窗 —— ★ 但**复盘进行中不许关**：
@@ -2967,8 +4230,15 @@ if (RV_MASK) RV_MASK.addEventListener('click', e => {
   RV_MASK.classList.remove('open');
 });
 /* ★ 加 !state.coach.batch：全盘讲解也会走这条「整盘逐手」的通路（它借了复盘接口），
-   但它有自己的进度条 —— 别把「复盘」那个弹窗弹出来。 */
-window.api.onReviewProgress(d => { if (reviewBusy && d && !state.coach.batch) showReviewProgress(d.done, d.total); });
+   但它有自己的进度条 —— 别把「复盘」那个进度窗弹出来。
+   ★ 2026-10-21：payload 里除了 done/total，还带本手的 { live, at, visits, maxVisits }，
+   用来画「本手已搜到 x/500」的细进度；**整盘完成数只认 rvRun.doneSet**
+   （done/total 是「本次请求」的口径，分块后一块只有 10 手，直接用会把进度条打回去）。 */
+window.api.onReviewProgress(d => {
+  if (!reviewBusy || !d || state.coach.batch) return;
+  if (rvRun && d.live === false && typeof d.at === 'number') rvRun.doneSet.add(d.at);
+  showReviewProgress(d);
+});
 
 /* ⚠️ 顶栏不再单独放「AI 复盘」按钮（2026-10-04 用户拍板）：
    复盘入口就是棋谱库每行的「AI 复盘」按钮 —— 两个入口反而多余。
@@ -3285,7 +4555,7 @@ initSeg('seg-tsdefend', v => {
   syncTsumegoUI();
   syncUI();
   flash(v === 'solution'
-    ? '按正解：对手照题集的正解应对（不脱先）；你走偏了会自动改用 KATAGO'
+    ? '按正解：对手照题集的正解应对；你走偏了就改用 KATAGO'
     : v === 'ai'
       ? 'KATAGO：对手由强引擎走，只在题目附近（离棋子 2 路内）找点'
       : '我下两边：黑白交替、两边都由你走（自己推演变化）');
@@ -3584,6 +4854,7 @@ function applyNewGame(idle) {
   state.rootComment = '';       // 也没有「棋谱说明」（那是某份棋谱根节点上的文字）
   state.quizTips = [];           // 也不是题集，没有「第几题」
   state.recName = '';           // ★ 也不是某份棋谱了 —— 讲解没有存放处（全盘讲解按钮会收起）
+  state.exportName = '';        // 新局 → 下次导出该新起名字（别覆盖上一局那份）
   clearCoachPanels();           // 讲解只在对局期间保留（用户要求：开新局就清）
   const R = RULES[settings.rules] || RULES.chinese;
 
@@ -3614,10 +4885,12 @@ function applyNewGame(idle) {
   state.result = null;             // 新对局：清掉终局结果
   state.lastEval = null;
   state.review = null;             // 新对局：清掉上一次的复盘数据（目损标记）
+  state.reviewDoc = null;          // 连着复盘文件一起丢（否则会给新局画上旧局的目损）
   state.pv = null;                 // 新对局：收掉变化图
   state.names = { b: '', w: '' };  // 新对局：名字回到默认（人机 PLAYER/KATAGO、摆棋 PLAYER1/2）
   state.noGame = !!idle;           // ★ 启动时停在「未开局」；「新对局 → 开始」时解除
   state.anaAt = {};                // ★ 逐手分析快照（「解说词」卡用）—— 新局从零开始
+  state.anaLines = {};             // ★ 各分支的分析存档（导出时一起写进复盘文件）
   /* ★ 双方都由 KATAGO 走（只有 AI 对弈模式有意义；启动时的"未开局"一律不算） */
   state.autoBoth = !idle && settings.mode === 'play' && !!settings.autoBoth;
   state.autoPaused = false;
@@ -3817,6 +5090,7 @@ function tsResetBoardState() {
   state.result = null;
   state.lastEval = null;
   state.review = null;
+  state.reviewDoc = null;
   state.pv = null;
   hover = null;
 }
@@ -3842,6 +5116,7 @@ function enterTsumego() {
   state.rootComment = '';
   state.quizTips = [];
   state.recName = '';           // 不是某份棋谱 → 没地方存全盘讲解（按钮会收起）
+  state.exportName = '';        // 换到习题 → 上一局的导出目标作废
   clearCoachPanels();
   state.setup = [];             // 空盘开始摆题
   state.myColor = tsMyColor();   // 你执 KATAGO 的另一方（见 settings.taicolor）
@@ -4024,9 +5299,9 @@ async function openPuzzleSet(name, pre) {
   const start = Math.max(0, Math.min(list.length - 1, psetProgGet(name)));
   tsLoadProblem(start);
   flash((pre ? pre + ' · ' : '')
-    + '已打开题集「' + name.replace(/\.sgf$/i, '') + '」· 共 ' + list.length + ' 题'
-    + (start > 0 ? ' · 接着上次的第 ' + (start + 1) + ' 题' : '')
-    + (skipped ? '（另有 ' + skipped + ' 段没解析出题目，已跳过）' : ''));
+    + '已打开题集「' + name.replace(/\.sgf$/i, '') + '」· ' + list.length + ' 题'
+    + (start > 0 ? ' · 接着第 ' + (start + 1) + ' 题' : '')
+    + (skipped ? '（跳过 ' + skipped + ' 段）' : ''));
 }
 
 /* 「正解」按钮：把这道题的正解顺序摆出来（题集里写着的答案）。
@@ -4051,7 +5326,7 @@ function tsToggleAnswer() {
     flash(tsSet() ? '这道题在 SGF 里没写正解手顺' : '手摆的题没有参考答案（正解来自导入的题集）');
     return;
   }
-  if (state.moves.length) { flash('盘上已经有手顺了 —— 先按「重来」回到初始局面，再看参考答案'); return; }
+  if (state.moves.length) { flash('盘上已有手顺 —— 先按「重来」回到初始局面'); return; }
   if (t.defend === 'ai') { /* 摆答案时不需要 KATAGO 插嘴，下面的守卫会挡住应手 */ }
   t.showAnswer = true;
   state.moves = p.answer.map(m => ({ color: m.color, x: m.x, y: m.y, pass: !!m.pass }));
@@ -4062,7 +5337,7 @@ function tsToggleAnswer() {
      滑块还是 0/0（2026-10-15 在截图里看出来的，断言没覆盖到，已补一条）。
      走 syncUI 也不会让 KATAGO 应手 —— `stillNeedDefend()` 在 showAnswer 期间为假。 */
   syncUI();
-  flash('参考答案 · 共 ' + state.moves.length + ' 手 —— 用 ← → 逐步回看；再按一次「正解」收起');
+  flash('参考答案 · ' + state.moves.length + ' 手 —— 用 ← → 回看；再按「正解」收起');
 }
 
 /* 摆题 → 解题 */
@@ -5688,7 +6963,7 @@ async function maybeAIMove() {
       komi: settings.komi,
       size: N,
       maxVisits: AI_VISITS,
-      profile: settings.level,      // ★ 真实段位（rank_3d 这种）→ 对弈引擎逐请求覆盖
+      profile: settings.level,
       /* 拟人落子要用 policy（人类先验）来抽样。⚠️ includePolicy 是**外层字段**
          —— 官方文档明确：除了它和 maxVisits，其余参数都必须放 overrideSettings，否则无效。 */
       includePolicy: settings.humanLike,
@@ -5784,6 +7059,10 @@ if (window.api) {
     engineReady = !!a.ready;
     engineReadyPlay = !!p.ready;
     coachReady = !!c.ready;
+    /* ★ 记下分析权重的文件名（2026-10-21）：复盘速度是**跟权重绑**的
+       （同机 b18c384 139 v/s、b40c768 31.9 v/s，差 4 倍），换权重后
+       旧的「秒/手」必须失效，否则剩余时间又变成假的。 */
+    analyzeModelName = (s && s.analyze && s.analyze.model) || analyzeModelName;
     /* ★ 只有 KataGo 的故障才算「引擎异常」—— 讲解模型没配/没加载不该影响下棋。 */
     engineNote = a.error || p.error || '';
     coachNote = (s && s.coach && s.coach.error) || '';
@@ -6549,8 +7828,34 @@ function updatePV() {
    ★ 量程自适应之后**必须把范围标出来**（右上角那行）—— 否则会被误读成
      "每盘都这么激烈"：一盘一路碾压的棋铺满之后看着也很刺激，
      但右上角会老老实实写着"全程 85% ~ 96%"。 */
+/* 当前走势图画的是哪条线 —— 有分支的棋谱里必须标出来（2026-10-22）。
+   为什么：两条分支常常共享大前半盘，曲线形状本来就很像；再叠上"切分支后
+   曲线没变"的错觉，用户会以为切了没反应。写一句「共 N 条分支的报告 /
+   这条分支还没复盘」，比任何解释都直接。 */
+function curveLineInfo() {
+  const doc = state.reviewDoc;
+  const keys = (doc && doc.lines) ? Object.keys(doc.lines) : [];
+  if (!keys.length) return null;
+  const cur = lineKeyOfMoves(state.moves);
+  return { n: keys.length, has: !!doc.lines[cur] };
+}
+function syncCurveLineLabel() {
+  const el = $('curve-line');
+  if (!el) return;
+  const inf = curveLineInfo();
+  /* 文字要**短**（卡片只有 268px 宽，还得给右边「胜率/目差」留位置）：
+     完整含义放 title 里。 */
+  el.textContent = (!inf || (inf.n < 2 && inf.has)) ? ''
+    : (inf.has ? '· ' + inf.n + ' 条分支' : '· 未复盘');
+  el.title = !inf ? ''
+    : (inf.has
+      ? '这份棋谱已有 ' + inf.n + ' 条分支的报告，走势图画的是你当前站的这条线'
+      : '当前这条分支还没复盘 —— 换回有报告的分支，或点「AI 复盘」算这一条');
+}
+
 function renderCurve() {
   const cv = $('curve');
+  syncCurveLineLabel();
   const w = cv.clientWidth || 268, h = cv.clientHeight || 76;
   const dpr = window.devicePixelRatio || 1;
   if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
@@ -6582,9 +7887,12 @@ function renderCurve() {
     c.fillStyle = 'rgba(0,0,0,.26)';
     c.font = '11px "Microsoft YaHei", sans-serif';
     c.textAlign = 'center'; c.textBaseline = 'middle';
+    const inf = curveLineInfo();
     c.fillText((isLead && Object.keys(state.history).length)
       ? '没有目差数据 · 重新复盘一次就有了'
-      : (state.noGame ? '还没有对局' : '逐手走一遍就会画出来'), w / 2, pT + H / 2);
+      : (state.noGame ? '还没有对局'
+        : ((inf && !inf.has) ? '这条分支还没复盘'
+          : '逐手走一遍就会画出来')), w / 2, pT + H / 2);
     return;
   }
 
@@ -6688,7 +7996,10 @@ let lastScrolledAt = -1;      // 列表上次自动滚到的手数（免得边�
      跟着圆圈走会正好压在下一列的圆圈上（同一手的另一条分支）。 */
 function moveLossHtml(i, m, leftPx) {
   const at = ' style="left:' + leftPx + 'px"';
-  const rvLoss = state.review ? state.review.losses[i] : null;
+  /* ★ 2026-10-23：`state.review` 有可能**没有 losses** —— 复盘文件里那条线只有 turns、
+     没有 report（写到一半被打断 / 手改过的文件）。原来这里直接 `state.review.losses[i]`
+     会抛 TypeError，整个手数列表就渲染不出来（测试撞出来的）。 */
+  const rvLoss = (state.review && state.review.losses) ? state.review.losses[i] : null;
   if (typeof rvLoss === 'number') {
     const lv = lossLevel(rvLoss);
     const t = '这一手亏 ' + rvLoss.toFixed(1) + ' 目' + (lv ? '（' + lv.label + '）' : '');
@@ -7114,8 +8425,10 @@ function gotoTreeRow(r) {
     if (!nx) break;
     line.push(nx); nd = nx;
   }
-  applyVariationLine(line, r.path.length);
-  flash('已切到另一条分支 · 这条线共 ' + state.moves.length + ' 手');
+  const ci = applyVariationLine(line, r.path.length);
+  flash('已换分支 · ' + state.moves.length + ' 手' + (state.review ? '（有复盘）' : '（这条线没复盘）')
+    + (ci && ci.mine ? ' · 讲解也换线了'
+      : (ci && ci.others ? ' · 讲解没讲过（另有 ' + ci.others + ' 条）' : '')));
 }
 
 /* ---------------- 棋谱变体：换线（2026-10-17） ----------------
@@ -7193,6 +8506,9 @@ function cutForBranch() {
   if (state.viewAt === state.moves.length) return false;
   const at = state.viewAt;
   ensureTree();
+  /* ★ 截断之前先把**这一条线**的分析快照留档（2026-10-22）：这一手之后的局面
+     马上要被删掉，但它们属于原来那条线 —— 导出时那条分支的分析还要用。 */
+  archiveAnaLine();
   state.moves = state.moves.slice(0, at);
   truncateAnalysisTo(at);                 // 后面那些手的分析 / 走势 / 快照都作废
   state.toMove = sideToMove(at);
@@ -7200,7 +8516,10 @@ function cutForBranch() {
   state.viewAt = at;
   state.result = null;
   state.pv = null;
-  flash('在第 ' + at + ' 手处新开一条分支 —— 原来后面的手留在「手数」卡的分支树里');
+  /* ★ 截断之后这条线就变了：复盘数据要么按新线取（正好有），要么清掉。
+     不清的话，第 at 手那一格的目损还挂着**原来那一手**的值（差值算的是"走完这手之后"）。 */
+  syncReviewForLine();
+  flash('在第 ' + at + ' 手处新开一条分支 —— 后面的手留在「手数」卡的树里');
   return true;
 }
 
@@ -7259,16 +8578,28 @@ function switchVariation(dir) {
     if (!nx) break;
     line.push(nx); nd = nx;
   }
-  applyVariationLine(line, n);
-  flash('已切到另一条分支 · 这条线共 ' + state.moves.length + ' 手'
-    + '（第 ' + n + ' 手有 ' + at.sibs.length + ' 个分支）');
+  const ci = applyVariationLine(line, n);
+  flash('已换分支 · ' + state.moves.length + ' 手（第 ' + n + ' 手 ' + at.sibs.length + ' 个）'
+    + (state.review ? ' · 有复盘' : ' · 这条线没复盘')
+    + (ci && ci.mine ? ' · 讲解也换线了'
+      : (ci && ci.others ? ' · 讲解没讲过（另有 ' + ci.others + ' 条）' : '')));
 }
 
 /* 用一条节点链替换当前手顺。分析数据整批作废 —— 换了条线，旧的胜率/目差不是这个局面的。 */
 function applyVariationLine(line, at) {
+  /* ★★ 2026-10-23：换线前后要把「讲解」按线存 / 取。
+     原来只按手号存 → 切到另一条分支，第 30 手还是上一条线的文字，
+     而且「全盘讲解」会把它当"已讲过"跳过（分支根本讲不了）。 */
+  const oldCoachKey = coachLineKey();
+  const oldCoachN = state.moves.length;
+  /* ★★ 换线之前：把**正要离开的这条线**的分析快照留一份档（2026-10-22）。
+     导出棋谱时要求「所有分支的 AI 分析都存下来」—— 数据只活在 anaAt 里，
+     而它马上要被截断/清空，不在这儿留一手就永久丢了。 */
+  archiveAnaLine();
   state.moves = line.map(x => ({
     color: x.move.color, x: x.move.x, y: x.move.y, pass: !!x.move.pass,
   }));
+  leaveCoachLine(oldCoachKey, oldCoachN);
   /* 解说词跟着这条线重建：comments[0] = 开局前，comments[i] = 第 i 手 */
   const cm = [(state.sgfComments && state.sgfComments[0]) || ''];
   line.forEach((x, i) => { if (x.comment) cm[i + 1] = x.comment; });
@@ -7280,12 +8611,30 @@ function applyVariationLine(line, at) {
   state.candidates = []; state.candAt = -1;
   state.ownership = null; state.ownAt = -1;
   state.history = []; state.leads = []; state.histVisits = [];
-  state.review = null;      // 复盘是按原来那条线算的
+  /* ★★ 2026-10-22：逐手分析快照（`state.anaAt`）也要跟着换线处理。
+     它是「第 at 手之后那个局面」的分析 —— 换线之后，**共享前缀**（位置 0..at-1）
+     还是同一个局面，数据有效；但 `at` 之后那些快照属于**上一条线**，
+     留着会被「解说词」卡当成这一手的分析显示，导出时还会被写进那条**别的**分支的
+     解说词（`curLineAnaAt()` 按线合并快照，混了就是串线）—— 于是那一手混进别的分支的胜率/目差。
+     所以：只截到共享前缀，别整批清空（前缀那几十手是白算的吗？不是，位置完全一样）。 */
+  for (const k in state.anaAt) {
+    if (+k > at - 1) delete state.anaAt[k];
+  }
+  state.review = null;
+  /* ★ 2026-10-22：换线之后**按这条线**重新挑复盘（同一份 json 里按线存着）。
+     这条线算过 → 目损/走势/报告立刻跟着换；没算过 → 清空（不拿上一条线的数字充数）。 */
+  const hasReview = syncReviewForLine();
   state.pv = null;
   state.result = null;
   state.draft = null;
+  /* ★ 讲解换成这条线的（有就显示，没有就退回按手数看的框，并作废渲染缓存） */
+  const coachInfo = enterCoachLine();
   syncUI();
   scheduleAnalysis(0, true);
+  /* 这条线没复盘、而这份棋谱别的分支有 → 问一句「要不要现在算」（2026-10-22 用户要求）。
+     ★ 放在最后：先把局面/走势/目损都换过来，弹窗才说得清"哪条线没算"。 */
+  if (!hasReview) scheduleAskReviewLine();
+  return coachInfo;
 }
 
 /* ---------------- 解说词框（棋谱自带的 C[]，2026-10-06 用户要求） ----------------
@@ -7315,7 +8664,8 @@ function quizTxt() {
   if (state.noGame) return '';
   const q = quizPos();
   if (!q || q.total < 2) return '';
-  return ` · ${q.total === 2 ? '第 ' + q.n + ' 题（共 2 题）' : '第 ' + q.n + ' 题 / 共 ' + q.total + ' 题'}`;
+  /* ★ 2026-10-24：顶栏只有一行 —— 题号写成「第 3/347 题」省下 30 多 px。 */
+  return ` · ${q.total === 2 ? '第 ' + q.n + ' 题（共 2 题）' : '第 ' + q.n + '/' + q.total + ' 题'}`;
 }
 
 /* ---------------- 逐手分析明细（2026-10-18 用户要求） ----------------
@@ -7349,10 +8699,19 @@ function leadText(lead) {
 
 /* 第 k 手那一块的文字。k = 手数（1 起）。 */
 function moveAnalysisText(k) {
-  const mv = state.moves[k - 1];
+  return moveAnalysisTextAt(state.moves, state.anaAt, k);
+}
+
+/* 同上，但**数据来源可以指定**（2026-10-22）：
+   导出带分支的棋谱时要按「那一条分支自己的手顺 + 自己的分析快照」写 C[]，
+   不能再读 state.moves / state.anaAt —— 它们只代表当前这条线（这就是「导出后只有最后
+   那条分支有解说词」的根因）。
+   moves = [{color,x,y,pass}]；at = {位置: 快照}（快照形状见 applyAnalysis）。 */
+function moveAnalysisTextAt(moves, at, k) {
+  const mv = (moves || [])[k - 1];
   if (!mv) return '';
-  const post = state.anaAt[k] || null;        // 走完这一手之后的局面
-  const pre = state.anaAt[k - 1] || null;     // 走这一手之前的局面（推荐点/直觉/损失都看它）
+  const post = (at || {})[k] || null;         // 走完这一手之后的局面
+  const pre = (at || {})[k - 1] || null;      // 走这一手之前的局面（推荐点/直觉/损失都看它）
   const mover = mv.color;                     // 'b' / 'w'
   const sgn = mover === 'b' ? 1 : -1;         // 黑方视角 → 走子方视角
   const L = [];
@@ -7594,7 +8953,10 @@ window.addEventListener('keydown', e => {
   if (e.ctrlKey && e.shiftKey && e.code === 'KeyD') {
     e.preventDefault();
     const cur = state.viewAt, n = state.moves.length;
-    flash('分析自检·局面: ' + n + '手·看第' + cur + '手'
+    /* ★ 2026-10-24：自检串原来有 60~80 字（一句就能顶满顶栏一行）。
+       现在**两分流**：状态栏只留三件事（局面 / 选点 / 引擎），完整那一串打到
+       调试台（DevTools Console）—— 要查细节就看控制台，别让顶栏替它撑宽。 */
+    const diag = '分析自检·局面: ' + n + '手·看第' + cur + '手'
       + '·选点: ' + (state.candAt < 0 ? '还没算过' : ('第' + state.candAt + '手算的, 差' + (cur - state.candAt)))
       + '·搜索量: ' + state.rootVisits
       + '·请求: ' + (anaBusy ? '在跑' : '空闲')
@@ -7606,7 +8968,14 @@ window.addEventListener('keydown', e => {
       + '·引擎: ' + (engineReady ? '就绪' : (engStates.analyze === 'loading' ? '加载中' : '未就绪'))
       + (anaTimeouts ? ('·超时' + anaTimeouts + '次') : '')
       + '·链路: 轮' + anaDiag.start + '/成功' + anaDiag.okCount + '/空跑' + anaDiag.failOnce
-      + (anaDiag.lastFailWhy ? ('·最近中断=' + anaDiag.lastFailWhy) : ''));
+      + (anaDiag.lastFailWhy ? ('·最近中断=' + anaDiag.lastFailWhy) : '');
+    console.log('[分析自检]', diag);
+    flash('自检 ' + n + '手/看' + cur + ' · 选点' + (state.candAt < 0 ? '没算' : state.candAt)
+      + ' · 搜' + state.rootVisits
+      + (anaBusy ? ' · 在跑' : '') + (anaQueue.length ? ' · 欠' + anaQueue.length : '')
+      + (anaTimeouts ? ' · 超时' + anaTimeouts : '')
+      + ' · 引擎' + (engineReady ? '就绪' : (engStates.analyze === 'loading' ? '加载中' : '未就绪'))
+      + ' · 详见控制台');
     return;
   }
 
@@ -7963,9 +9332,8 @@ $('set-save').onclick = async () => {
   /* ★ 这次改棋谱库位置的话，如实报一下搬了几份过去（老位置的不删）。 */
   const mv = r.moved;
   if (mv && (mv.copied || mv.failed)) {
-    flash('设置已保存 · 引擎正在重启…　棋谱：已复制 ' + mv.copied + ' 份到新位置'
-      + (mv.skipped ? '，' + mv.skipped + ' 份同名已存在没覆盖' : '')
-      + '（老位置的没删）');
+    flash('设置已保存 · 引擎重启中… 棋谱复制了 ' + mv.copied + ' 份'
+      + (mv.skipped ? '（' + mv.skipped + ' 份同名没覆盖）' : ''));
   } else {
     flash('设置已保存 · 引擎正在按新路径重启…');
   }
@@ -8156,33 +9524,12 @@ fillVisitSelect();         // 搜索量下拉（「计算深度」）
      · 内容只在对局期间保留；开新局 / 换棋谱就清空
 */
 
-/* ---------- 两个框的常驻标注 ----------
-   用户要求写清楚这框是干啥的，**尤其是选点讲解**：
-   棋盘上已经有 KataGo 画的推荐点了（虚线圆圈），不说明白会和框里的内容混淆。 */
-const COACH_PH_EXPLAIN = [
-  '点评当前显示的这一手。',
-  '',
-  '· 好不好 —— 看 KataGo 的目损（客观数据，不会瞎夸）',
-  '· 为什么 —— 听 LoGos 讲',
-  '',
-  '回看、打谱都能用。点一次讲一次。',
-].join('\n');
-
-/* 空状态的说明。
-   ★ 措辞要点（2026-10-07 按用户要求改）：**必须点明「点是谁选的」** ——
-     原来写成「LoGos 推荐落点讲解」，会被读成"LoGos 自己选的点、和 KataGo 不是一批"，
-     那是误解：**点全是 KataGo 算的，LoGos 只负责讲道理**（它连 prompt 里都是被点名讲某一点的）。 */
-const COACH_PH_PICK = [
-  '点击「生成讲解」：由 LoGos 逐点解释 KataGo 算出的推荐落点。',
-  '',
-  '选点是 KataGo 的事，LoGos 只讲「为什么这么下」。',
-  '棋盘上要不要显示那批点，用「显示」菜单里的「实时推荐落点」（快捷键 T）。',
-  '',
-  '讲解是**点击那一刻**的快照：之后棋盘会继续随分析更新，两者可能不同，',
-  '上方会提示「当前局面已变化」；要讲现在的局面，请重新生成。',
-  '',
-  '打谱时用不了 —— 那是别人的棋，不替人支招。',
-].join('\n');
+/* ---------- 空状态只留一句「点哪儿」 ----------
+   ★ 2026-10-24 用户要求：原来那两大段常驻说明（「点评当前显示的这一手…」「点由 KataGo 定 ·
+     讲解由 LoGos 写…打谱时用不了」）**整段删掉** —— 卡片本来就窄，正文还没出来先占满一屏，
+     而且那些话现在都写进了按钮的 tooltip 和软件内帮助里。这里只留一句指路。 */
+const COACH_EMPTY_EXPLAIN = '点下面「讲解这手」，听听这一手怎么样。';
+const COACH_EMPTY_PICK = '点下面「推荐落点讲解」，让 LoGos 讲讲 KataGo 算出的这几个点为什么这么下。';
 
 /* LoGos 的 system prompt（照官方格式写，它认这个） */
 const COACH_SYS = '你是一位专业的围棋棋手。在给出的棋局中，"X"表示黑棋，"O"表示白棋。'
@@ -8455,7 +9802,15 @@ function resetCoachBtn(which) {
   const b = $(which === 'explain' ? 'btn-explain' : 'btn-pick');
   if (!b) return;
   b.disabled = false;
-  b.textContent = which === 'explain' ? '讲解这手' : '生成讲解';
+  b.textContent = which === 'explain' ? '讲解这手' : '推荐落点讲解';
+}
+
+/* 换页 / 重新生成时把讲解区滚回顶。
+   ★ 2026-10-24 三个按钮共用一块正文区之后，不再需要「滚到某一段」——
+     露出来的永远只有一页，新内容就该从第一行开始读。 */
+function coachScrollTop() {
+  const sc = $('coach-scroll');
+  if (sc) sc.scrollTop = 0;
 }
 
 /* ---------- 按**当前手数**刷新两个框 ----------
@@ -8465,24 +9820,123 @@ function resetCoachBtn(which) {
      ② 讲完第 6 手再点回第 2 手，第 2 手的讲解直接没了。
      现在每手各存一份，切到哪手显示哪份，没有就写「这一手还没有讲解」。 */
 let coachRenderedAt = -999;
+/* #pick-body 里此刻挂着的是**哪一手**的打字机（-1 = 没挂）。
+   ★ 2026-10-24 晚：推荐落点改成「按当前局面显示」之后，切手数会把 #pick-body 清空重画，
+     那条打字机就脱开了文档（还在跑，但画在没人看的地方）。靠这个标记区分
+     「正在这一手往上画（别动 DOM）」和「切回来时这一手还在后台跑（显示等待提示）」。 */
+let pickLiveAt = -1;
 function pickPositionKey(at) {
   return JSON.stringify([N, settings.rules, settings.komi, state.setup, state.moves.slice(0, at)]);
 }
+/* 取「第 at 手那个局面」对应的推荐落点讲解；没讲过返回 null。
+   ★★ 2026-10-24 晚 用户报障：讲完某一手，往前/往后看到别的手，「推荐落点讲解」那段
+     内容纹丝不动 —— 因为渲染时读的是 `state.coach.pick`（**最后生成的那一份**），
+     而不是当前局面那一份。现在一律按**局面键**取：切到哪一手看哪一手，没讲过就是空状态。
+     正在生成的那一份（pickPending）也认同一个键，别的手在跑时不冒充当前局面。 */
+function pickRecAt(at) {
+  const key = pickPositionKey(at);
+  const pend = state.coach.pickPending;
+  if (pend && pend.positionKey === key) return pend;
+  const hit = state.coach.picks[key];
+  if (hit) return hit;
+  /* 兼容老路径：有几处只往 state.coach.pick 里放、不写 picks */
+  return (state.coach.pick && state.coach.pick.positionKey === key) ? state.coach.pick : null;
+}
 function renderPickContext() {
-  const rec = state.coach.pickPending || state.coach.pick;
+  const rec = pickRecAt(state.viewAt);
   const el = $('pick-context');
-  const stale = !!rec && rec.positionKey !== pickPositionKey(state.viewAt);
   el.hidden = !rec;
-  el.classList.toggle('is-stale', stale);
+  el.classList.remove('is-stale');       // 现在永远讲的都是**眼前这个局面**，没有「已变化」这回事
   el.textContent = rec
     ? '第 ' + rec.at + ' 手后 · ' + (rec.side === 'b' ? '黑方' : '白方') + ' · '
-      + (state.coach.pickPending ? '正在生成讲解快照' : '讲解快照')
-      + (stale ? ' · 当前局面已变化' : '')
+      + (rec === state.coach.pickPending ? '正在生成讲解快照' : '讲解快照')
+      + (rec.srcNote || '')
     : '';
 }
+/* ---------- 「全盘」视图：整盘每一手的讲解连成一页 ----------
+   ★ 2026-10-22 用户报障：「LoGos 全盘讲解的结果，只是分析了当前手，而不是全盘」。
+     查下来**数据是全的**（.coach.json 里 16 手都有），问题在**没有地方能一次看完**：
+     那个框永远只显示 `state.coach.explain[viewAt]`，于是跑完几分钟，
+     用户看到的还是最后那一手的一段话，自然读成「只讲了一步」。
+   这个视图：① 跑完自动切过来 ② 标题旁「看全盘」随时能回来 ③ 点其中一手跳过去。
+   高亮只改 class、不重建 DOM —— 否则每换一手阅读位置就被弹回顶上。 */
+let coachAllSig = '';
+let coachAllCur = -1;             // 上一次高亮在第几手（syncUI 每次都调，没变就别扫一遍 DOM）
+function renderCoachAll(force) {
+  const box = $('explain-body');
+  if (!box) return;
+  const n = state.moves.length;
+  const keys = [];
+  for (let i = 1; i <= n; i++) {
+    const rec = state.coach.explain[i];
+    if (rec && rec.body) keys.push(i);
+  }
+  const sig = n + '|' + keys.join(',');
+  if (force || sig !== coachAllSig) {
+    box.classList.add('all-list');
+    box.textContent = '';
+    const sc = $('coach-scroll');
+    if (sc) sc.scrollTop = 0;        // 摊成全盘 → 从第一手开始读（别停在上半/下半段原来的位置）
+
+    const otherLines = coachOtherLines().length;
+    box.appendChild(mkEl('div', 'src', keys.length
+      ? ('整盘 ' + n + ' 手 · 逐手讲了 ' + keys.length + ' 手'
+        + (keys.length < n ? '（其余的手选到那一手、再点「讲解这手」补）' : ''))
+      : (otherLines
+        ? ('这条分支还没讲过（另外 ' + otherLines + ' 条分支有讲解）—— 点下面「全盘讲解」，它只补这一条')
+        : ('整盘 ' + n + ' 手，还没有逐手讲解 —— 点下面「全盘讲解」一次讲完'))));
+    for (const i of keys) {
+      const rec = state.coach.explain[i];
+      const row = mkEl('div', 'all-row');
+      row.dataset.at = String(i);
+      row.title = '点一下跳到第 ' + i + ' 手';
+      row.appendChild(mkEl('div', 'pnt', rec.head));
+      if (rec.verdict) row.appendChild(mkEl('div', rec.ok ? 'ph vok' : 'ph', rec.verdict));
+      if (rec.lead) row.appendChild(mkEl('div', 'ph', rec.lead));
+      row.appendChild(mkEl('div', 'all-body', rec.body));
+      box.appendChild(row);
+    }
+    coachAllSig = sig;
+    coachAllCur = -1;
+  }
+  if (coachAllCur !== state.viewAt) {
+    coachAllCur = state.viewAt;
+    const rows = box.querySelectorAll('.all-row');
+    for (const el of rows) el.classList.toggle('cur', +el.dataset.at === state.viewAt);
+  }
+}
+
 function renderCoachPanels(force) {
   renderPickContext(); // 生成期间也更新上下文，不重绘打字机正文
   const at = state.viewAt;
+
+  /* ★★ 2026-10-24 用户要求：三个按钮**共用这一块正文区**，点哪个显示哪个 ——
+     所以这里只让**当前那一页**露出来（另一页 hidden），标题也跟着换。
+     不换标题的话，「推荐落点讲解」的正文顶上写着「分析讲解」，读起来像放错了地方。 */
+  const view = state.coach.view === 'pick' ? 'pick' : 'explain';
+  const exBody = $('explain-body'), pkSec = $('pick-sec');
+  if (exBody) exBody.hidden = (view === 'pick');
+  if (pkSec) pkSec.hidden = (view !== 'pick');
+  const titleEl = $('coach-title');
+  if (titleEl) {
+    titleEl.textContent = view === 'pick'
+      ? '推荐落点讲解' : (state.coach.allView ? '全盘讲解' : '分析讲解');
+  }
+
+  /* 「看全盘」入口：有逐手讲解、或者是从棋谱库打开的棋谱时露出来。
+     视图开着时它变成「返回」（回到按手数看的那个框）。
+     ★ 推荐落点那一页不显示它（那一页只讲「这一刻该走哪」，没有逐手列表）。 */
+  const allLink = $('btn-all');
+  if (allLink) {
+    allLink.hidden = view === 'pick' || !(Object.keys(state.coach.explain).length
+      || (state.fromRecord && state.recName));
+    allLink.textContent = state.coach.allView ? '返回' : '看全盘';
+  }
+  /* ★ 2026-10-22 用户报障：整盘讲解跑完，右边只有当前那一手 → 加了这个「全盘」视图。
+     它**不跟手数走**（换手数只是挪高亮），所以先于下面那条「同一手就跳过」的短路返回。
+     ★ 2026-10-24：只在「分析讲解」那一页生效（推荐落点那一页有自己的正文，别抢）。 */
+  if (view !== 'pick' && state.coach.allView) { renderCoachAll(force); return; }
+
   if (!force && at === coachRenderedAt
       && state.coach.busy.explain !== at && state.coach.busy.pick !== at) return;
   coachRenderedAt = at;
@@ -8500,6 +9954,8 @@ function renderCoachPanels(force) {
     const box = $('explain-body');
     if (box) {
       const rec = state.coach.explain[at];
+      box.classList.remove('all-list');
+      coachAllSig = '';                 // 下次进「全盘」要重建
       box.textContent = '';
       if (rec) {
         box.appendChild(mkEl('div', 'pnt', rec.head));
@@ -8508,31 +9964,39 @@ function renderCoachPanels(force) {
         box.appendChild(mkEl('div', '', rec.body));
       } else {
         box.appendChild(mkEl('div', 'ph', at > 0
-          ? '这一手还没有讲解 —— 点上面「讲解这手」。'
-          : COACH_PH_EXPLAIN));
+          ? '这一手还没有讲解 —— 点下面「讲解这手」。'
+          : COACH_EMPTY_EXPLAIN));
       }
     }
   }
 
-  /* 选点讲解 —— **不跟手数走**：始终显示存下来的那一份。
-     如果它讲的是别的局面（用户切过手数），上面加一行小字标出对应手数，
-     免得和眼前的局面混淆。正在生成时别动 DOM（打字机正往上画）。 */
-  if (state.coach.busy.pick < 0) {
-    const box = $('pick-body');
-    if (box) {
-      const rec = state.coach.pick;
-      box.textContent = '';
-      box.appendChild(mkEl('div', 'src', '点由 KataGo 定 · 讲解由 LoGos 写 · 基于点击那一刻的推荐落点'));
-      if (rec && rec.pts && rec.pts.length) {
-        rec.pts.forEach(p => {
-          box.appendChild(mkEl('div', 'pnt', p.title));
-          box.appendChild(mkEl('div', '', p.body));
-        });
-      } else if (state.fromRecord || !state.moves.length) {
-        box.appendChild(mkEl('div', 'ph', COACH_PH_PICK));
-      } else {
-        box.appendChild(mkEl('div', 'ph', '还没生成讲解 —— 点上面「生成讲解」。'));
-      }
+  /* 选点讲解 —— 按**当前局面**取那一份（★ 2026-10-24 晚 修 bug：原来固定读最后生成的
+     那一份，于是回看到别的手时这段内容不动，和眼前局面完全对不上）。
+     ★ 只有「正在生成的就是这一手，且打字机还挂在这块 DOM 上」时才别动 DOM；
+       其余情况（没讲过 / 讲的是别的局面 / 切走了又切回来）都按当前局面渲染。
+       生成中的那一份跑完仍会进 picks 缓存，切回去就能直接看到。 */
+  const pickBusy = state.coach.busy.pick;
+  if (pickBusy === at && pickLiveAt === at) return;   // 打字机正往上画，别抢 DOM
+  const pickBox = $('pick-body');
+  if (pickBox) {
+    const rec = pickRecAt(at);
+    pickLiveAt = -1;                                  // 下面要清空 DOM → 旧打字机就脱开了
+    pickBox.textContent = '';
+    if (rec && rec.pts && rec.pts.length) {
+      rec.pts.forEach(p => {
+        pickBox.appendChild(mkEl('div', 'pnt', p.title));
+        pickBox.appendChild(mkEl('div', '', p.body));
+      });
+    } else if (pickBusy === at
+        || (state.coach.pickPending && rec === state.coach.pickPending)) {
+      /* 切走了又切回来，而这一手还在生成中（打字机已随清空脱开文档）→ 说清状态。
+         ⚠️ 必须写成 `pickPending && rec === pickPending`：两边都为 null 时
+         `null === null` 也是 true，会把「没讲过」误判成「正在生成」（测试抓到的）。 */
+      pickBox.appendChild(mkEl('div', 'ph', '这一手的推荐落点讲解还在生成，稍等…'));
+    } else {
+      pickBox.appendChild(mkEl('div', 'ph', at > 0
+        ? '这一手还没有推荐落点讲解 —— 点下面「推荐落点讲解」。'
+        : COACH_EMPTY_PICK));
     }
   }
 }
@@ -8543,37 +10007,124 @@ function clearCoachPanels() {
   coachSeq++;                                   // 作废还在飞的那条
   state.coach.busy = { explain: -1, pick: -1 };
   state.coach.explain = {};
+  state.coach.lines = {};                        // 按线存的那份也清（换棋谱/开新局）
+  state.coach.curKey = '';
   state.coach.pick = null;
+  state.coach.picks = {};                        // 推荐落点的缓存也清（换棋谱就该重讲）
+  pickLiveAt = -1;                               // 打字机随 #pick-body 重画一并作废
   state.coach.pickPending = null;
+  state.coach.view = 'explain';                  // 换棋谱 → 回到「分析讲解」那一页
+  state.coach.allView = false;                   // 换棋谱 → 回到按手数看的那个框
+  coachAllSig = '';
   resetCoachBtn('explain');
   resetCoachBtn('pick');
   /* 「全盘讲解」只在**打开棋谱**时出现（用户要求） */
   if ($('btn-batch')) $('btn-batch').hidden = !state.fromRecord;
+  if ($('btn-all')) $('btn-all').hidden = true;
   coachRenderedAt = -999;
   renderCoachPanels(true);
 }
 
 /* ---------- 选点讲解 ----------
-   点位和胜率**全部取自 KataGo 的候选点**（state.candidates，就是棋盘上画的那几个）
+   点位和胜率**全部取自 KataGo 的候选点**（对局中就是棋盘上画的那几个；
+   打谱时棋盘上没有实时分析，就借复盘数据、没有复盘才现场算 —— 见 pickCandidatesAt）
    —— 点击时同源；之后棋盘继续实时更新，文字保留点击时的快照。
-   LoGos 只负责给每个点补一句「为什么这么下」。 */
-async function runPickExplain() {
+   LoGos 只负责给每个点补一句「为什么这么下」。
+
+   ★ 2026-10-24 用户两条要求：
+     ① 同一个局面讲过一次，再点**直接显示**，不再让 LoGos 重讲（缓存见 state.coach.picks）；
+     ② 打谱时也能用（原来这里是「别人的棋，不替人支招」直接挡住）。 */
+
+/* 取「当前局面」的一批候选点。
+   ① 先看复盘：同一个局面、同一档搜索量，和「复盘 / 全盘讲解」说的是同一个数；
+   ② 没有复盘数据就现场问 KataGo（reviewVisits() = 500，和复盘同一档）。
+   返回 { from, visits, list:[{x,y,win,visits}] }；取不到返回 null（已经 flash 说清原因）。 */
+async function pickCandidatesAt(at) {
+  let src = null;
+  try { src = await reviewCandidatesAt(at); } catch (e) { src = null; }
+  if (src && src.list && src.list.length) {
+    const list = src.list.slice(0, 4).map(x => {
+      const pt = fromGTP(x.move);
+      return pt ? { x: pt.x, y: pt.y, win: x.winrate, visits: x.visits } : null;
+    }).filter(Boolean);
+    if (list.length) return { from: 'review', visits: src.visits, list: list };
+  }
+  if (!engineReady) { needEngine('analyze', '推荐落点讲解'); return null; }
+  const before = state.moves.slice(0, at);
+  const res = await window.api.analyze({
+    initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
+    moves: before.map(mv => [mv.color === 'b' ? 'B' : 'W', mv.pass ? 'pass' : toGTP(mv.x, mv.y)]),
+    rules: (RULES[settings.rules] || RULES.chinese).kata,
+    komi: settings.komi,
+    size: N,
+    maxVisits: reviewVisits(),
+  });
+  /* ⚠️ 候选点在 res.moves（主进程从 moveInfos 转出来的），**不在** res.root 里。 */
+  const list = ((res && res.moves) || [])
+    .filter(x => x && x.move && (x.visits || 0) >= 2)
+    .sort((a, b) => b.winrate - a.winrate)
+    .slice(0, 4)
+    .map(x => {
+      const pt = fromGTP(x.move);
+      return pt ? { x: pt.x, y: pt.y, win: x.winrate, visits: x.visits } : null;
+    }).filter(Boolean);
+  if (!list.length) {
+    flash('KataGo 没算出推荐点 —— 可能是这个局面已经结束了');
+    return null;
+  }
+  return { from: 'engine', visits: reviewVisits(), list: list };
+}
+
+async function runPickExplain(force) {
   if (state.coach.busy.pick >= 0) { flash('正在讲，稍微等一下…'); return; }
   /* ★ 两条讲解共用**一条** LoGos 通道（每次请求会掐掉上一条），
      所以同一时刻只能有一条在跑 —— 否则后点的会静默把先点的打断（审查发现）。 */
   if (state.coach.busy.explain >= 0) { flash('「分析讲解」正在讲 —— 等它讲完再来点推荐点'); return; }
   if (state.coach.batch) { flash('全盘讲解正在跑 —— 等它跑完，或点进度条旁边的「停止」'); return; }
-  if (needEngine('coach', '推荐落点讲解')) return;
   if (state.noGame || !state.moves.length) { flash('先落几手，再来问「该走哪」'); return; }
-  if (state.fromRecord) { flash('打谱时不讲选点 —— 那是别人的棋，不替人支招'); return; }
-  if (!engineReady) { needEngine('analyze', '推荐落点讲解'); return; }
-  if (state.candAt !== state.viewAt || !state.candidates.length) {
-    flash('KataGo 还在算这个局面 —— 等推荐点出来再点');
-    return;
-  }
 
   const at = state.viewAt;                           // ★ 讲的是哪个局面（存下来时要标出来）
-  const pts = state.candidates.slice(0, 4);          // 用户要求：不能只给一个
+  const posKey = pickPositionKey(at);
+  /* ★★ 同一个局面讲过一次 → 直接把那份快照摆出来，一个请求都不发。
+     Alt 点 = 强制重讲（想换个说法时用）。 */
+  const cached = force ? null : (state.coach.picks[posKey]
+    || (state.coach.pick && state.coach.pick.positionKey === posKey ? state.coach.pick : null));
+  if (cached) {
+    state.coach.pick = cached;
+    state.coach.view = 'pick';
+    coachRenderedAt = -999;
+    renderCoachPanels(true);
+    coachScrollTop();
+    flash('第 ' + cached.at + ' 手后讲过了 —— 直接看（Alt+点可重讲）');
+    return;
+  }
+  if (needEngine('coach', '推荐落点讲解')) return;
+
+  /* 推荐点从哪来：对局中盘上那批就是（同一批，不另算）；打谱 / 还没算到就自己取。 */
+  let pts = null;
+  let srcInfo = null;
+  if (!state.fromRecord && state.candAt === at && state.candidates.length) {
+    pts = state.candidates.slice(0, 4);              // 用户要求：不能只给一个
+    srcInfo = { from: 'live', visits: state.rootVisits || 0 };
+  } else {
+    srcInfo = await pickCandidatesAt(at);
+    if (!srcInfo) return;
+    pts = srcInfo.list;
+    /* ★ 打谱：把这一批点画到盘上（正是「显示 → 实时推荐落点」那批虚线圆圈）——
+       否则那一页里说的「棋盘上那批圈」在打谱时根本不存在。
+       对局中不动 state.candidates：实时分析马上会自己更新，别跟它抢。 */
+    if (state.fromRecord) {
+      state.candidates = pts.map(c => ({
+        x: c.x, y: c.y, win: c.win, visits: c.visits || 0,
+        label: (typeof c.win === 'number' ? (c.win * 100).toFixed(1) : ''), pv: null,
+      }));
+      state.candAt = at;
+      setHintsVisible(true);
+      draw();
+    }
+  }
+  if (!pts || !pts.length) { flash('KataGo 还没算到这个局面 —— 等推荐点出来再点'); return; }
+
   setHintsVisible(true);                            // 看推荐讲解时同步显示盘上的点
   const board = boardAt(at);
   const moves = state.moves.slice(0, at);
@@ -8581,11 +10132,22 @@ async function runPickExplain() {
   const sideTxt = side === 'b' ? '黑' : '白';
 
   const body = $('pick-body');
-  body.textContent = '';
-  body.appendChild(mkEl('div', 'src', '点由 KataGo 定 · 讲解由 LoGos 写 · 基于点击那一刻的推荐落点'));
-  const btn = $('btn-pick');
+  state.coach.view = 'pick';            // ★ 切到「推荐落点讲解」那一页（三个按钮共用一块正文区）
+  state.coach.allView = false;          // 那一页没有逐手列表这个说法
+  /* ★ busy 必须先置上再调 renderCoachPanels —— 否则它会以为「没在生成」，
+     把刚写进去的正文按空状态重画一遍（然后打字机往一个已清空的节点里画）。 */
   state.coach.busy.pick = at;
-  const snapshot = { at, side, positionKey: pickPositionKey(at), gen: gameGen };
+  pickLiveAt = at;                       // 这一手的打字机挂上 #pick-body 了（切手数会清掉）
+  body.textContent = '';
+  coachRenderedAt = -999;
+  renderCoachPanels(true);              // 先把这一页切出来（否则写在 hidden 的容器里，看不见）
+  coachScrollTop();
+  const btn = $('btn-pick');
+  /* ★ 2026-10-24：原来正文第一行那句「点由 KataGo 定 · 讲解由 LoGos 写 · …」按用户要求删了。
+     「这批数字是从复盘借的还是现场算的」改由上面那行状态小字（#pick-context）交代。 */
+  const srcNote = (srcInfo && srcInfo.from === 'review')
+    ? (' · 数字用的是复盘数据（每手 ' + srcInfo.visits + ' 次）') : '';
+  const snapshot = { at, side, positionKey: pickPositionKey(at), gen: gameGen, srcNote: srcNote };
   state.coach.pickPending = snapshot;
   renderPickContext();
   btn.disabled = true;
@@ -8601,8 +10163,10 @@ async function runPickExplain() {
       const h = document.createElement('span');
       h.className = 'pnt';
       /* 标题里明写「推荐」二字 —— 和棋盘上那几个虚线圆圈是同一批点，
-         但不能让人误以为已经落子了（正文里是「如果下在这里…」）。 */
-      h.textContent = '推荐 ' + (i + 1) + ' · ' + pt + '（胜率 ' + (c.win * 100).toFixed(1) + '%）';
+         但不能让人误以为已经落子了（正文里是「如果下在这里…」）。
+         ★ 老复盘文件可能没存候选点胜率（瘦身那版）→ 没有就写「胜率 —」，别写出 NaN%。 */
+      h.textContent = '推荐 ' + (i + 1) + ' · ' + pt
+        + '（胜率 ' + (typeof c.win === 'number' ? (c.win * 100).toFixed(1) + '%' : '—') + '）';
       const p = document.createElement('div');
       wrap.appendChild(h);
       wrap.appendChild(p);
@@ -8637,12 +10201,19 @@ async function runPickExplain() {
     /* ★ 只清「自己那一手」的标记：可能用户已经切到别的手、并在那里起了新的一段，
        无条件清会把新那段的标记抹掉（审查发现）。 */
     if (state.coach.busy.pick === at) state.coach.busy.pick = -1;
+    if (pickLiveAt === at) pickLiveAt = -1;
     if (state.coach.pickPending === snapshot) state.coach.pickPending = null;
     resetCoachBtn('pick');
   }
   /* 几个点都讲完了才存（中途被切走/掐断就不存，免得留下半份）。
-     ★ 存成**一份快照**、不按手数存 —— 用户要求：切手数时「显示刚才讲解的就行」。 */
-  if (snapshot.gen === gameGen && collected.length === pts.length) state.coach.pick = { ...snapshot, pts: collected };
+     ★ 存成**一份快照**、不按手数存 —— 用户要求：切手数时「显示刚才讲解的就行」。
+     ★ 2026-10-24：同时按**局面**记进缓存（picks）—— 同一个局面再点就是直接显示，
+       不再让 LoGos 重讲一遍。 */
+  if (snapshot.gen === gameGen && collected.length === pts.length) {
+    const snap = { ...snapshot, pts: collected };
+    state.coach.pick = snap;
+    state.coach.picks[snap.positionKey] = snap;
+  }
   renderCoachPanels(true);
 }
 
@@ -8665,8 +10236,62 @@ function handVerdict(at, m) {
   return null;
 }
 
-async function runAnalysisExplain() {
-  if (needEngine('coach', '分析讲解')) return;
+/* 「讲解这手」的候选点：**先看复盘数据**（2026-10-23 用户要求）。
+   ★ 为什么能直接用：`turns[at-1]` 就是「第 at 手落下之前」那个局面 —— 和现场 analyze
+     问的是同一个问题，候选点/胜率都是 KataGo 对这一手的判断。
+   ★ 为什么该直接用：复盘的搜索量（默认 500，老文件是当时那一档）和「全盘讲解」完全相同，
+     两处给出的「AI 当时想下 D8（47.2%）」才是同一个数；现场另算一次会出现两个说法。
+   ★ 借的条件（缺一不可）：
+       · 环境核心一致（权重 / 贴目 / 规则 / 棋盘 / 摆子 —— 同 reviewEnvCore）；
+       · 不是 `source:'live'`（对弈时边下边算的，每手 3~507 次，还要重新算）；
+       · 这条线**覆盖到第 at-1 手**（`sharedPrefixLen >= at-1` → 那个局面一模一样）；
+       · 该回合真有候选点。
+     找不到就返回 null，调用方现场问引擎。 */
+async function reviewCandidatesAt(at) {
+  const idx = at - 1;
+  if (idx < 0) return null;
+  if (!state.recName && !(state.reviewDoc && state.reviewDoc.lines)) return null;   // 对局中且没复盘文件
+  const base = {
+    initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
+    rules: (RULES[settings.rules] || RULES.chinese).kata,
+    komi: settings.komi,
+    size: N,
+  };
+  const coreSig = reviewEnvCore(base, analyzeModelName);
+  const myList = lineGtpOf(state.moves);
+  let doc = state.reviewDoc;
+  if (!doc || !doc.lines) {
+    const gen = gameGen;
+    try { doc = await loadReviewDoc(state.recName, state.moves); } catch (e) { doc = null; }
+    if (gen !== gameGen) return null;
+    if (doc && doc.lines) state.reviewDoc = doc;
+  }
+  if (!doc || !doc.lines) return null;
+  let best = null;
+  for (const k of Object.keys(doc.lines)) {
+    const L = doc.lines[k];
+    if (!L || L.source === 'live' || !L.turns) continue;
+    if (!L.env || envCoreOf(L.env) !== coreSig) continue;
+    const t = L.turns[idx];
+    if (!t || !Array.isArray(t.moves) || !t.moves.length) continue;
+    /* 第 idx 手之前的局面必须和本线完全一样（共享前缀够长） */
+    if (sharedPrefixLen(L.moves || [], myList) < idx) continue;
+    const vs = (typeof L.visits === 'number' && L.visits > 0) ? L.visits : 0;
+    if (!vs) continue;
+    const same = vs === reviewVisits();
+    /* 同一档搜索量优先；否则取搜索量大的那份（精度高），别再拿 100 次的当 500 次用 */
+    if (!best || (same && !best.same) || (same === best.same && vs > best.vs)) {
+      best = { turn: t, vs: vs, same: same };
+    }
+  }
+  if (!best) return null;
+  const list = (best.turn.moves || []).filter(x => x && x.move)
+    .sort((a, b) => (b.winrate || 0) - (a.winrate || 0));
+  if (!list.length) return null;
+  return { list: list, visits: best.vs, from: 'review' };
+}
+
+async function runAnalysisExplain(force) {
   if (state.coach.batch) { flash('全盘讲解正在跑 —— 等它跑完，或点进度条旁边的「停止」'); return; }
   /* 两条讲解共用一条 LoGos 通道 → 同一时刻只允许一条（见 runPickExplain 的注释）。 */
   if (state.coach.busy.pick >= 0) { flash('「推荐落点讲解」正在讲 —— 等它讲完再来'); return; }
@@ -8677,8 +10302,30 @@ async function runAnalysisExplain() {
   const sideTxt = m.color === 'b' ? '黑' : '白';
   const pt = m.pass ? '停一手' : toGTP(m.x, m.y);
 
+  /* ★★ 2026-10-24 用户要求：这一手讲过了 → **直接把存下来的那段摆出来**，一个请求都不发。
+     原来的规矩是「再点一次 = 清掉旧的、重新生成」，那会白花几秒、还每次都换一个说法。
+     想重讲就按住 Alt 点（force）。缓存判断要放在 needEngine 之前 —— 没加载 LoGos
+     也该能翻看已经存下来的讲解。 */
+  const cached = force ? null : state.coach.explain[at];
+  if (cached) {
+    state.coach.allView = false;           // 只看这一手（别停在「全盘」那一页）
+    state.coach.view = 'explain';
+    coachAllSig = '';
+    coachRenderedAt = -999;
+    renderCoachPanels(true);
+    coachScrollTop();
+    flash('第 ' + at + ' 手讲过了 —— 直接看（Alt+点可重讲）');
+    return;
+  }
+  if (needEngine('coach', '分析讲解')) return;
+
   const body = $('explain-body');
+  state.coach.view = 'explain';            // ★ 三个按钮共用一块正文区 → 切回「分析讲解」这一页
+  state.coach.allView = false;             // 单讲一手 → 从「全盘」视图退出来（否则正文写进去马上被覆盖）
+  coachAllSig = '';
+  body.classList.remove('all-list');
   body.textContent = '';
+  coachScrollTop();
   const head = document.createElement('div');
   head.className = 'pnt';
   head.textContent = '第 ' + at + ' 手 · ' + sideTxt + ' ' + pt + (state.viewAt === state.moves.length ? '' : '（回看中）');
@@ -8694,6 +10341,11 @@ async function runAnalysisExplain() {
   btn.disabled = true;
   btn.textContent = '讲解中…';
   state.coach.busy.explain = at;
+  /* ★ busy 置上之后再刷新一次：把「推荐落点」那一页切回「分析讲解」，
+     而 busy === at 会让 renderCoachPanels 不动刚摆好的正文（打字机正往那儿画）。 */
+  coachRenderedAt = -999;
+  renderCoachPanels(true);
+  coachScrollTop();
   let saved = null;                        // 完整生成成功才存（中途被打断就不存）
   try {
     /* ① 客观评价 —— 只有 KataGo 说了算 */
@@ -8702,25 +10354,34 @@ async function runAnalysisExplain() {
     verdict.textContent = verdictTxt;
     if (v && v.loss <= 0.05) verdict.className = 'vok';
 
-    /* ② 道理 —— 交给 LoGos 讲「这一手之前的局面，AI 想下哪」 */
-    if (!engineReady) {
-      why.textContent = '（想听「为什么」，得先把 KataGo 加载起来 —— 它要先算一下当时的局面）';
-      return;
-    }
+    /* ② 候选点：**先看复盘数据**（2026-10-23 用户要求）——
+       有就直接用（同一个局面、同一档搜索量，和「全盘讲解」说的是同一个数），
+       没有才现场问 KataGo。省一次引擎计算，也避免两处各说一个数。 */
     const before = state.moves.slice(0, at - 1);
-    const res = await window.api.analyze({
-      initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
-      moves: before.map(mv => [mv.color === 'b' ? 'B' : 'W', mv.pass ? 'pass' : toGTP(mv.x, mv.y)]),
-      rules: (RULES[settings.rules] || RULES.chinese).kata,
-      komi: settings.komi,
-      size: N,
-      maxVisits: Math.max(120, Math.round((settings.visits || ANALYZE_VISITS) / 2)),
-    });
-    /* ⚠️ 候选点在 res.moves（主进程从引擎的 moveInfos 转出来的），
-       **不在** res.root 里 —— res.root 只是 rootInfo（winrate/scoreLead/visits）。 */
-    const list = ((res && res.moves) || [])
-      .filter(x => x && x.move && (x.visits || 0) >= 2)
-      .sort((a, b) => b.winrate - a.winrate);
+    let src = await reviewCandidatesAt(at);
+    if (!src) {
+      /* 复盘里没有这个局面 → 现场算。搜索量按**复盘默认那一档**（500），
+         和复盘/全盘讲解统一（原来这里是 settings.visits 的一半 = 250，同一个位置两套精度）。 */
+      if (!engineReady) {
+        why.textContent = '（想听「为什么」，得先把 KataGo 加载起来 —— 它要先算一下当时的局面）';
+        return;
+      }
+      const res = await window.api.analyze({
+        initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
+        moves: before.map(mv => [mv.color === 'b' ? 'B' : 'W', mv.pass ? 'pass' : toGTP(mv.x, mv.y)]),
+        rules: (RULES[settings.rules] || RULES.chinese).kata,
+        komi: settings.komi,
+        size: N,
+        maxVisits: reviewVisits(),
+      });
+      /* ⚠️ 候选点在 res.moves（主进程从引擎的 moveInfos 转出来的），
+         **不在** res.root 里 —— res.root 只是 rootInfo（winrate/scoreLead/visits）。 */
+      const list = ((res && res.moves) || [])
+        .filter(x => x && x.move && (x.visits || 0) >= 2)
+        .sort((a, b) => b.winrate - a.winrate);
+      src = { list: list, visits: reviewVisits(), from: 'engine' };
+    }
+    const list = src.list || [];
     const best = list[0];
 
     if (!best) {
@@ -8734,12 +10395,18 @@ async function runAnalysisExplain() {
        跟上面胜率条（当前局面）不是一个数，不写清楚会让人对不上。
        ★ 2026-10-08 改：下错了的时候**要把"你实际下了哪"也写出来** ——
          原来只写「AI 当时更倾向 D8」，用户会以为下面那段讲的是 D8（而它确实讲错了，见下方注释）。
-         现在先交代 AI 想下哪、再交代实际下在哪，下面那段讲的**永远是实际这一手**。 */
+         现在先交代 AI 想下哪、再交代实际下在哪，下面那段讲的**永远是实际这一手**。
+       ★ 2026-10-23：老复盘文件没存候选点胜率（瘦身那版丢了）→ 没有就不写百分比，别写出 NaN。 */
+    const wrTxt = (typeof best.winrate === 'number')
+      ? ('，' + sideTxt + '棋当时胜率 ' + (best.winrate * 100).toFixed(1) + '%')
+      : '';
+    const srcTxt = src.from === 'review'
+      ? ('（数字用的是复盘数据 · 每手 ' + src.visits + ' 次搜索）')
+      : ('（现场算的 · 每手 ' + src.visits + ' 次搜索）');
     const leadTxt = same
-      ? ('AI 当时想下的也是这里（' + best.move + '，' + sideTxt + '棋当时胜率 '
-        + (best.winrate * 100).toFixed(1) + '%）。下面讲这一手：')
-      : ('AI 当时想下的是 ' + best.move + '（' + sideTxt + '棋当时胜率 '
-        + (best.winrate * 100).toFixed(1) + '%）；实际下的是 ' + pt + '。下面讲实际这一手：');
+      ? ('AI 当时想下的也是这里（' + best.move + wrTxt + '）。下面讲这一手：' + srcTxt)
+      : ('AI 当时想下的是 ' + best.move + wrTxt + '；实际下的是 ' + pt
+        + '。下面讲实际这一手：' + srcTxt);
     lead.textContent = leadTxt;
     body.insertBefore(lead, why);
 
@@ -8793,7 +10460,13 @@ async function runAnalysisExplain() {
   }
   /* ★ 存到「第 at 手」名下 —— 切到别手再切回来还能看到（用户报的问题②）。
      分析讲解**按手数存**（它点评的就是第 at 手本身），和选点讲解的存法不一样。 */
-  if (saved) { state.coach.explain[at] = saved; renderCoachPanels(true); }
+  if (saved) {
+    state.coach.explain[at] = saved;
+    renderCoachPanels(true);
+    /* ★ 2026-10-23：单条讲完也落盘。原来只有「全盘讲解」才写 .coach.json ——
+       用户单独讲了几手，关掉软件就没了，下次还得让 LoGos 再讲一遍（用户报障）。 */
+    saveCoachFile();
+  }
 }
 
 /* ==================== 全盘讲解（2026-10-05 用户要求）====================
@@ -8802,14 +10475,15 @@ async function runAnalysisExplain() {
    下次打开这份棋谱直接就能看，不用重跑。
 
    分两段（进度条上会看出在哪一段）：
-     ① KataGo 把整盘逐手算一遍 —— 一次请求拿全（复用「复盘」那条通路），
-        得到每手的「AI 当时首选」+ 胜率。
+     ① KataGo 把整盘逐手算一遍 —— 借「复盘」那条通路，**而且优先复用复盘数据**：
+        这份棋谱复盘过就直接用（一个请求都不发），只缺一部分就只补那几个回合。
         ★ 为什么非要它：LoGos 讲的是「AI 当时想下哪、为什么」，
           那个点必须由 KataGo 定 —— 让 LoGos 自己选点，实测会把角上一路
           （T19 / A1）说成好棋，那是硬错。
      ② LoGos 逐手讲 —— 每手一次请求，约 2~4 秒。
 
    ★ 已经讲过的手**跳过**：所以点「停止」之后再来一次，是接着往下讲，不从头。
+   ★ 跑完自动切到「全盘」视图（标题旁「看全盘」）—— 整盘每一手的讲解连成一页。
    ★ 不用打字机：那是给「盯着它一个字一个字写」用的；这里要跑几分钟，
      用户早切到别的手去看别的了。 */
 let batchStop = false;
@@ -8824,39 +10498,350 @@ function setBatchBar(on, done, total, txt) {
   $('batch-txt').textContent = txt || (done + ' / ' + total);
 }
 
+/* ---------- 讲解按线存（2026-10-23 用户报障：有分支的棋谱） ----------
+   原来 `explain` 只认手号：切到另一条分支，第 30 手拿到的还是上一条线第 30 手的文字，
+   而且「全盘讲解」的 `todo` 一看 `explain[at]` 有值就当"已讲过"跳过 —— 分支等于讲不了。
+   现在：
+     · 线指纹和复盘共用 `lineKeyOfList(lineGtpOf(moves))`（手顺哈希 + 手数）；
+     · 内存 `state.coach.lines[<key>] = { n, list }`，磁盘 `.coach.json` 的 `lines` 同形；
+     · `state.coach.explain` 是**当前这条线**那个 list 的引用（不是副本）——
+       所有老代码照旧写 `explain[at]`，落盘时自动归到这条线。 */
+function coachLineKey() { return lineKeyOfList(lineGtpOf(state.moves)); }
+
+function coachLineOf(key, n) {
+  const k = key || coachLineKey();
+  let rec = state.coach.lines[k];
+  if (!rec) {
+    rec = { n: (typeof n === 'number' ? n : state.moves.length), list: {} };
+    state.coach.lines[k] = rec;
+  }
+  return rec;
+}
+
+/* 把 explain 的值序列化成「按手数排好的数组」（下标 = 手数，0 位空着） */
+function coachLineList(rec) {
+  const n = Math.max(0, rec && typeof rec.n === 'number' ? rec.n : 0);
+  const list = [];
+  for (let i = 0; i <= n; i++) list.push((rec && rec.list && rec.list[i]) || null);
+  return list;
+}
+
+/* 这条线之外，还有几条线是有讲解的（用来在界面上说清楚「讲解存在别的分支上」） */
+function coachOtherLines(key) {
+  const k = key || coachLineKey();
+  return Object.keys(state.coach.lines).filter(x => x !== k
+    && Object.keys((state.coach.lines[x] || {}).list || {}).length);
+}
+
+/* 换线**之前**调：把正要离开的那条线的手数记准（分支长短不一样） */
+function leaveCoachLine(key, n) {
+  if (!key) return;
+  const rec = state.coach.lines[key];
+  if (rec && typeof n === 'number') rec.n = n;
+}
+
+/* 换线**之后**调：把 explain 重新指到新那条线上，并顺手作废渲染缓存 */
+function enterCoachLine() {
+  const k = coachLineKey();
+  const rec = coachLineOf(k, state.moves.length);
+  rec.n = state.moves.length;
+  state.coach.explain = rec.list;
+  state.coach.curKey = k;
+  coachAllSig = '';
+  coachRenderedAt = -999;
+  const mine = Object.keys(rec.list).length;
+  if (!mine) state.coach.allView = false;      // 这条线没讲解 → 退回「按手数看」的框
+  return { mine: mine, others: coachOtherLines(k).length };
+}
+
 /* 把内存里的逐手讲解落盘（<棋谱名>.coach.json）。
-   list 的下标 = 手数（0 位空着），这样读回来能直接按手数对上。 */
+   v2 = 按线存：{ v:2, n, lineKey, list, lines:{ <线指纹>: { n, list } } }
+   ★ list 仍然写当前这条线（老版本只认 list，读回来至少不会全丢）；lines 才是全量。
+   ★ v2 之前写过带 summary 字段的 v2（整盘总评，已删）—— 读的时候忽略即可。 */
 function saveCoachFile() {
   if (!state.recName) return Promise.resolve(null);
-  const list = [];
-  for (let i = 0; i <= state.moves.length; i++) list.push(state.coach.explain[i] || null);
-  const json = JSON.stringify({ v: 1, n: state.moves.length, list: list });
+  const curKey = coachLineKey();
+  const cur = coachLineOf(curKey, state.moves.length);
+  /* explain 可能是被整体换过的（读盘 / 清空），确保它和这条线的记录是**同一个对象** */
+  if (cur.list !== state.coach.explain) cur.list = state.coach.explain;
+  cur.n = state.moves.length;
+  const lines = {};
+  for (const k of Object.keys(state.coach.lines)) {
+    const rec = state.coach.lines[k];
+    const list = coachLineList(rec);
+    if (list.some(x => x && x.body)) lines[k] = { n: rec.n, list: list };   // 空线不写
+  }
+  const list = coachLineList(cur);
+  const json = JSON.stringify({
+    v: 2, n: state.moves.length, lineKey: curKey, list: list, lines: lines,
+  });
   try {
     return Promise.resolve(window.api.records.saveCoach(state.recName, json)).catch(() => null);
   } catch (e) { return Promise.resolve(null); }
 }
 
-/* 打开棋谱时把存下来的讲解读回来（用户要求：结果跟棋谱一起保存，下次打开还在） */
+/* 打开棋谱时把存下来的讲解读回来（用户要求：结果跟棋谱一起保存，下次打开还在）
+   ★ v2 按线读：当前这条线有就摊开；没有但**别的分支**有 → 明说（不是文件丢了）；
+     同一份棋谱里切分支时由 applyVariationLine → enterCoachLine 直接换，不用重读文件。 */
 async function loadCoachForRecord(name) {
   if (!name) return;
   const gen = gameGen;
+  /* ★ 读盘前记下"文件对应哪条线"：await 期间用户可能切了分支（v1 的 list 属于主分支） */
+  const startKey = coachLineKey();
   let r = null;
   try { r = await window.api.records.readCoach(name); } catch (e) { return; }
   if (!r || !r.text || gen !== gameGen) return;      // 读盘期间换了棋谱 → 丢掉
   let data = null;
   try { data = JSON.parse(r.text); } catch (e) { return; }
-  const list = (data && data.list) || [];
-  const box = {};
-  for (let at = 1; at < list.length && at <= state.moves.length; at++) {
-    const it = list[at];
-    if (it && it.body) box[at] = it;
+  const toBox = list => {
+    const box = {};
+    const arr = Array.isArray(list) ? list : [];
+    for (let at = 1; at < arr.length; at++) {
+      const it = arr[at];
+      if (it && it.body) box[at] = it;
+    }
+    return box;
+  };
+  const lines = {};
+  let v1Elsewhere = false;
+  if (data && data.lines && typeof data.lines === 'object') {
+    for (const k of Object.keys(data.lines)) {
+      const rec = data.lines[k] || {};
+      const box = toBox(rec.list);
+      if (Object.keys(box).length) {
+        lines[k] = { n: (typeof rec.n === 'number' ? rec.n : state.moves.length), list: box };
+      }
+    }
+  } else {
+    /* v1（没有分支支持时写的）：整份只有一个 list → 归给读盘时那条线 */
+    const box = toBox(data && data.list);
+    if (Object.keys(box).length) {
+      lines[startKey] = {
+        n: (data && typeof data.n === 'number') ? data.n : state.moves.length, list: box,
+      };
+      /* 读盘期间用户切走了分支 → 这份老文件属于**主分支**，别当成"文件是空的" */
+      if (coachLineKey() !== startKey) v1Elsewhere = true;
+    }
   }
-  const howMany = Object.keys(box).length;
-  if (!howMany) return;                              // 存过但是空的 → 当没有
-  state.coach.explain = box;
+  /* ★ 读盘是异步的：这期间用户可能已经切了分支、甚至讲了一手（写进 state.coach.lines）。
+     那些**新写的**不能被文件内容盖掉 → 合并（文件打底，内存里非空的覆盖它）。 */
+  for (const k of Object.keys(state.coach.lines)) {
+    const cur = state.coach.lines[k];
+    if (cur && Object.keys(cur.list || {}).length) lines[k] = cur;
+  }
+  state.coach.lines = lines;
+  const nowKey = coachLineKey();
+  const mine = lines[nowKey];
+  state.coach.explain = mine ? mine.list : {};
+  state.coach.curKey = nowKey;
+  const howMany = Object.keys(state.coach.explain).length;
+  const others = coachOtherLines(nowKey).length;
   coachRenderedAt = -999;
+  coachAllSig = '';
+  /* ★ 2026-10-23 用户报障：棋谱库里明明标着「带讲解」，打开却什么都看不到、还得让 LoGos 重讲。
+     两个原因都在这：
+     ① 文件存在但这条线一条正文都没有（讲到一半被打断 / 讲解存在别的分支上）→ 原来静默 return，
+        用户只能看见空的框；现在明说，并告诉他点哪儿能重讲；
+     ② 读回来了却只显示**当前那一手**（右边那个框永远只跟手数走）→ 用户以为「不是全盘讲解」。
+        所以打开就直接摊成「全盘」那一页 —— 你要的就是打开就能读到结果。 */
+  if (!howMany) {
+    state.coach.allView = false;
+    state.coach.view = 'explain';
+    if (v1Elsewhere) {
+      flash('讲解存在主线上（你现在在别的分支）—— Alt+←/→ 切回主线就能看');
+    } else if (others) {
+      flash('讲解在别的分支上（这条线没讲）—— Alt+←/→ 切到带「变」的分支');
+    } else {
+      flash('讲解文件是空的（上次没讲完）—— 点「全盘讲解」重讲');
+    }
+    renderCoachPanels(true);
+    return;
+  }
+  state.coach.allView = true;          // ★ 打开就摊开：直接看到整盘，不用再点「看全盘」
+  state.coach.view = 'explain';        // 那一页就是「分析讲解」页的全盘形态
   renderCoachPanels(true);
-  flash('这份棋谱带着逐手讲解（' + howMany + ' 手）—— 点手数列表就能看');
+  flash('带逐手讲解（' + howMany + ' 手' + (others ? ' · 另有 ' + others + ' 条也讲过' : '')
+    + '）—— 已摊成「全盘」，点一行跳过去');
+}
+
+/* ---------- 整盘的逐回合数据（「全盘讲解」用）----------
+   ★★ 和「AI 复盘」本来就是**同一件事**：同 review 接口、同 reviewVisits()、同 analyzeTurns，
+     连复盘的 `turns` 都正是「第 t 手落下之前那个局面」的 root + 候选点。所以规矩是：
+       ① 当前这条线已经复盘过（环境签名一致）→ 一个请求都不发，直接用；
+       ② 只覆盖一部分（别的分支的共享前缀 / 复盘后又下了几手）→ 只补算缺的那几个回合；
+       ③ 一手都没有 → 照旧整盘算一遍。
+     ★ 「下棋时边下边算」那份 live 数据**不当数据源**：每手搜索量 3~507 参差，
+       胜率/目损前后不可比（reviewLineJob 里同一条规矩）。
+   ★ 2026-10-23 从 runBatchCoach 里抽成独立函数（原本是一段内联代码）。
+   返回 { ok, turns, reused, computed, incomplete }：
+     turns[i] = 第 i 手落下之前那个局面（i = 0..n），没算到的回合是 null。
+   进度画在「全盘讲解」那条进度条上；调用方负责 coach.batch / 按钮状态。 */
+async function coachTurnsForLine(gen) {
+  const n = state.moves.length;
+  const base = {
+    initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
+    rules: (RULES[settings.rules] || RULES.chinese).kata,
+    komi: settings.komi,
+    size: N,
+    maxVisits: reviewVisits(),
+  };
+  const coreSig = reviewEnvCore(base, analyzeModelName);
+  const myList = lineGtpOf(state.moves);
+  let doc = state.reviewDoc;
+  if (!doc || !doc.lines) {                 // 打开棋谱时是异步读的，可能还没到
+    try { doc = await loadReviewDoc(state.recName, state.moves); } catch (e) { doc = null; }
+    if (doc && doc.lines) state.reviewDoc = doc;   // 装进仓库：报告按钮/目损也能用上
+  }
+  if (gen !== gameGen) return { ok: false };
+
+  /* ---------- ① 挑一档搜索量：和当前设置一致的报告优先，否则用覆盖最长的那份 ----------
+     ★★ 2026-10-23 用户报障的根因就在这一步（原来根本没这一步，只有「env 必须完全相等」）：
+     老复盘文件是每手 100 次，现在的默认是 500 次 → env 不等 → 整盘一个回合都借不到 → 白算一遍。
+     现在：环境（权重/贴目/规则/棋盘/摆子）一致就允许借，**整盘统一用那份复盘的搜索量**
+     （否则 100 次和 500 次的数据混在一盘里，目损互相不可比）。 */
+  let useVisits = base.maxVisits;
+  let borrowedVisits = 0;
+  if (doc && doc.lines) {
+    let best = null;
+    for (const k of Object.keys(doc.lines)) {
+      const L2 = doc.lines[k];
+      if (!L2 || L2.source === 'live' || !L2.turns) continue;   // live：搜索量参差，不当数据源
+      if (!L2.env || envCoreOf(L2.env) !== coreSig) continue;   // 换了权重/规则/棋盘 → 真的不能借
+      const cov = sharedPrefixLen(L2.moves || [], myList);
+      if (cov < 1) continue;
+      const vs = (typeof L2.visits === 'number' && L2.visits > 0) ? L2.visits : 0;
+      if (!vs) continue;
+      const same = vs === base.maxVisits;
+      const better = !best
+        || (same && !best.same)
+        || (same === best.same && (cov > best.cov
+             || (cov === best.cov && vs > best.vs)));
+      if (better) best = { vs, cov, same };
+    }
+    if (best) {
+      useVisits = best.vs;
+      if (best.vs !== base.maxVisits) borrowedVisits = best.vs;
+    }
+  }
+  base.maxVisits = useVisits;               // ★ 补算也按这一档，整盘精度统一
+  const envSig = reviewEnvSig(base, analyzeModelName);
+
+  const have = {};
+  let reused = 0;
+  const seed = line => {
+    if (!line || !line.turns) return;
+    if (line.source === 'live') return;                 // 搜索量不统一 → 不复用
+    if (line.env && line.env !== envSig) return;        // envSig 已经统一到 useVisits 那一档
+    const L = sharedPrefixLen(line.moves || [], myList);
+    for (let tt = 0; tt <= L; tt++) {
+      const v = line.turns[tt];
+      if (!v || have[tt]) continue;
+      const c = Object.assign({}, v);
+      /* 共享前缀的最后一回合，后面那一手正是分叉的那一手 ——
+         必须换成**这条线自己的**手，否则「与 AI 首选一致」会串线。 */
+      if (tt === L && L < myList.length) c.actualMove = myList[tt] ? myList[tt].slice(1) : null;
+      have[tt] = c;
+      reused++;
+    }
+  };
+  for (const k of Object.keys((doc && doc.lines) || {})) seed(doc.lines[k]);
+  const missing = [];
+  for (let tt = 0; tt <= n; tt++) if (!have[tt]) missing.push(tt);
+
+  let computed = false, incomplete = false;
+  if (missing.length) {
+    if (needEngine('analyze', '整盘讲解')) return { ok: false };
+    reviewBusy = true;                    // 占着引擎：别让自动分析来抢
+    setBatchBar(true, 0, n, !reused
+      ? '正在让 KataGo 把整盘算一遍…'
+      : ('已经有 ' + reused + ' 个回合的复盘数据（每手 ' + useVisits + ' 次），只补算剩下的 '
+        + missing.length + ' 个…'));
+    const req = Object.assign({}, base, {
+      moves: myList.map(g => [g[0] === 'W' ? 'W' : 'B', String(g).slice(1)]),
+      analyzeTurns: missing,
+    });
+    let res = null;
+    try { res = await window.api.review(req); } catch (e) { res = { error: String(e) }; }
+    reviewBusy = false;
+    if (gen !== gameGen) return { ok: false };
+    computed = true;
+    /* ★ 整盘**超时**时 main.js 会带 `incomplete: true` 交回「已经算到的那些回合」，
+       这种情况只能用算到的部分，而且要如实说明。 */
+    incomplete = !!(res && res.incomplete);
+    /* ★ 两种回包形状都收（同 reviewLineJob）：`{turns:[…]}` 是逐回合收集模式，
+       单个 payload 是只有一个回合时主进程回的形状 —— 只认前一种会静默漏手。 */
+    const back = (res && res.turns) ? res.turns
+      : ((res && typeof res.turn === 'number') ? [res] : []);
+    for (const it of back) if (it && typeof it.turn === 'number') have[it.turn] = it;
+    if (!Object.keys(have).length) {
+      return { ok: false, flash: '整盘分析失败：' + ((res && res.error) || '引擎没给出结果') };
+    }
+    if (res && res.error) {
+      flash('引擎报错（' + res.error + '）—— 先用已经拿到的那部分');
+    }
+  }
+
+  const turns = Array.from({ length: n + 1 }, (_, i) => have[i] || null);
+  const haveN = turns.filter(Boolean).length;
+  if (haveN < 2) {
+    return { ok: false, flash: '整盘分析失败：' + (haveN ? '只拿到 ' + haveN + ' 个回合' : '引擎没给出结果') };
+  }
+  /* 顺手把胜率走势填满（引擎给的是「轮到谁走」视角，seriesFromTurns 已换算成黑方视角）——
+     这样手数列表的「涨跌」和走势图也一起活了，讲的胜率能跟它们对上。 */
+  const series = seriesFromTurns(turns);
+  state.history = series.history;
+  state.leads = series.leads;
+  /* ★ 精度标记按**实际那一回合的 visits** 填（借来的 100 次不能标成 500 次 —— 界面会撒谎） */
+  state.histVisits = turns.map(t => (t && t.root && typeof t.root.visits === 'number')
+    ? t.root.visits : useVisits);
+  /* ★★ 2026-10-23：算出来的东西别扔 —— 这条线还没有正式复盘（或只有边下边算的 live 数据）时，
+     把这次整盘算的落成一份正式复盘。下次点「全盘讲解」「复盘报告」都不用再算第二遍。 */
+  let saved = false;
+  if (computed && !incomplete && haveN === n + 1) {
+    saved = await saveReviewFromTurns(state.recName, myList, n, envSig, useVisits, turns, doc);
+  }
+  renderMoveList();
+  renderCurve();
+  return { ok: true, turns, reused, computed, incomplete,
+           visits: useVisits, borrowed: borrowedVisits, saved };
+}
+
+/* 把「全盘讲解」阶段①算出来的整盘存成正式复盘（v3 文档里这条线一项）。
+   ★ 只在**这条线还没有正式复盘**时写（老的是 source==='review' 且有 turns 就跳过）——
+     绝不覆盖用户自己算过的那份。live 那类（边下边算攒的、没有 turns）会被换成这份更准的。
+   返回是否写了文件。 */
+async function saveReviewFromTurns(name, myList, n, envSig, visits, turns, doc) {
+  if (!name || !Array.isArray(turns) || turns.length !== n + 1) return false;
+  const myKey = lineKeyOfList(myList);
+  const d = (doc && doc.lines) ? doc : emptyReviewDoc(name);
+  const old = d.lines[myKey];
+  if (old && old.source === 'review' && old.turns) return false;
+  try {
+    const rep = buildReview(n, turns);
+    rep.name = String(name).replace(/\.sgf$/i, '');
+    rep.file = name;
+    rep.visits = visits;
+    const series = seriesFromTurns(turns);
+    rep.history = series.history.slice();
+    rep.leads = series.leads.slice();
+    rep.partial = null;
+    rep.lineKey = myKey;
+    rep.lineN = n;
+    const map = {};
+    for (let i = 0; i < turns.length; i++) if (turns[i]) map[i] = turns[i];
+    d.lines[myKey] = {
+      key: myKey, moves: myList, n, env: envSig, sig: envSig + '|' + myKey,
+      visits, source: 'review',
+      report: rep, history: series.history.slice(), leads: series.leads.slice(),
+      turns: slimTurns(map),
+    };
+    d.name = d.name || String(name).replace(/\.sgf$/i, '');
+    d.updated = Date.now();
+    await window.api.records.saveReview(name, JSON.stringify(d));
+    state.reviewDoc = d;                  // 装回仓库：「复盘报告」按钮 / 目损立刻能用
+    if (typeof refreshRecords === 'function') refreshRecords();
+    return true;
+  } catch (e) { return false; }
 }
 
 async function runBatchCoach() {
@@ -8865,78 +10850,91 @@ async function runBatchCoach() {
      直接点「全盘讲解」会把在跑的那条**静默掐掉** —— 两条共用 coachSeq 通道，
      原来只有「批量挡单条」这一半（批量期间按钮被 disabled），反向漏了。 */
   if (state.coach.busy.explain >= 0 || state.coach.busy.pick >= 0) {
-    flash('正在讲别的（分析讲解 / 推荐落点讲解）—— 等它讲完再点全盘讲解');
+    flash('正在讲别的 —— 等它讲完再点全盘讲解');
     return;
   }
   if (!state.fromRecord || !state.recName) { flash('先打开一份棋谱，再来做全盘讲解'); return; }
-  if (needEngine('coach', '全盘讲解')) return;
-  if (needEngine('analyze', '全盘讲解')) return;
+  /* ★ KataGo 的检查**挪到阶段①里**去了（2026-10-22）：这一盘要是已经复盘过，
+     阶段①一个请求都不发、根本用不到 analyze 引擎 —— 这时还拦着说「先加载 KataGo」
+     没有道理（用户实测：明明有复盘报告，还让他等引擎、还重算了一遍）。
+     ★ LoGos 的检查也挪到「确实还有手要讲」之后（2026-10-24）：
+       整盘都讲过了就只是把结果摊开给你看，不需要 LoGos。 */
   const n = state.moves.length;
   if (!n) { flash('这份棋谱里没有手顺，讲不了'); return; }
 
   const gen = gameGen;
+  /* ★★ 2026-10-23：讲解按线存 —— 整场只往**开始时这条线**写。
+     中途切分支就停（见循环里的 coachLineKey 判定），否则两条线的手会混进同一份记录。 */
+  const runKey = coachLineKey();
+  const runRec = coachLineOf(runKey, n);
+  if (runRec.list !== state.coach.explain) runRec.list = state.coach.explain;
+  const box = state.coach.explain;
+
+  /* ★★ 2026-10-24 用户要求：**讲过的直接显示**。
+     整盘每一手都已经有讲解（单条讲过 / 上次全盘讲过 / 打开棋谱时读回来的）——
+     那就连 KataGo 都不用碰，直接把「全盘」那一页摊开。 */
+  let allDone = true;
+  for (let at = 1; at <= n; at++) if (!box[at]) { allDone = false; break; }
+  if (allDone) {
+    state.coach.view = 'explain';
+    state.coach.allView = true;
+    coachRenderedAt = -999;
+    renderCoachPanels(true);
+    coachScrollTop();
+    flash('这条分支已经全讲过（' + n + ' 手）—— 已摊成全盘，没让 LoGos 重讲');
+    return;
+  }
+  if (needEngine('coach', '全盘讲解')) return;
+
   state.coach.batch = { done: 0, total: n };
   batchStop = false;
+  state.coach.view = 'explain';         // 三个按钮共用一块正文区 → 进度写在这一页
+  state.coach.allView = false;          // 跑的时候逐手看进度，跑完再摊成全盘
   $('btn-batch').disabled = true;
   $('btn-explain').disabled = true;      // 批量期间不许插队（会和批量抢 coachSeq）
   $('btn-pick').disabled = true;
-  setBatchBar(true, 0, n, '正在让 KataGo 把整盘算一遍…');
-  /* 这一步占着引擎：把自动分析压住，否则两边抢同一个进程、谁也算不完。
-     （同时靠 state.coach.batch 让「复盘进度」弹窗别冒出来 —— 见文件后面那条订阅。） */
-  reviewBusy = true;
+  setBatchBar(true, 0, n, '正在核对复盘数据…');
   try {
-    /* ---------- ① KataGo：整盘逐手算一遍 ---------- */
-    const req = {
-      initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
-      moves: state.moves.map(m => [m.color === 'b' ? 'B' : 'W', m.pass ? 'pass' : toGTP(m.x, m.y)]),
-      rules: (RULES[settings.rules] || RULES.chinese).kata,
-      komi: settings.komi,
-      size: N,
-      maxVisits: reviewVisits(),
-      analyzeTurns: Array.from({ length: n + 1 }, (_, i) => i),
-    };
-    let res = null;
-    try { res = await window.api.review(req); } catch (e) { res = { error: String(e) }; }
-    reviewBusy = false;
+    /* ---------- ① KataGo：整盘逐手 —— **能复用复盘就复用**（细节见 coachTurnsForLine） ---------- */
+    const got = await coachTurnsForLine(gen);
+    if (!got.ok) { if (got.flash) flash(got.flash); return; }
     if (gen !== gameGen) return;         // 期间换了棋谱 → 整体作废（finally 会收拾界面）
-    if (!res || res.error || !res.turns || res.turns.length < 2) {
-      flash('整盘分析失败：' + ((res && res.error) || '引擎没给出结果'));
-      return;
+    const turns = got.turns;
+    if (got.incomplete) {
+      flash('KataGo 整盘没算完（超时）—— 只讲算到的部分，再点一次接着讲');
+    } else if (!got.computed) {
+      /* 一个请求都没发：这一盘已经复盘过（搜索量可能和当前设置不同，见 coachTurnsForLine ①） */
+      flash('这盘复盘过（每手 ' + got.visits + ' 次）—— 直接用复盘数据讲，没重算');
+    } else if (got.reused) {
+      flash('借了已有 ' + got.reused + ' 个回合的复盘数据（每手 ' + got.visits
+        + ' 次），只补算剩下几个');
+    } else {
+      flash('没有可用的复盘数据 —— KataGo 整盘算了一遍'
+        + (got.saved ? '，顺手存成了复盘' : ''));
     }
-    /* ★ 整盘分析**超时**时 main.js 会带 `incomplete: true` 交回「已经算到的那些回合」
-       （见 analyze 的超时兜底）。这种情况只能讲算到的部分，而且要如实说明 ——
-       原来只看 `turns.length >= 2` 就照跑到底，末尾还报「讲了 N 手」，
-       实际有几手因为没数据被跳过（2026-10-06 审查发现）。 */
-    if (res.incomplete) {
-      flash('KataGo 整盘没算完（超时）—— 这次只讲算到的部分，回头再点一次会接着讲');
-    }
-    const turns = res.turns;
-    /* 顺手把胜率走势填满（引擎给的是「轮到谁走」视角，要换算成黑方视角）——
-       这样手数列表的「涨跌」和走势图也一起活了，讲解里说的胜率能跟它们对上。 */
-    const isWhiteTurn = x => String(((x && x.root) || {}).currentPlayer || '').toUpperCase() === 'W';
-    state.history = turns.map(x => {
-      const wr = x && x.root && x.root.winrate;
-      return (typeof wr === 'number') ? (isWhiteTurn(x) ? 1 - wr : wr) : undefined;
-    });
-    state.leads = turns.map(x => {
-      const sl = x && x.root && x.root.scoreLead;
-      return (typeof sl === 'number') ? (isWhiteTurn(x) ? -sl : sl) : undefined;
-    });
-    /* ★ 同上：整盘讲解也是同一档搜索量一次算完的，精度标记统一填上 */
-    state.histVisits = turns.map(() => reviewVisits());
-    renderMoveList();
-    renderCurve();
 
     /* ---------- ② LoGos：逐手讲（讲过的跳过，所以能接着上次继续） ---------- */
     const todo = [];
-    /* ★ 上限取 min(手数, 已算到的回合数) —— 超时的情况只讲有数据的那些手，
-       免得后面每一手都走到「没算出候选点」、空转一遍还被算进完成数（见上面的 incomplete 判断）。 */
-    for (let at = 1; at <= Math.min(n, turns.length); at++) if (!state.coach.explain[at]) todo.push(at);
-    if (!todo.length) { flash('这份棋谱已经全部讲过（' + n + ' 手）'); return; }
+    for (let at = 1; at <= n; at++) if (!box[at] && turns[at - 1]) todo.push(at);
+    if (!todo.length) {
+      /* 全讲过了 → 直接把整盘摊开给他看（原来只 flash 一句「已经全部讲过」，
+         用户看不到东西，以为没讲）。★ 2026-10-24：这就是「讲过的直接显示」——
+         一个 LoGos 请求都不发，只把页切过去。 */
+      state.coach.view = 'explain';
+      state.coach.allView = true;
+      coachRenderedAt = -999;
+      renderCoachPanels(true);
+      flash('这条分支已经全讲过（' + n + ' 手）—— 已摊成全盘');
+      return;
+    }
 
     let k = 0;
+    let lineChanged = false;
     for (let i = 0; i < todo.length; i++) {
       if (batchStop || gen !== gameGen) break;
+      /* ★ 换到别的分支了：立刻收工。不能接着讲 —— 现在的 moves 已经是另一条线的手顺，
+         `turns` 却是原来那条线的，混着写会把两条分支的讲解搅在一起。 */
+      if (coachLineKey() !== runKey) { lineChanged = true; break; }
       const at = todo[i];
       const m = state.moves[at - 1];
       const pt = m.pass ? '停一手' : toGTP(m.x, m.y);
@@ -8955,18 +10953,20 @@ async function runBatchCoach() {
       } else {
         /* 「当时」两个字不能省 —— 这是**这一手之前**那个局面的胜率。
            ★ 2026-10-08 与「分析讲解」同步修：这里原来也把 `best.move`（AI 想下的点）
-             传给了 LoGos，于是整盘讲解讲的都是"AI 该下哪"，而不是**实际下的这一手**会怎样。 */
+             传给了 LoGos，于是整盘讲解讲的都是"AI 该下哪"，而不是**实际下的这一手**会怎样。
+           ★ 2026-10-22：复用老的复盘文件时可能没有候选点胜率（旧版瘦身没存）——
+             那就不报数字，别写出 NaN%。 */
         const same = String(best.move).toUpperCase() === pt.toUpperCase();
+        const wrTxt = (typeof best.winrate === 'number')
+          ? ('，' + sideTxt + '棋当时胜率 ' + (best.winrate * 100).toFixed(1) + '%') : '';
         leadTxt = same
-          ? ('AI 当时想下的也是这里（' + best.move + '，' + sideTxt + '棋当时胜率 '
-            + (best.winrate * 100).toFixed(1) + '%）。下面讲这一手：')
-          : ('AI 当时想下的是 ' + best.move + '（' + sideTxt + '棋当时胜率 '
-            + (best.winrate * 100).toFixed(1) + '%）；实际下的是 ' + pt + '。下面讲实际这一手：');
+          ? ('AI 当时想下的也是这里（' + best.move + wrTxt + '）。下面讲这一手：')
+          : ('AI 当时想下的是 ' + best.move + wrTxt + '；实际下的是 ' + pt + '。下面讲实际这一手：');
         const before = state.moves.slice(0, at - 1);
         const onset = same
           ? '，和 AI 的首选是同一个点'
-          : ('，不过 AI 当时更倾向 ' + best.move + '（' + sideTxt + '棋当时胜率 '
-            + (best.winrate * 100).toFixed(1) + '%）');
+          : ('，不过 AI 当时更倾向 ' + best.move + (wrTxt ? ('（' + sideTxt + '棋当时胜率 '
+            + (best.winrate * 100).toFixed(1) + '%）') : ''));
         const explainHead = '这一手 ' + pt + '（' + sideTxt + '棋第 ' + at + ' 手）下出来，';
         const ask = () => coachAsk(coachPrompt(before, boardAt(at - 1), m.color, pt, onset), 320);
         let r = await ask();
@@ -8989,7 +10989,7 @@ async function runBatchCoach() {
         body = r.error ? ('（讲不出来：' + r.error + '）') : txt;
       }
       if (body) {
-        state.coach.explain[at] = {
+        box[at] = {
           head: headTxt, verdict: verdictTxt, ok: !!(v && v.loss <= 0.05),
           lead: leadTxt, body: body,
         };
@@ -9001,14 +11001,27 @@ async function runBatchCoach() {
       if (k % 8 === 0) saveCoachFile();     // 每 8 手落一次盘：中途关软件不至于全丢
     }
     /* ★ 只有还停在原来那份棋谱上才写盘 —— 否则会把「刚才切过去的那份棋谱」的
-       讲解覆盖成空（那些讲解属于**原来那份**，键存在 state.coach.explain 里）。 */
+       讲解覆盖成空（那些讲解属于**原来那份**，键存在 box 里）。 */
     if (gen !== gameGen) {
       flash('换棋谱了 —— 全盘讲解已停（这次讲完的 ' + k + ' 手没存）');
+    } else if (lineChanged) {
+      /* 中途换了分支：已经讲的那几手**存回原来那条线**（box 是它的引用），
+         但不摊开 —— 眼前这条分支还没讲，摊开会是一页空的。 */
+      await saveCoachFile();
+      state.coach.allView = false;
+      coachRenderedAt = -999;
+      renderCoachPanels(true);
+      flash('切分支了 · 全盘讲解已停：刚讲的 ' + k + ' 手存回原线，回去再点接着讲');
     } else {
       await saveCoachFile();
+      /* ★ 跑完就摊成全盘（2026-10-22 用户报障：等了几分钟，右边只显示当前那一手，
+         看着像「只分析了当前手」）—— 一页读完才知道整盘都讲了。 */
+      state.coach.allView = true;
+      coachRenderedAt = -999;
+      renderCoachPanels(true);
       flash(batchStop
-        ? ('已停下 —— 讲完了 ' + k + ' 手，下次再点「全盘讲解」接着往下讲')
-        : ('全盘讲解完成：这次讲了 ' + k + ' 手（整盘共 ' + n + ' 手）'));
+        ? ('已停下 —— 讲完 ' + k + ' 手；再点「全盘讲解」接着往下讲')
+        : ('全盘讲解完成：讲了 ' + k + ' 手（整盘共 ' + n + ' 手）—— 已摊成全盘'));
     }
   } finally {
     reviewBusy = false;
@@ -9031,9 +11044,11 @@ window.api.onReviewProgress(d => {
   }
 });
 
-/* ---------- 绑定 ---------- */
-$('btn-explain').onclick = () => runAnalysisExplain();
-$('btn-pick').onclick = () => runPickExplain();
+/* ---------- 绑定 ----------
+   ★ 2026-10-24：按住 Alt 点 = 强制重讲（平时点已经讲过的那一手/局面，
+     只把存下来的内容摆出来，不再问 LoGos）。 */
+$('btn-explain').onclick = e => runAnalysisExplain(!!(e && e.altKey));
+$('btn-pick').onclick = e => runPickExplain(!!(e && e.altKey));
 /* 全盘讲解：只在**打开棋谱**时出现（clearCoachPanels 管显隐） */
 $('btn-batch').onclick = () => runBatchCoach();
 $('batch-stop').onclick = () => {
@@ -9041,7 +11056,24 @@ $('batch-stop').onclick = () => {
   window.api.coach.cancel();          // 掐掉正在写的那一手
   setBatchBar(true, 0, 1, '正在停…');
 };
-/* ★ 启动初始化放在**最后**（讲解模块的 const 都已求值）：
-   applyNewGame 内部会调 clearCoachPanels()，它要用 COACH_PH_* 那两个常量 ——
-   放在它们前面会踩 const 的暂时性死区（TDZ）。 */
+/* 标题旁的「看全盘 / 返回」——在「按手数看」和「整盘一页」之间切 */
+$('btn-all').onclick = () => {
+  if (state.coach.batch) { flash('全盘讲解正在跑 —— 等它跑完再切'); return; }
+  state.coach.view = 'explain';        // 它属于「分析讲解」那一页
+  state.coach.allView = !state.coach.allView;
+  coachRenderedAt = -999;
+  coachAllSig = '';                    // 两种视图的 DOM 结构不同 → 必须重建
+  renderCoachPanels(true);
+  coachScrollTop();
+};
+/* 全盘视图里点某一行 → 跳到那一手（视图不关：方便一路往下点着读） */
+$('explain-body').addEventListener('click', e => {
+  if (!state.coach.allView || state.coach.view === 'pick') return;
+  const row = e.target && e.target.closest ? e.target.closest('.all-row') : null;
+  if (!row) return;
+  const at = +row.dataset.at;
+  if (at > 0) gotoView(at);
+});
+/* ★ 启动初始化放在**最后**：applyNewGame 内部会调 clearCoachPanels()，
+   它要用上面那些模块里的东西 —— 放前面会踩 const 的暂时性死区（TDZ）。 */
 applyNewGame(true);

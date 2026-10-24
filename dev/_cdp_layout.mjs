@@ -42,7 +42,9 @@ const out = await js(`(async function(){
     手数条目数: document.querySelectorAll('#movelist li').length,
     '手数在左栏里': !!document.querySelector('.left #movelist') ? '✓' : '★ 不在',
     '两个讲解框': (document.querySelector('.left #explain-body') && document.querySelector('.left #pick-body')) ? '✓' : '★ 缺',
-    '三个卡的高度': [...left.children].map(c => Math.round(c.getBoundingClientRect().height)).join(' / '),
+    /* 2026-10-23：左栏两张讲解卡合并成一张 → 常驻卡从 3 张变 2 张（手数 / 讲解卡），
+       习题卡隐藏时也在 children 里（高度 0），所以三个数里第一个恒为 0。 */
+    '各卡高度（含隐藏的习题卡）': [...left.children].map(c => Math.round(c.getBoundingClientRect().height)).join(' / '),
     '底栏/顶栏高度': Math.round(document.querySelector('.bottombar').getBoundingClientRect().height)
       + ' / ' + Math.round(document.querySelector('.topbar').getBoundingClientRect().height),
   };

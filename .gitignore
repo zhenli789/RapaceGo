@@ -12,6 +12,9 @@ settings.json
 
 # 引擎日志（每次跑 KataGo 都会写）
 engine-logs/
+# ★ 2026-10-23 补：engine.cfg 里 `logDirDated = analysis_logs` 那一档的产物
+#   （本机 10-22 开了这个开关，git status 里立刻多出一个未跟踪目录）。
+analysis_logs/
 
 # 棋谱库（你的真实对局，涉及隐私）
 records/

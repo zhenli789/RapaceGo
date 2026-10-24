@@ -98,6 +98,11 @@ contextBridge.exposeInMainWorld('api', {
     setNote: (name, note) => ipcRenderer.invoke('records:setNote', name, note),
     saveReview: (name, json) => ipcRenderer.invoke('records:saveReview', name, json),
     readReview: name => ipcRenderer.invoke('records:readReview', name),
+    /* ★ 复盘**中间结果**（<棋谱名>.review.part.json）—— 断点续算用：
+       整盘复盘在重权重上要几十分钟，停止/崩溃后下次只补没算完的手。 */
+    saveReviewPart: (name, json) => ipcRenderer.invoke('records:saveReviewPart', name, json),
+    readReviewPart: name => ipcRenderer.invoke('records:readReviewPart', name),
+    deleteReviewPart: name => ipcRenderer.invoke('records:deleteReviewPart', name),
     /* ★ 全盘讲解的结果（逐手存下来的一整盘）—— 跟棋谱存在一起，下次打开直接就有 */
     saveCoach: (name, json) => ipcRenderer.invoke('records:saveCoach', name, json),
     readCoach: name => ipcRenderer.invoke('records:readCoach', name),

@@ -598,7 +598,16 @@ function setStatus() {
 
 /* ---------- 启停 ---------- */
 function launch(e) {
-  if (e.proc) return;
+  if (e.proc) {
+    /* ★ 2026-10-21：「卸载」还没真正退完时又来了「加载」。
+       原来这里是**静默 return** —— 于是「点卸载 → 立刻点加载」引擎再也起不来：
+       灯停在「未加载」、界面上没有任何提示，用户只能再点一次（或者以为坏了）。
+       写复盘测试时踩到（脚本里 unload 完马上 load，等了 180 秒也没就绪）。
+       改成记一笔，等旧进程真退出后由 exit 处理补拉（见 e.proc.on('exit') 里那段）。 */
+    e.relaunch = true;
+    return;
+  }
+  e.relaunch = false;
   e.lastErr = null;
   e.paused = false;                // 重新拉起 = 取消暂停
   /* ★ 清掉上一次的探针状态（2026-10-06）：不然重试的「总时限」会沿用上次的起点，
@@ -634,7 +643,18 @@ function launch(e) {
        KataGo 允许多次 -override-config（对弈引擎还会再传一个 humanSLProfile）。 */
     args = ['analysis', '-config', CFG, '-model', e.weight,
             '-override-config', 'logDir=' + LOG_DIR];
-    if (e.key === 'play') args.push(...PLAY_EXTRA_ARGS);   // ← 少了这两项引擎会 FATAL
+    /* ★★ 分析引擎：把 16 条搜索线程**拆成 2 个分析线程 × 8 条**（2026-10-21 实测）。
+       M1 Pro / Metal / b10c384 上，整盘逐手（连续多个位置）34.3 → 52.8 次评估/秒（+54%），
+       单局面也略快（500 步 16.98 → 14.45 秒）。搜索量、权重一个没动，只是重新分组 ——
+       两个位置并行时，一个在跑「树策略」，另一个还在喂 GPU，batch 填得更满。
+       ⚠️ 只给 analyze 传：对弈引擎（play）走的是「一次想一手」的单局面低延迟场景，
+       保持 engine.cfg 里的 1×16 不动（它还要带 humanSLProfile，别混在一起）。
+       ⚠️ 两个键必须写在**同一条** -override-config 里、逗号分隔（分开写第二条会被当成
+       位置参数，引擎直接起不来 —— 探针踩过）。 */
+    if (e.key === 'analyze') {
+      args.push('-override-config', 'numAnalysisThreads=2,numSearchThreadsPerAnalysisThread=8');
+    }
+    if (e.key === 'play') args.push(...PLAY_EXTRA_ARGS);
   }
 
   e.loading = true;                // 界面上显示「加载中」（就绪前）
@@ -681,6 +701,10 @@ function launch(e) {
   e.proc.on('exit', code => {
     console.log('[engine:' + e.key + '] 退出 code=' + code);
     e.proc = null; e.ready = false; e.loading = false; e.paused = false;
+    /* 卸载途中那次被挡下的「加载」（见 launch 开头）：这里必须先把标记取走，
+       因为下面的 manualStop 分支会用 relaunch 决定补不补拉。 */
+    const relaunch = !!e.relaunch;
+    e.relaunch = false;
     for (const [, rec] of e.pending) {
       clearTimeout(rec.timer);
       /* ★ 不要把中途报告 rec.best 当结果回给前端（2026-10-06 审查发现）。
@@ -697,7 +721,13 @@ function launch(e) {
 
     /* ★ 手动重启（在设置里改完路径）时别走下面那段「意外退出自动重启」——
        我们马上会自己用新路径 launch，两边同时拉会打架。 */
-    if (e.manualStop) { e.manualStop = false; return; }
+    if (e.manualStop) {
+      e.manualStop = false;
+      /* ★ 2026-10-21：卸载途中又点了「加载」→ 旧进程这时候才真的退出，
+         把当时记下的那一次补拉起来（见 launch 开头）。不补的话引擎就永远停在那儿了。 */
+      if (relaunch && !quitting) launch(e);
+      return;
+    }
 
     /* 意外退出就自动拉起来（最多 3 次）——
        在用户眼里这是「AI 突然不动了」，不该让他自己去重启软件。
@@ -757,7 +787,7 @@ function probe(e, t0) {
   if (!e.probeStart) e.probeStart = started;
   console.log('[engine:' + e.key + '] 模型加载中（首次约 10~20 秒）...');
   const req = { moves: [], initialStones: [], rules: 'chinese', komi: 7.5, size: 19, maxVisits: 2 };
-  if (e.key === 'play') req.profile = PLAY_DEFAULT_PROFILE;   // human 权重必须带档位
+  if (e.key === 'play') req.profile = PLAY_DEFAULT_PROFILE;
   analyze(e, req)
     .then(res => {
       if (!res || res.error || !res.root) {
@@ -887,9 +917,14 @@ function stopEngine(e, cb) {
   let done = false;
   const fin = () => { if (done) return; done = true; cb(); };
   p.once('exit', fin);
-  /* KataGo 走优雅退出；llama-server 没有 stdin 协议 —— 直接 kill。 */
+  /* KataGo 走优雅退出；llama-server 没有 stdin 协议 —— 直接 kill。
+     ⚠️ 别写 `{"action":"quit"}`：KataGo 的 analysis 引擎**没有 quit 这个动作**
+     （实测它会回一句 'action' field must be 'query_version' or 'query_models'
+     or 'clear_cache' or 'terminate' or 'terminate_all'，然后继续待着）——
+     那句话只会往 engine-logs 里塞一行误导人的警告，真正让它退出的还是下面 1.5 秒后的 kill。
+     现在改成关 stdin（EOF）：引擎读到 EOF 会自己退；万一不退，kill 兜底。 */
   if (e.kind === 'katago') {
-    try { p.stdin.write('{"id":"__quit","action":"quit"}\n'); } catch (err) { /* 忽略 */ }
+    try { p.stdin.end(); } catch (err) { /* 已经关了就算了 */ }
   }
   setTimeout(() => {
     try { p.kill(); } catch (err) { /* 忽略 */ }
@@ -1144,18 +1179,37 @@ function onLine(e, line) {
 
   /* ★ 复盘（多回合）：逐条累积，**收齐再回**。
      原来每条 isDuringSearch===false 都会 resolve → 第一条就把 promise 结掉，
-     后面 N-1 条全丢（这是多回合请求最隐蔽的坑）。 */
+     后面 N-1 条全丢（这是多回合请求最隐蔽的坑）。
+
+     ★★ 2026-10-21：只有**终局报告**（payload.final，即 isDuringSearch===false）才进累积。
+     中途报告（reportDuringSearchEvery=1 之后每秒一条）**只喂进度条**。
+     不加这个判断会怎样：一开中途报告，rec.turns 每秒 +1，
+     `turns.length >= expect` 立刻成立 → 整个复盘在第二秒就以一堆半成品"完成"了。 */
   if (rec.collect && typeof msg.turnNumber === 'number') {
-    rec.turns.push(payload);
+    armReviewStall(e, rec);              // 有消息 = 引擎还活着
+    if (!payload.final) {
+      if (e.lastId === msg.id) {
+        send('engine:review-progress', {
+          done: rec.turns.length, total: rec.expect,
+          at: msg.turnNumber,
+          visits: (payload.root && payload.root.visits) || 0,
+          maxVisits: rec.maxVisits || 0,
+          live: true,
+        });
+      }
+      return;
+    }
+    /* 同一回合只留一条（分块请求 / 引擎重发时防重；防重比「长度够不够」更可靠） */
+    const dup = rec.turns.findIndex(x => x.turn === msg.turnNumber);
+    if (dup >= 0) rec.turns[dup] = payload; else rec.turns.push(payload);
     if (e.lastId === msg.id) {
-      send('engine:review-progress', { done: rec.turns.length, total: rec.expect });
+      send('engine:review-progress', {
+        done: rec.turns.length, total: rec.expect,
+        at: msg.turnNumber, visits: rec.maxVisits || 0, maxVisits: rec.maxVisits || 0,
+        live: false,
+      });
     }
-    if (rec.turns.length >= rec.expect) {
-      clearTimeout(rec.timer); rec.done = true; e.pending.delete(msg.id);
-      if (e.lastId === msg.id) e.lastId = null;
-      rec.turns.sort((a, b) => a.turn - b.turn);
-      rec.resolve({ turns: rec.turns });
-    }
+    if (rec.turns.length >= rec.expect) settleCollect(e, rec.id, rec, {});
     return;
   }
 
@@ -1216,7 +1270,18 @@ function analyze(e, req) {
     const turns = (Array.isArray(req.analyzeTurns) && req.analyzeTurns.length)
       ? req.analyzeTurns.slice()
       : [(req.moves || []).length];
-    const collect = turns.length > 1;      // 多回合 = 收集模式，收齐再回（见 onLine）
+    /* ★★ 判据是「调用方是不是走整盘逐手通路」，**不是** turns.length > 1（2026-10-22 实测踩到）。
+       原来写 `turns.length > 1`，于是分块复盘**只剩 1 个回合的最后一块**（比如 110 手的棋谱，
+       0..109 都算完了，最后一块是 [110]）被当成「单局面分析」：
+         · 不走 collect 累积，`rec.resolve(payload)` 回的是**一个 payload 对象**、
+           不是 `{turns:[...]}`；
+         · 前端 `for (const t of (res && res.turns) || [])` 一条都收不到 →
+           整盘永远停在「已算完 110 / 111 手」；
+         · 而且这块**不报错、不算卡住**，所以面板说的是「这次没算完」——
+           用户点「接着算」发的还是同一个 [110]，同一条路，永远补不上（用户报的正是这个）。
+       判据改成「显式传了 analyzeTurns」= 整盘逐手通路（只有 renderer 的复盘 / 全盘讲解用）。
+       普通单局面分析（当前局面胜率、候选点、数子）不传这个字段，行为一点没变。 */
+    const collect = Array.isArray(req.analyzeTurns) && req.analyzeTurns.length > 0;
 
     const q = {
       id,
@@ -1230,8 +1295,13 @@ function analyze(e, req) {
       maxVisits: req.maxVisits || 400,
       /* ⚠️ 合法范围 0.001~1000000（实测传 0 引擎直接报
          "Must be number of seconds from 0.001 to 1000000.0"）。
-         复盘不要中途报告 —— 给个极大值等于不推，否则 N 个回合会产生 N×4 条消息。 */
-      reportDuringSearchEvery: collect ? 1000000 : 0.25,
+         ★★ 2026-10-21 改：复盘**要**中途报告（原来是 1000000 = 根本不推）。
+         为什么改：每手在重权重上要 15~20 秒，而进度条只在**整手算完**时才跳一格 ——
+         用户看到的就是「进度条卡住不动」。现在每手每秒推一条，界面拿它画
+         「本手已经搜到 x/500」的细进度（见 renderer 的 showReviewProgress）。
+         ⚠️ 代价必须记住：中途报告也是 `moveInfos` 消息，onLine 里必须用
+         `payload.final` 把它们和终局报告分开，否则 rec.turns 会被灌满、提前 resolve。 */
+      reportDuringSearchEvery: collect ? 1.0 : 0.25,
       includeOwnership: !!req.includeOwnership,
       includePolicy: !!req.includePolicy,      // 拟人落子要用 policy（人类先验）来抽样
     };
@@ -1307,29 +1377,74 @@ function analyze(e, req) {
     if (e.lastId) q.terminateId = e.lastId;    // 新局面前先掐掉旧查询
     e.lastId = id;
 
-    /* 超时兜底：复盘按回合数放宽（实测约 0.5~0.7 秒/手），普通分析固定 90 秒 */
-    const budget = collect ? (60000 + turns.length * 6000) : 90000;
-    const timer = setTimeout(() => {
+    /* ★★ 超时兜底（2026-10-21 重做）。
+       原来是「复盘总预算 = 60 秒 + 6 秒/手」，理由写的是「实测约 0.5~0.7 秒/手」。
+       那个实测是在小权重（b18c384）上得到的；换成 b40c768 这类重权重后，
+       本机实测只有 **31 次评估/秒**，500 次搜索要 16~20 秒一手 —— 294 手要 80 分钟，
+       而预算只给 30 分钟，到点就把整盘砍成「数据不全」。用户看到的就是
+       「进度条不动」然后突然弹出一份残缺报告。
+
+       现在换成「**卡住**才算超时」：
+         · 只要引擎还在出消息（每手都推中途报告，见 reportDuringSearchEvery），就一直算；
+         · 连续 stallMs 毫无音讯 → 认定卡死，把已算到的交回去（不比原来更差）；
+         · 另加一个绝对上限，防止异常情况下永久占着分析引擎。
+       普通分析（单局面）仍然是固定 90 秒 —— 它没有中途报告之外的心跳。 */
+    const REV_STALL = 180000, REV_CAP = 6 * 3600 * 1000;
+    const budget = 90000;
+    const timer = collect ? null : setTimeout(() => {
       const rec = e.pending.get(id);
       if (rec && !rec.done) {
         rec.done = true; e.pending.delete(id);
-        resolve(rec.collect
-          ? { turns: rec.turns, incomplete: true }        // 复盘超时：把已收到的交出去
-          : (rec.best || { error: '分析超时' }));
+        resolve(rec.best || { error: '分析超时' });
       }
     }, budget);
 
-    e.pending.set(id, {
-      resolve, best: null, timer, done: false,
+    const rec = {
+      id, resolve, best: null, timer, done: false,
       /* 复盘用：收齐 expect 条回合报告再一次性回给前端 */
       collect, expect: turns.length, turns: [], moveList: req.moves || [],
-    });
+      maxVisits: q.maxVisits,
+      stallMs: REV_STALL, capTimer: null,
+    };
+    e.pending.set(id, rec);
+    if (collect) {
+      /* 绝对上限（正常情况下永远用不到，但要有个兜底） */
+      rec.capTimer = setTimeout(() => {
+        const r = e.pending.get(id);
+        if (r && !r.done) settleCollect(e, id, r, { incomplete: true, capped: true });
+      }, REV_CAP);
+      armReviewStall(e, rec);
+    }
     try { e.proc.stdin.write(JSON.stringify(q) + '\n'); }
     catch (err) {
-      clearTimeout(timer); e.pending.delete(id);
+      clearTimeout(timer);
+      if (rec.capTimer) clearTimeout(rec.capTimer);
+      e.pending.delete(id);
       resolve({ error: '写入引擎失败：' + err.message });
     }
   });
+}
+
+/* 复盘的心跳计时器：每收到一条消息就重置一次（见 onLine）。
+   连续 stallMs 一条都没有 → 认定引擎卡死，把已经算完的手交回去。 */
+function armReviewStall(e, rec) {
+  clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => {
+    if (!rec.done) settleCollect(e, rec.id, rec, { incomplete: true, stalled: true });
+  }, rec.stallMs);
+}
+
+/* 结束一次「整盘逐手」请求（正常收齐 / 卡住 / 用户停止 都走这里）。
+   唯一出口，免得三种收尾各自处置 pending、lastId、两个定时器时漏一处。 */
+function settleCollect(e, id, rec, extra) {
+  if (rec.done) return;
+  rec.done = true;
+  clearTimeout(rec.timer);
+  if (rec.capTimer) clearTimeout(rec.capTimer);
+  e.pending.delete(id);
+  if (e.lastId === id) e.lastId = null;
+  rec.turns.sort((a, b) => a.turn - b.turn);
+  rec.resolve(Object.assign({ turns: rec.turns.slice() }, extra || {}));
 }
 
 function cancel(e) {
@@ -1337,6 +1452,33 @@ function cancel(e) {
   const id = e.lastId;
   const rec = e.pending.get(id);
   if (rec && !rec.done) {
+    /* ★★ 整盘复盘被**用户停止**（2026-10-21 新增「停止」按钮）：
+       ① 已经算完的那些手要交回去 —— 原来这里直接 resolve({cancelled:true})，
+          前端拿不到任何 turn，只能整盘作废，几十分钟白算；
+       ② 必须真的让引擎停下 —— 原来只在前端 resolve，引擎根本没收到任何指令，
+          还会闷头把剩下几百手算完、白烧 GPU。
+          ⚠️ 终止的格式是 `{"action":"terminate","terminateId":"<要停的查询 id>"}`。
+          踩过一次：写成 `{"id":..., "action":"terminate"}` → 引擎回
+          「Requests for a terminate action must have a string "terminateId" field」，
+          也就是没停成（测试从「停止后中间文件又多了 7 手」看出来）。 */
+    if (rec.collect) {
+      try {
+        /* ★★ terminate **自己也必须有 id**（2026-10-21 用户实测踩出）。
+           KataGo 对每一条请求都先校验 `id`，缺了就直接回
+           `Request must have a string "id" field` 并**把这条 terminate 扔掉**：
+           前端以为停了，引擎还在闷头把这一块算完（十几分钟 GPU 白烧），
+           而且下一块请求要排队等它 —— 用户看到的正是「只算了前 4 / 294 手」。
+           证据：engine-logs/20261021-*.log 里每次点停止都留一行上面那句 error。
+           带个不重复的 id（命中不了 e.pending 里的任何记录，回包会被 onLine 忽略）。 */
+        e.proc.stdin.write(JSON.stringify({
+          id: id + '#term', action: 'terminate', terminateId: id,
+        }) + '\n');
+      }
+      catch (err) { /* 写不进去也没关系：本地已经把 promise 结掉了 */ }
+      settleCollect(e, id, rec, { aborted: true });
+      e.lastId = null;
+      return { ok: true };
+    }
     rec.done = true; e.pending.delete(id); clearTimeout(rec.timer);
     /* ★ 必须打上 cancelled 标记：这时候 rec.best 是**搜索中途的半成品**
        （visits 很少、胜率还没收敛）。前端若把它当正常结果上屏，
@@ -1652,6 +1794,10 @@ ipcMain.handle('records:rename', (_e, oldName, newName) => {
       const co = coachPath(oldName), cn = coachPath(newName);
       if (fs.existsSync(co)) fs.renameSync(co, cn);
     } catch (e2) { }
+    try {                                       // 复盘中间结果也跟着改名（没算过就跳过）
+      const po = reviewPartPath(oldName), pn = reviewPartPath(newName);
+      if (fs.existsSync(po)) fs.renameSync(po, pn);
+    } catch (e2) { }
     return { ok: true, name: to };
   } catch (e) { return { error: String((e && e.message) || e) }; }
 });
@@ -1661,9 +1807,18 @@ ipcMain.handle('records:delete', async (_e, name) => {
     await shell.trashItem(path.join(RECORDS_DIR, safeRecName(name)));   // 进回收站，可恢复
     try { await shell.trashItem(reviewPath(name)); } catch (e2) { /* 没复盘过就跳过 */ }
     try { await shell.trashItem(coachPath(name)); } catch (e2) { /* 没讲过就跳过 */ }
+    try { await shell.trashItem(reviewPartPath(name)); } catch (e2) { /* 没有中间结果就跳过 */ }
     return { ok: true };
   } catch (e) { return { error: String((e && e.message) || e) }; }
 });
+
+/* 复盘**中间结果**的存放路径：<棋谱名>.review.part.json。
+   用途：① 断点续算 —— 整盘复盘在这台机上可能要一小时，中途停止/关窗口/引擎崩了，
+   下次只补没算完的那些手，而不是从第 0 手重来；② 分块请求的落盘锚点。
+   签名（手顺 + 搜索量 + 权重）对不上就整份作废 —— 换了任何一项，旧数都不算数。 */
+function reviewPartPath(name) {
+  return path.join(RECORDS_DIR, safeRecName(name) + '.review.part.json');
+}
 
 /* 复盘结果（JSON）：存成 <棋谱名>.review.json，读不到就返回 null */
 ipcMain.handle('records:saveReview', (_e, name, json) => {
@@ -1676,6 +1831,27 @@ ipcMain.handle('records:readReview', (_e, name) => {
     const rp = reviewPath(name);
     return fs.existsSync(rp) ? { text: fs.readFileSync(rp, 'utf8') } : null;
   } catch (e) { return null; }
+});
+
+/* 复盘中间结果：读 / 写 / 删（整盘算完后就不再需要，见 renderer 的 runReview） */
+ipcMain.handle('records:saveReviewPart', (_e, name, json) => {
+  try { fs.writeFileSync(reviewPartPath(name), String(json), 'utf8'); return { ok: true }; }
+  catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+ipcMain.handle('records:readReviewPart', (_e, name) => {
+  try {
+    const pp = reviewPartPath(name);
+    return fs.existsSync(pp) ? { text: fs.readFileSync(pp, 'utf8') } : null;
+  } catch (e) { return null; }
+});
+
+ipcMain.handle('records:deleteReviewPart', async (_e, name) => {
+  try {
+    const pp = reviewPartPath(name);
+    if (fs.existsSync(pp)) await shell.trashItem(pp);
+    return { ok: true };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
 });
 
 /* 逐手讲解（JSON）：存成 <棋谱名>.coach.json。读不到返回 null。 */

@@ -18,12 +18,18 @@
   P('===== 0 元素与文案 =====');
   ok('0a 讲解卡片里的勾选项已删除', !!el('pick-show-hints'), false);
   ok('0b 有 pick-context 提示条', !!el('pick-context'), true);
-  ok('0c 按钮文案', el('btn-pick') ? el('btn-pick').textContent : '(无)', '生成讲解');
-  var sub = document.querySelector('.card-title-sub');
-  var titleTxt = sub ? sub.parentNode.textContent : '';
+  ok('0c 按钮文案', el('btn-pick') ? el('btn-pick').textContent : '(无)', '推荐落点讲解');
+  /* ★ 2026-10-24：三个按钮共用一块正文区 —— 推荐落点这一页没有自己的小标题了，
+     标题换成卡片标题（#coach-title），「谁选点谁讲」写在正文第一行（#pick-body .src）。 */
+  state.coach.view = 'pick'; renderCoachPanels(true);
+  var titleTxt = el('coach-title') ? el('coach-title').textContent : '';
   P('  卡片标题: ' + titleTxt);
-  ok('0d 标题以「推荐落点讲解」开头', titleTxt.indexOf('推荐落点讲解'), 0);
-  ok('0e 标题里点明谁选点谁讲（含 KataGo）', titleTxt.indexOf('KataGo') >= 0, true);
+  ok('0d 标题是「推荐落点讲解」', titleTxt, '推荐落点讲解');
+  /* ★ 2026-10-24：正文那句「点由 KataGo 定 · 讲解由 LoGos 写 · …」已按用户要求删掉，
+     「谁选点谁讲」只剩按钮 tooltip（和软件内帮助）里写着 —— 就查它。 */
+  var tip = el('btn-pick') ? (el('btn-pick').title || '') : '';
+  ok('0e 按钮提示里点明谁选点谁讲（含 KataGo）', tip.indexOf('KataGo') >= 0 && tip.indexOf('LoGos') >= 0, true);
+  state.coach.view = 'explain'; renderCoachPanels(true);
 
   P('');
   P('===== 1 开关只有「显示」菜单那一个 =====');

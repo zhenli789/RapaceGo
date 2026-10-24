@@ -62,8 +62,33 @@ type pre-selected; pressing Cancel changes nothing. Tick **"continue from this p
 dialog to switch mode while keeping the current board and move history.
 
 **Numbers** — winrate bar & score, recommended moves, move previews, ownership map
-(fog or blocks), winrate/score graph, per-move loss list, and a **review report**
-(black/white split: average loss, blunder counts, agreement with AI's top choice).
+(fog or blocks), winrate/score graph (it **follows the branch you are on** — switching branches
+redraws it, and the title tags `· N branches` or `· not reviewed`), per-move loss list, and a **review report**
+(black/white split: average loss, blunder counts, agreement with AI's top choice). The review
+progress bar keeps moving (the engine reports its in-hand progress every second) and shows a
+**measured** "seconds per move / time left" for this machine. You can **stop at any time** —
+moves already computed are kept, the dialog switches to "review paused" with a **Resume**
+button right there (it only computes the remainder), and a partial
+run never overwrites the previous saved report.
+**One report per branch** — every branch lives in the **same** `<record>.review.json`.
+**Choose the scope**: the "AI review" dialog (when the record has branches) offers three buttons —
+**this line** / **the N not reviewed yet** / **all M branches**. Multi-line runs show "branch N / M"
+in the progress window and **reuse the shared prefix** instead of recomputing it (two lines that
+diverge at move 120 cost only that one extra move for the second line).
+**Switching to an unreviewed branch asks first**: the dialog says the line has not been reviewed,
+**where it diverges** and that the shared opening will be reused; buttons "review this branch" /
+"not now". It asks once per line, and "don't ask again" is remembered.
+**Exported records carry no analysis report**: "export" writes the game itself (moves, players, date,
+plus the per-move **commentary**). The numbers gathered while playing are **not** saved — their visit
+count per move ranges from a few to several hundred, so win rates and losses are not comparable; **run
+"AI review" on the record in the library** for one uniform pass. **Per-branch commentary is still written
+per node**: every move on every branch carries its own analysis in `C[]`, so switching branches shows
+that branch's commentary instead of only the last one's.
+**One record per game**: the first export creates `black vs white-<time>.sgf`; pressing "export" again
+**overwrites that same file** instead of piling up `…-2055.sgf` / `…-2058.sgf` copies. Exporting a record
+you opened from the library writes back into it when the file was produced by this app; a foreign record
+(another program, a downloaded classic) is saved as a copy instead — rebuilding it would drop its event /
+date / title properties.
 Per-move numbers appear **only once the search has settled** (a "…" placeholder shows
 while it is still computing), so a number never changes after you have seen it.
 
@@ -82,11 +107,25 @@ recommended moves stop appearing, or the "computing… N" line above the board f
 press it: it releases the stuck analysis, re-queues it, re-checks the engine, and
 restarts the engine if it is actually dead.
 
-**Explanation** — three panels, all powered by the local LoGos model:
+**Explanation** — one card in the left column holds both panels: "explain this move" on top,
+"explain candidates" below it behind a dashed divider, sharing a single scrollbar. The three
+actions are buttons at the **bottom of the card**: whole-game / this move / candidates.
 - **Explain this move** — verdict from KataGo, reasoning from LoGos. Stored per move.
-- **Explain candidates** — several recommended points, each explained.
+  The "what did the AI want to play here" point **comes from the saved review when there is
+  one** (the same number the whole-game pass uses), and only falls back to a live KataGo
+  analysis (500 visits/move) when it isn't.
+- **Explain candidates** — several recommended points, each explained. **Stored per position**: step to another move and this page switches to that move's (it says so when there is none), so it never keeps showing the previous move's text; explaining a position once means a second click just shows the result. Works while replaying records too.
 - **Explain whole game** — narrates every move of an SGF once; **the result is saved
-  next to the SGF**, so reopening it shows the commentary instantly.
+  next to the SGF**, so reopening it shows the commentary instantly (a record that already
+  has commentary opens straight into the whole-game page). When it finishes, the whole game
+  is laid out as one scrollable page (click a move to jump to it; the "whole game / back"
+  link by the title switches at any time). **If the game has already been reviewed, the
+  KataGo pass reuses that review instead of recomputing it** — even when the visit count
+  differs (old review files are 100 visits/move, the default is 500; that mismatch alone
+  used to force a full recompute). The whole game then uses the review's own visit count,
+  so nothing mixes coarse and fine numbers. **Commentary is stored per branch**: each line
+  keeps its own, switching branches swaps it instantly, an un-narrated branch says so, and
+  a run interrupted by a branch switch saves what it finished to the original line.
 
 ![Whole-game commentary](docs/screenshots/batch-progress.png)
 
