@@ -33,7 +33,11 @@ const settings = {
   handicap: 0,
   komi: 7.5,
   clock: 'none',     // 计时档位：none / blitz / rapid / slow / pro / world
-  visits: 500,       // 分析搜索量：每个局面让引擎思考多少步（越大越准、越慢）。见 VISIT_OPTS
+  /* 分析搜索量（底栏「计算深度」）。★ 2026-10-26 一度降到 300，**当天又改回 500**（用户定）：
+     300 步在 19 路习题上选点明显更飘 —— 而习题的候选点本来就挤在一起、差几百步就换手。
+     默认仍取 500（= 老的「标准」档），嫌慢/嫌不准都在底栏自己调，改档位是热切换。
+     超时不再按 500 拍死：`analyzeTimeoutMs()` 会随棋盘和搜索量放大，慢不会误判。 */
+  visits: 500,       // 见 VISIT_OPTS / analyzeTimeoutMs
   /* AI 复盘的搜索量 —— ★ 2026-10-04 用户要求「点 AI 复盘后手动设置，默认 500」：
      刻意**不跟随**底栏的「计算深度」——复盘是整盘逐手算，慢得多，
      值不值得调深应当由用户在点的那一刻决定（会弹面板让他选）。 */
@@ -60,6 +64,11 @@ const settings = {
   taicolor: 'w',
   tframe: 'auto',      // 死活框架：'auto' 自动框 / 'off' 不加框架
   tdist: 4,            // 框架距离：框边比题目棋子最外沿再多留几路（角上典型小题 → 约 9×9）
+  /* ★ 2026-10-27：引擎的分析范围 —— 'on' = **把真实棋盘裁成框架那么大**发给引擎
+     （画面仍是全盘，坐标由主进程还原），'off' = 老行为（整盘棋盘 + allowMoves 白名单）。
+     开关存在的唯一目的是 A/B 对照（裁切不会让选点变准，只让它更快、形势雾不再铺满全盘，
+     依据见 `tsCropRect` 上面那段实测）。 */
+  tcrop: 'on',
 };
 
 /* ★★ 习题练习的**规则与贴目是固定值**（2026-10-14 用户提出「是不是不需要规则和贴目」）。
@@ -902,6 +911,49 @@ canvas.addEventListener('mouseleave', () => {
 
 const $ = id => document.getElementById(id);
 
+/* 右侧胜率卡「现在该画哪个局面」的数字。null = 这个局面还没有任何读数。
+   ★★ 2026-10-28 新增（用户报「回看前面已手数时，右侧胜率看板不跟着变」）。
+   根因：右侧那两个数以前**只认 `state.lastEval`**（最近一次上屏的那份），
+   而回看要靠引擎把那个局面**重算一遍**才有新报文 —— 19 路整盘一次三十秒，
+   这段期间界面上一直是「最新一手」的数字，看着就是「不同步」。
+   可那些数其实早就有了：走势曲线用的 `history` / `leads`（下标 = 第几手之后的局面，
+   黑方视角）就是每一手的读数，`state.anaAt` 还存着每个完整快照。
+   优先级（从准到粗）：
+     ① `history[at]` —— 有搜索量门槛，和曲线、手数栏的涨跌**同一份数据**，最该优先；
+     ② `anaAt[at]`  —— 那个局面的快照，可能只攒了很少搜索量，但确实是"这一手"的；
+     ③ `lastEval`   —— 兜底（回看时短暂沿用最新一手，总比空着好）。
+   ⚠️ 别把 ② 放到 ① 前面：anaAt 也会收中间报告（visits 很低），
+      按它画会让胜率条在回看时抖得比实际更厉害。 */
+function evalForView() {
+  const at = state.viewAt;
+  if (typeof state.history[at] === 'number') {
+    return { blackWin: state.history[at], lead: typeof state.leads[at] === 'number' ? state.leads[at] : 0 };
+  }
+  const snap = state.anaAt && state.anaAt[at];
+  if (snap && typeof snap.blackWin === 'number') return { blackWin: snap.blackWin, lead: snap.lead };
+  /* ③ 刚上屏的那份 —— 必须**确实是这个局面**（`lastEval.at`，2026-10-28 加的字段）。
+     不记手号的话，回看时 applyAnalysis 会把 lastEval 改成"回看的那一手"，
+     等回到最新一手就显示错局面的数字。 */
+  if (state.lastEval && state.lastEval.at === at) return state.lastEval;
+  /* ④ 最新一手：哪怕 lastEval 属于上一手也先用着 —— 落子后到第一份中间报告只有零点几秒，
+     这段时间把条子清空会"闪"。而**回看**时绝不这样兜：拿别的手的数字冒充会误导，
+     宁可写「计算中…」（那才是实话：这一手确实还没算过）。 */
+  if (at === state.moves.length) return state.lastEval;
+  return null;
+}
+
+/* 贴目该怎么写。
+   ★ 2026-10-28：用户问「点开始解题后，右侧要较长时间才显示贴目」——
+   那段时间它一直写着 `0`，看着像"这题不贴目"，其实只是**探针还在折**。
+   硬性的 0 只在**摆题阶段**才对（那时 tsKomi() 恒 0 = 探针口径，见 tsKomi）。
+   解题阶段配平值没到手时写「配平中…」，到手后写数字。 */
+function komiText() {
+  if (!tsOn()) return String(settings.komi);
+  const t = state.tsumego;
+  if (t && t.phase === 'solve' && !(t.bal && Number.isFinite(t.bal.komi))) return '配平中…';
+  return String(tsKomi());
+}
+
 function syncUI() {
   const total = state.moves.length;
   $('slider').max = total;
@@ -912,12 +964,14 @@ function syncUI() {
   const sizeTxt = N === 19 ? '' : `${N} 路 · `;
   /* ★ 习题练习里这两个数要按**实际发给引擎的值**显示（2026-10-14）：
      · 「让 N 子」——习题模式下的摆子是**题目初始局面**，不是让子，写成"让 13 子"会误导；
-     · 「贴目」——习题模式固定 0（TS_KOMI），显示 settings.komi 就会跟实际不符。
+     · 「贴目」——习题模式用的是**配平贴目**（2026-10-25 起；原来是固定 0），
+       显示 settings.komi 就会跟实际不符。含义放在信息栏的 title 里，这里只给数字 ——
+       顶栏只有一行（纪律 7）。
      状态栏是用户唯一能看到这两个数的地方，不能跟引擎实际收到的不一致。 */
   const tsMode = tsOn();
   const hcTxt = R.seats ? '座子 · '
     : (state.setup.length && !tsMode ? `让 ${state.setup.length} 子 · ` : '');
-  const koTxt = `贴目 ${tsMode ? TS_KOMI : settings.komi}`;
+  const koTxt = `贴目 ${komiText()}`;
 
   /* 两个引擎各自的就绪状态 —— 分析引擎挂了胜率不出来，对弈引擎挂了 AI 不落子，
      必须分开提示，否则用户只会看到「AI 不动」而不知道卡在哪。
@@ -952,12 +1006,15 @@ function syncUI() {
      它自己会挡掉重复调用（同一手不重画），所以放 syncUI 里开销很小。 */
   renderCoachPanels();
 
-  /* ★ 引擎还没就绪（或还没算出第一个局面）→ 胜率条两头不显示「黑 —」「白 —」，
-     改一句「AI 准备中」（用户要求）：否则刚启动那几秒看着像"算完了、但两边都是横杠"。
-     `lastEval` 有值 = 至少算过一次，就不再回退到这句话。
-     ⚠️ 反过来（就绪了 / 又有数据了）也要**照着 lastEval 把数字画回来** ——
-        否则「AI 准备中」会一直残留：改这几个文本的只有 applyAnalysis，
-        而局面没变时分析是**不会重跑**的（shownAt 已经等于 viewAt）。 */
+  /* ★ 引擎还没就绪（或还没算出**这个局面**）→ 胜率条两头不显示「黑 —」「白 —」，
+     改一句「计算中」（用户要求）：否则刚启动那几秒看着像"算完了、但两边都是横杠"。
+     ⚠️ 反过来（就绪了 / 又有数据了）也要**照着数字把它画回来** ——
+        否则「计算中」会一直残留：改这几个文本的只有 applyAnalysis，
+        而局面没变时分析是**不会重跑**的（shownAt 已经等于 viewAt）。
+     ★★ 2026-10-28：判据从 `state.lastEval` 换成 `evalForView()`，并且修掉一个文案 bug ——
+        原来引擎**已经就绪**、只是这个局面还没算出来时，下面那句会落到
+        「点顶栏的 KataGo 加载」，用户报的就是「明明已经加载了，右侧却说未加载」。 */
+  const ev = state.noGame ? null : evalForView();
   if (state.noGame) {
     /* ★ 未开局：胜率条停在中性（五五开、两头都是 0.0 目）。
        之所以「不动」，是因为这个状态下**根本不发分析请求**（见 scheduleAnalysis）——
@@ -967,18 +1024,24 @@ function syncUI() {
     $('eval-wr-w').textContent = '白 50.0%';
     $('eval-lead').textContent = '0.0 目';
     $('eval-lead-w').textContent = '0.0 目';
-  } else if (!engineReady || !state.lastEval) {
+  } else if (!engineReady || !ev) {
     /* ★ 用户要求：胜率条上**不再显示「正在加载」**（引擎状态挪到顶栏灯上了）。
-       这里换成中性的一句，顺便告诉用户该干什么。 */
+       这里换成中性的一句，顺便告诉用户该干什么。
+       ⚠️ 三种"没数字"要分开说：没加载 / 已暂停 / 就绪但还没算完 —— 混成一句会误导。 */
     const st = engStates.analyze;
-    $('eval-wr').textContent = engineNote ? '引擎异常' : (st === 'loading' ? '加载中…' : '未分析');
+    $('eval-wr').textContent = engineNote ? '引擎异常' : (st === 'loading' ? '加载中…' : '计算中…');
     $('eval-wr-w').textContent = '';
+    /* ★ 2026-10-28（方案 A）：抢跑后 AI 应手会让路到配平值到手，这期间画面几乎不动 ——
+       这里写明"在等什么"，否则看着像卡死。判据同 balWaiting，别另写一套。 */
     $('eval-lead').textContent = engineNote ? ''
       : (st === 'loading' ? '模型正在读入显存…'
-        : (st === 'paused' ? '已暂停（顶栏可恢复）' : '点顶栏的 KataGo 加载'));
+        : (st === 'paused' ? '已暂停（顶栏可恢复）'
+          : (st === 'ready'
+            ? ((tsOn() && balWaiting()) ? '正在等配平贴目 · 算完就应手' : '引擎已就绪 · 正在算这个局面')
+            : '点顶栏的 KataGo 加载')));
     $('eval-lead-w').textContent = '';
   } else {
-    const bw = state.lastEval.blackWin, ld = state.lastEval.lead;
+    const bw = ev.blackWin, ld = ev.lead;
     const sg = v => (v < 0 ? '\u2212' : '+') + Math.abs(v).toFixed(1);
     $('bar-black').style.width = (bw * 100).toFixed(1) + '%';
     $('eval-wr').textContent = '黑 ' + (bw * 100).toFixed(1) + '%';
@@ -1047,16 +1110,33 @@ function syncUI() {
   if (state.noGame) {
     for (const id of ['info-rules', 'info-clock', 'info-hc', 'info-komi']) $(id).textContent = '未定';
   } else {
-    /* ★ 习题练习：这三项要按"实际发给引擎的值"显示（2026-10-14）。
+    /* ★ 习题练习：这三项要按"实际发给引擎的值"显示（2026-10-14；贴目 2026-10-25 改配平）。
        · 规则：固定 TS_RULE（面板里那一行也藏了）
-       · 贴目：固定 TS_KOMI —— 显示 settings.komi 就与实际不符
+       · 贴目：**配平贴目**（tsKomi）—— 不是棋规贴目，是把"题目本身的存量优势"折算给白方，
+         使双方初始胜率落在 50% 附近。含义写进 title，免得读成"这题要贴 18 目"。
        · 让子：习题模式下的摆子是**题目初始局面**，不是让子 ——
          原来这里写出「让 13 子」（截图上看到的），纯属误导，改成「题目摆子 N 子」。
        （同样的口径在底栏状态行也有一份，见 syncUI 里 hcTxt / koTxt 那段。） */
     const tsMode = tsOn();
+    const kNow = tsMode ? tsKomi() : settings.komi;
+    const bal = tsMode ? state.tsumego.bal : null;
     $('info-rules').textContent = short((RULES[tsMode ? TS_RULE : settings.rules] || RULES.chinese).label);
     $('info-clock').textContent = (CLOCK_PRESETS[settings.clock] || CLOCK_PRESETS.none).label;
-    $('info-komi').textContent = String(tsMode ? TS_KOMI : settings.komi);
+    $('info-komi').textContent = komiText();
+    /* ★ 2026-10-27：配平值现在是「第一级 + 最多 3 轮校正」的结果。
+       ① 说清 lead0 是**哪个口径**的（裁切模式下它来自框内那张小盘，数值天然比整盘小）；
+       ② 说清校正了几轮 —— 用户看到贴目从 45.5 变成 38.5 会以为在乱跳，这一句能解释。 */
+    const cropNow = tsMode ? tsCropRect() : null;
+    $('info-komi').title = !tsMode ? ''
+      : (bal && kNow !== TS_KOMI)
+        ? '习题配平贴目：本题初始局面黑方已领先 ' + bal.lead0.toFixed(1)
+          + ' 目' + (cropNow ? '（按框内 ' + cropNow.w + '×' + cropNow.h + ' 的裁切棋盘测得）' : '')
+          + '，折算给白方 ' + kNow + ' 目，让双方初始胜率尽量靠到 50%。'
+          + (bal.fixN ? '（已按实测目差校正 ' + bal.fixN + ' 轮）' : '')
+          + (bal.capped ? '（已按上限截断）' : '')
+          + ' 这不是棋规贴目 —— 死活题的目差动辄几十目，所以数值会很大；'
+          + '它只影响引擎怎么判断「哪一手更值」。'
+        : '习题模式的贴目：还没配平（探针没跑或没给出目差）时固定 0 目。';
     $('info-hc').textContent = tsMode
       ? (state.setup.length ? '题目摆子 ' + state.setup.length + ' 子' : '还没摆')
       : (R.seats ? '座子 4 子'
@@ -1274,11 +1354,17 @@ async function runScore(silent) {
       ms.push([turn === 'b' ? 'B' : 'W', 'pass']);
     }
 
+    /* ★★ 习题模式的口径必须和分析一致（2026-10-25 修的真隐患）。
+       原来这里写死 `settings.komi` / `settings.rules`，而分析走 `tsAnalyzeExtras()`
+       的「中国规则 · 固定 0 目 / 配平贴目」—— 于是同一个局面会出现
+       「胜率条说黑 96%，点『数子』说白胜 3 目」，用户只会当成新 bug。
+       习题不导出、不影响别处，数子直接跟着 `tsKomi()` 走。 */
+    const tsScore = tsOn();
     const res = await window.api.analyze({
       initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
       moves: ms,
-      rules: (RULES[settings.rules] || RULES.chinese).kata,
-      komi: settings.komi,
+      rules: (RULES[tsScore ? TS_RULE : settings.rules] || RULES.chinese).kata,
+      komi: tsScore ? tsKomi() : settings.komi,
       size: N,
       maxVisits: 2000,
     });
@@ -1301,7 +1387,11 @@ async function runScore(silent) {
     state.result = {
       winner: blackLead > 0 ? 'b' : 'w',
       lead: Math.abs(blackLead),
-      unit: SCORE_UNIT[settings.rules] || '子',
+      unit: SCORE_UNIT[tsScore ? TS_RULE : settings.rules] || '子',
+      /* ★ 习题模式：这个目差是**配平后**的（含配平贴目），结果条要标出来，
+         否则"黑胜 0.5 子"会让人以为题目只差半子。 */
+      balanced: tsScore && tsKomi() !== TS_KOMI,
+      komi: tsScore ? tsKomi() : null,
       resign: false,
       by: 'score',
       terminal: isTerminal(),
@@ -1381,6 +1471,8 @@ function renderVerdict() {
   } else {
     main = sideTxt + '胜';
     sub.push(r.lead.toFixed(1) + ' ' + r.unit);
+    /* ★ 习题模式：这个数含「配平贴目」——不标出来会被读成"题目只差半子"（2026-10-25）。 */
+    if (r.balanced) sub.push('配平贴 ' + r.komi + ' 目');
     if (!r.terminal) sub.push('当前局面 · 非终局');
   }
   $('verdict-text').innerHTML = '<b>' + main + '</b>'
@@ -4262,6 +4354,7 @@ function initSeg(id, apply) {
 
 function setSeg(id, val) {
   const box = $(id);
+  if (!box) return;                    // 面板上还没有这一行（老 HTML / 已删掉的控件）→ 静默跳过
   box.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === String(val)));
 }
 
@@ -4318,7 +4411,7 @@ function syncNewGameRows() {
   $('row-clock').hidden = ts;
   $('row-rules').hidden = ts;
   $('row-komi').hidden = ts;
-  ['row-tsplace', 'row-tsfirst', 'row-tsframe', 'row-tsaicolor'].forEach(id => {
+  ['row-tsplace', 'row-tsfirst', 'row-tsframe', 'row-tsaicolor', 'row-tcrop'].forEach(id => {
     const el = $(id);
     if (el) el.hidden = !ts;
   });
@@ -4412,8 +4505,16 @@ function updateFrameNote() {
     return;
   }
   const side = 5 + settings.tdist * 2;
+  /* ★ 裁切生效时把「引擎实际算多大」写出来（2026-10-27）——
+     否则用户没法从界面上确认"到底有没有只算框内"（画面永远是整盘）。
+     这里只是显示，算不出来（还没摆子 / 框架关掉 / 开关在「整盘」）就保持原样。 */
+  let crop = '';
+  if (settings.tcrop !== 'off') {
+    const c = tsCropRect();
+    if (c) crop = ' 引擎按 ' + c.w + '×' + c.h + ' 的裁切棋盘分析（框外不参与计算）。';
+  }
   el.textContent = '框架距离 ' + settings.tdist + ' 路：框边比题目棋子最外沿多留 ' + settings.tdist
-    + ' 路。角上一道小题的棋子约占 5×5 → 框约 ' + side + '×' + side + '。';
+    + ' 路。角上一道小题的棋子约占 5×5 → 框约 ' + side + '×' + side + '。' + crop;
 }
 
 /* ---- 框架 / 框距：**同一个值有两个地方能改**（「新对局」面板 + 练习卡），
@@ -4427,15 +4528,35 @@ const TDIST_MIN = 0, TDIST_MAX = 10;
 function syncFrameUI() {
   setSeg('seg-tframe', settings.tframe);      // 「新对局」面板
   setSeg('seg-tsframe', settings.tframe);     // 练习卡
+  setSeg('seg-tcrop', settings.tcrop);        // 分析范围（只算框内 / 整盘）
   const inp = $('inp-tdist'); if (inp) inp.value = settings.tdist;
   const txt = $('ts-dist-txt'); if (txt) txt.textContent = settings.tdist;
   updateFrameNote();
 }
 
-/* 用户改了框架设置 → 拉齐显示，并让棋盘与引擎跟上（框变了 = allowMoves 的范围变了）。 */
+/* 用户改了框架设置 → 拉齐显示，并让棋盘与引擎跟上（框变了 = allowMoves 的范围变了）。
+   ★★ 2026-10-27：框距还决定**裁切矩形**（引擎看到的是几路的小盘），所以它同时决定
+     配平值该不该重算（`setupSig` 里带着框的四个边）。
+     · 初始局面（viewAt === 0）：直接作废旧配平 → 下面排的那一趟就是探针，几秒后自动重折；
+     · 已经走了几手：**不作废**（作废会让胜率条当场跳到 0 目口径的 99.9%），只提示用户
+       按「重来」回到初始局面 —— 那一步一定会走 tsStartSolve 的配平流程。 */
 function applyFrameChange() {
   syncFrameUI();
-  if (tsOn()) { draw(); scheduleAnalysis(120); }
+  if (!tsOn()) return;
+  const t = state.tsumego;
+  const stale = !!(t && t.phase === 'solve' && t.bal && t.bal.sig !== setupSig());
+  if (stale) {
+    if (state.viewAt === 0) {
+      t.bal = null;
+      t.probe = null;
+      balWaitUntil = Date.now() + TS_BAL_WAIT_MS;
+      freeEngineForProbe();
+    } else {
+      flash('框距变了 → 贴目要重配平：按「重来」回到初始局面');
+    }
+  }
+  draw();
+  scheduleAnalysis(120, true);
 }
 
 /* 改框距（唯一的入口：面板的数字框、练习卡的两个加减按钮都走它） */
@@ -4500,6 +4621,7 @@ function applyFirstChange(v) {
   t.nextColor = settings.tfirst;
   state.myColor = tsMyColor();
   state.toMove = settings.tfirst;
+  syncBalToSetup();        // 先手进了签名 → 旧贴目作废（改回来会命中缓存，见 syncBalToSetup）
   tsResetBoardState();     // 手顺不再成立（顺带 +1 局面代，在飞的应手会作废）
   syncTsumegoUI();         // 内含 syncTkaicolorUI
   draw();
@@ -4531,6 +4653,13 @@ $('inp-tdist').oninput = e => setFrameDist(e.target.value);
 
 /* 练习卡上的框架 / 框距（和面板那份写的是同一对设置） */
 initSeg('seg-tsframe', v => { settings.tframe = v; applyFrameChange(); });
+/* 分析范围（只算框内 / 整盘）：改了要重发一次 —— 引擎的**棋盘尺寸**跟着变，
+   旧结果（另一个口径的目差 / 胜率 / 候选）不能留在屏幕上。 */
+initSeg('seg-tcrop', v => {
+  if (settings.tcrop === v) return;
+  settings.tcrop = v;
+  applyFrameChange();
+});
 $('btn-ts-dist-less').onclick = () => setFrameDist(settings.tdist - 1);
 $('btn-ts-dist-more').onclick = () => setFrameDist(settings.tdist + 1);
 
@@ -4691,7 +4820,7 @@ function fillVisitSelect() {
 /* 设定搜索量：写进 settings，并让两个下拉保持一致 */
 function setVisits(v) {
   const n = parseInt(v, 10);
-  settings.visits = VISIT_OPTS.some(o => o[0] === n) ? n : 500;
+  settings.visits = VISIT_OPTS.some(o => o[0] === n) ? n : ANALYZE_VISITS;
   for (const id of ['m-visits', 'sel-visits']) {
     const el = $(id);
     if (el) el.value = String(settings.visits);
@@ -4796,6 +4925,8 @@ $('m-start').onclick = () => {
   settings.tmode = ($('seg-tmode').querySelector('.on') || { dataset: {} }).dataset.v || settings.tmode;
   settings.tfirst = ($('seg-tfirst').querySelector('.on') || { dataset: {} }).dataset.v || settings.tfirst;
   settings.tframe = ($('seg-tframe').querySelector('.on') || { dataset: {} }).dataset.v || settings.tframe;
+  const cr = $('seg-tcrop');
+  if (cr) settings.tcrop = (cr.querySelector('.on') || { dataset: {} }).dataset.v || settings.tcrop;
   const dv = parseInt($('inp-tdist').value, 10);
   settings.tdist = Number.isFinite(dv) ? Math.max(0, Math.min(10, dv)) : 4;
   /* （2026-10-17：原来这里还读一档「题目目标」sel-tgoal —— 随判定/提示一起删了） */
@@ -4947,6 +5078,14 @@ function makeTsumego() {
        ★ 为什么留这个字段：第一版把失败吞在空 catch 里，端到端测试只看到
          「AI 一声不吭」，完全查不出原因。诊断信息要留得住。 */
     defendNote: '',
+    /* 配平贴目（2026-10-25）：{ komi, lead0, capped, sig, visits, at } 或 null。
+       由 mkBal() 造、tsKomi() 读；sig 与当前局面不符就作废重来（见 setupSig）。
+       ⚠️ 它**只是引擎口径**：不进 moves / 不进 SGF / 不影响数子与复盘。 */
+    bal: null,
+    /* 「这道题偏多少目」的原始测量：{ sig, lead0, visits } 或 null。
+       来源见 balFromProbe 上面那段 —— 摆题阶段本来就在算，那一趟白捡。
+       bal 由 probe 折算而来（`k = round(lead0) + 0.5`），所以 probe 留着便于排查。 */
+    probe: null,
   };
 }
 
@@ -4983,7 +5122,7 @@ function frameRect() {
   };
 }
 
-/* ★★ 「贴题半径」（2026-10-17）：引擎找点时**只允许落在离最近棋子 ≤ 2 路的空点**上。
+/* ★★ 「贴题半径」（2026-10-17）→ 「近身 / 局部」两档（2026-10-26）。
    来龙去脉（实测数据见 daily log 2026-10-17）：原来 allowMoves 只给「整个框」，
    框距默认 4、框里 100~195 个点，大半离战斗 4~6 路。而死活题的胜率几乎是常数
    （黑已大优 → 99.9%），引擎没有"必须应"的动机，就在框内随手挑个大场 —— 这就是
@@ -4991,8 +5130,43 @@ function frameRect() {
      · 整框：首选距最近棋子 >2 路的占 25~33%（另一次跑 33%，引擎有随机性）
      · 收成 2 路：**0%**，与 SGF 正解应手的吻合率不变（42%）
      · 把框距从 4 调到 2：仍是 29% —— **调框距治不了**（框的角落照样离棋子 4~5 路）
-   ⚠️ 这只影响**引擎**（allowMoves / 候选过滤）；人的落子范围仍由框架管。 */
-const TS_BAND = 2;
+
+   ★★ 2026-10-26 用户第二次报「用 xxqj 测试时 KATAGO 还是很容易去**练习题的框**边缘落子」
+   —— 注意：是那道**虚线框**，不是棋盘的自然边（第一次我按盘边理解，答错了）。
+   实测（`_probe_edge2.mjs` / `_probe_trim.mjs`，全部 347 题，**只看题目初始局面**）：
+     · 框距 4（默认）/3：引擎那一档的允许点里，**落在人工框线上的 = 0 个**（0/347 题）。
+       数学上也不可能：框是「摆子外接矩形 + 4」，而引擎只在离棋子 ≤2（腹地里）/≤1（外皮）——
+       所以它离人工框线至少还有 2 路。
+     · 框距 2：人工框线上的允许点 **3579 个**（平均 10.3/题，342/347 题都有）；
+       框距 1：1644 个；框距 0：1591 个（其中 86 题还会整框兜底）。
+       因为框距 ≤2 时**框比引擎的战术半径（贴身 1 路）还窄**，框线本身成了允许集合的边界。
+       真 app 实测（框距 2，12 题）：AI 应手有一半落在**人工框线内侧 1 路**。
+   ⇒ 处理：新增 `frameBorderSet()` + `trim()`（见 regionPoints）—— **人工框线上的点不进允许集合**
+   （两档都剔，留 8 点地板）。分两种狠度，按框距：
+     · 框距 **≥3**：框线上一律不踩（框线已在战术半径之外，会走到那儿只说明棋飘出题目了）；
+     · 框距 **≤2**：只剔「离棋子 ≥2 路」的（这种框比贴身半径还窄，框线上的贴身点是必须的）。
+     效果（347 题初始局面）：框距 2 的 3579 → **0**、框距 1 的 1644 → **0**、
+     框距 0 的 1591 → **7**（1 题撞到 8 点地板，保留原样）；框距 4/3 本来就是 0。
+   ⇒ 半径这一层（**2026-10-27 起只剩一档**）：
+     · wide（两方都用）= 离棋子 ≤2 路 —— 曾经"人用 wide、对手用 tight"的分档已取消，
+       理由见 `tsAnalyzeExtras()` 里那段（tight 遮住 3.5% 题目的正解 ⇒ 应手不够强）。
+     · tight 的实现**保留**在 `regionPoints(fr, true)` 里（含 `TS_TIGHT`），但**当前没有调用点**；
+       要恢复"对手贴身"只需把 `tsAnalyzeExtras()` 与 `maybeDefendMove` 两处同时改回 true。
+
+   ⚠️ 半径只**影响引擎**（allowMoves / 候选过滤）；人的落子范围由框架管。 */
+const TS_BAND = 2;    // 离棋子几路（唯一在用的半径）
+const TS_TIGHT = 1;   // tight 档的贴身半径（该档 2026-10-27 停用，无调用点）
+
+/* 题目棋子的外接矩形（只看 state.setup —— 和 frameRect 同一个口径，解题中不跟着手顺长）。
+   用途只有一个：判断「2 路的那个点是在腹地里、还是在旷野上」（见上面那段）。 */
+function stoneBox() {
+  let x0 = N, y0 = N, x1 = -1, y1 = -1;
+  for (const s of state.setup) {
+    if (s.x < x0) x0 = s.x; if (s.x > x1) x1 = s.x;
+    if (s.y < y0) y0 = s.y; if (s.y > y1) y1 = s.y;
+  }
+  return x1 < 0 ? null : { x0, y0, x1, y1 };
+}
 
 /* 「离棋子 ≤ maxD 路」的空点集合（按当前局面：摆子 + 手顺到 state.moves.length）。
    19×19 只有 361 点，直接对每颗棋子做一次切比雪夫膨胀，够快也够直白。 */
@@ -5009,26 +5183,92 @@ function bandNear(maxD) {
   return set;
 }
 
-/* 框内 ∩ 贴题半径。带太窄时（盘上只有一两颗子、或题目本身很空）依次放宽到 3 路、
-   最后退回整框 —— 宁可给引擎一点余地，也不能让它无点可选（无点 = 应手直接失败）。 */
-function bandPointsInFrame(fr) {
-  const all = [];
+/* **人工框线**上的点：框的四条边里，**不在棋盘边上**的那些（贴盘边那一侧是
+   `frameRect()` clamp 出来的，它就是棋盘自己的第一线 —— 引擎在那儿提子/立、
+   收气都是正常手段，不能算"跑到框边"）。
+   为什么要单独把这条线认出来：框是给人看的矩形约定，它的四条边会横穿空地；
+   而引擎一旦被限制在这个矩形里，"框线上的点"就成了可选集合的边界 ——
+   胜率饱和时它会随手挑到那儿，看着就是"KATAGO 老往框边跑"。 */
+function frameBorderSet(fr) {
+  const set = new Set();
+  if (!fr) return set;
+  const onBoardEdge = (x, y) => x === 0 || x === N - 1 || y === 0 || y === N - 1;
+  for (let x = fr.x0; x <= fr.x1; x++)
+    for (const y of [fr.y0, fr.y1])
+      if (!onBoardEdge(x, y)) set.add(y * N + x);
   for (let y = fr.y0; y <= fr.y1; y++)
-    for (let x = fr.x0; x <= fr.x1; x++) all.push([x, y]);
+    for (const x of [fr.x0, fr.x1])
+      if (!onBoardEdge(x, y)) set.add(y * N + x);
+  return set;
+}
+
+/* 框内 ∩ 局部区域。返回点数组 [[x,y], ...]。
+   层次（每一层都要 ≥20 点，否则往下一层退 —— 宁可给引擎余地，也不能让它无点可选）：
+     wide（唯一在用）：2 路 → 3 路 → 整框（每一层都过一遍 trim）
+     tight（`tight=true`，2026-10-27 停用、无调用点）：
+           贴身 1 路 ∪ (2 路 ∩ 外接矩形) → 2 路 → 3 路 → 整框 */
+function regionPoints(fr, tight) {
+  /* fr 可能为 null（框架关掉 / 还没摆子）—— 那时按整盘算，保持"仍然只贴题"的老行为，
+     别因为关了框架就让对手随便跑到对角去。 */
+  const box0 = fr || { x0: 0, y0: 0, x1: N - 1, y1: N - 1 };
+  const all = [];
+  for (let y = box0.y0; y <= box0.y1; y++)
+    for (let x = box0.x0; x <= box0.x1; x++) all.push([x, y]);
+  const box = stoneBox();
+  const inBox = (x, y) => !!box && x >= box.x0 && x <= box.x1 && y >= box.y0 && y <= box.y1;
+  const s1 = bandNear(TS_TIGHT);
+
+  /* ★★ 2026-10-26（用户第二次报「还是容易去**练习题的框**边缘落子」之后加的一层）：
+     把「**人工框线**」上的点从允许集合里剔掉。这类点本身没有任何战术含义 ——
+     它只是"贴着那条虚线"，胜率饱和时就成了"随手挑一个"的牺牲品。
+     分两种情况（**按框距**决定狠到什么程度，理由见下）：
+       · 框距 ≥3（框线离题目棋子 ≥3 路）：**框线上一律不踩**。
+         此时框线已经在引擎的战术半径（贴身 1 路 / 腹地 2 路）之外 —— 会走到那儿，
+         只可能是棋已经往题外飘了（比如人在框边上试探了一手）。不追这一手，正是用户要的。
+       · 框距 ≤2（框线落在战术半径之内）：只剔「离棋子 ≥2 路」的那些。
+         这种框比引擎的贴身半径还窄，框线上的**贴身**点（扳、立、紧气）是必须留的。
+     **每一档都这么剔**（当前只剩 wide；人的**落子范围**仍是整个框
+     （tryPlay 不经过这里），只是引擎不再把它推荐到框线上。
+     · 留 8 点地板：真剔空了就原样返回，绝不让引擎无点可选。 */
+  const border = frameBorderSet(fr);
+  const tdNow = Math.max(0, Math.min(10, parseInt(settings.tdist, 10) || 0));
+  const strictLine = tdNow >= 3;
+  const trim = pts => {
+    if (!border.size) return pts;
+    const keep = pts.filter(([x, y]) => {
+      const k = y * N + x;
+      if (!border.has(k)) return true;
+      return strictLine ? false : s1.has(k);
+    });
+    return keep.length >= 8 ? keep : pts;
+  };
+
+  if (tight) {
+    const s2 = bandNear(TS_BAND);
+    const core = all.filter(([x, y]) => s1.has(y * N + x) || (inBox(x, y) && s2.has(y * N + x)));
+    if (core.length >= 20) return trim(core);
+  }
   for (const d of [TS_BAND, TS_BAND + 1]) {
     const set = bandNear(d);
     const pts = all.filter(([x, y]) => set.has(y * N + x));
-    if (pts.length >= 20) return pts;
+    if (pts.length >= 20) return trim(pts);
   }
-  return all;
+  return trim(all);
 }
 
-/* 候选过滤（方案 3 的兜底）：只留贴题的候选，pass 永远留着（该收束时允许停一手）。
+/* 候选过滤（方案 3 的兜底）：只留局部区域里的候选，pass 永远留着（该收束时允许停一手）。
    正常情况用不上 —— 请求里已经把搜索限在带内了。留这一层是因为 allowMoves 是引擎标注
    「experimental」的字段，而且带太窄时我们会退回整框：万一引擎给了远处大场，
    这一层保证"不会当真落下去"。返回空数组时调用方要保留原列表（别把候选清空）。 */
-function filterLocalMoves(infos, maxD) {
-  const set = bandNear(maxD);
+function filterLocalMoves(infos, fr, tight) {
+  /* ★★ 没有框架（框架关掉 / 还没摆子）→ **一律不过滤**（2026-10-26）。
+     这里原来会一路走到 `regionPoints(null, tight)`，而那个 null 分支是「整盘当容器、
+     再取贴身 1~2 路」—— 结果就是：设置里写着「框架：关」，引擎请求也确实没带
+     allowMoves（自由落子），但候选/应手回来以后又被这一层砍到题目旁边。
+     用户看到的是「关了框架，KATAGO 还是只在那一小块里挑」，跟开关的说法正相反。
+     口径统一成一句话：**框架管的是"题目范围"，没有框架就没有范围限制。** */
+  if (!fr) return infos;
+  const set = new Set(regionPoints(fr, tight).map(([x, y]) => y * N + x));
   return infos.filter(m => {
     const s = String(m.move || '');
     if (!s || s.toLowerCase() === 'pass') return true;
@@ -5042,25 +5282,726 @@ function filterLocalMoves(infos, maxD) {
 function tsAnalyzeExtras() {
   if (!tsOn()) return {};
   const extra = {};
-  /* ★ 规则与贴目**一律用固定值**（2026-10-14）：死活题与它们无关，面板里那两行也藏了。
+  /* ★ 规则与贴目**一律覆盖**（2026-10-14 起；2026-10-25 贴目改成配平值）。
      放在这里覆盖，是因为三个请求点（常规分析 / KATAGO 应手 / 判定）都是
      `Object.assign({...}, req, tsAnalyzeExtras())` —— 附加项在**最后**，能盖掉 req 里的值，
-     而 settings.rules / settings.komi 本身不动（退出习题模式后还是用户原来那套）。 */
+     而 settings.rules / settings.komi 本身不动（退出习题模式后还是用户原来那套）。
+     ★ 贴目不是棋规贴目：`tsKomi()` 在解题阶段返回**配平值**，摆题阶段恒 0（那是探针口径）。 */
   extra.rules = TS_RULE;
-  extra.komi = TS_KOMI;
+  extra.komi = tsKomi();
   /* moves 为空时先手只能靠它告诉引擎。有 moves 时不必传（引擎从第一手的颜色就知道）。 */
   if (!state.moves.length) extra.initialPlayer = (state.toMove === 'b') ? 'B' : 'W';
   const fr = frameRect();
   if (fr) {
-    /* ★ 2026-10-17：从「整框」收成「框内 ∩ 离棋子 2 路内」—— 治"脱先"的关键一层。
-       详见 TS_BAND 顶上那段实测数据。 */
-    const pts = bandPointsInFrame(fr).map(([x, y]) => toGTP(x, y));
+    /* ★★ 2026-10-17：从「整框」收成「离棋子 2 路内」—— 治"脱先"的第一层。
+       ★★ 2026-10-26：曾按**谁执哪一方**分两档（对手 tight、人 wide）。
+       ★★ 2026-10-27：**取消分档，两方一律 wide**（用户要求：KATAGO 应手那一方也要 wide）。
+          为什么要退回来：tight 把「离棋子 2 路、但在摆子外接矩形外」的点（外皮）全剔了，
+          而 347 题实测里正解首手有 **12 题（3.5%）正落在那圈外皮上** —— 对手一旦被按下
+          tight，它连最强的抵抗手段都看不见，"应手不像最强抵抗/判断变松"就是这么来的。
+          脱先那头也不必靠 tight 兜：真正治它的是下面这层 2 路半径 + 人工框线上的点被 trim
+          剔掉（框距≥3 时一个不踩）；旷野 2 路点只占允许集合的一小块，胜率饱和时它不再是
+          "贴着框线随手挑"的那一类点。
+          ⚠️ 别让某一方**没有**条目（空 moves 会被主进程丢掉 → 引擎完全不约束）。 */
+    const wide = regionPoints(fr, false).map(([x, y]) => toGTP(x, y));
     extra.allowMoves = [
-      { player: 'B', moves: pts, untilDepth: 1000 },
-      { player: 'W', moves: pts, untilDepth: 1000 },
+      { player: 'B', moves: wide, untilDepth: 1000 },
+      { player: 'W', moves: wide, untilDepth: 1000 },
     ];
   }
   return extra;
+}
+
+/* ==================== 裁切棋盘：让引擎只在框架内分析（2026-10-27）====================
+
+   用户要求：「直接把 KataGo 的分析限制在框架内，不要分析全局」。
+   做法：**把框架当成一张真实的小棋盘发给引擎**（boardXSize/boardYSize），
+   而不是「19 路棋盘 + allowMoves 白名单」。裁切只发生在**请求**里 ——
+   画面照样是 19 路，回来的坐标由主进程还原（main.js 的 uncropPayload），
+   所以下游（候选点 / 形势雾 / 应手 / 讲解 / 复盘）一行都不用改。
+
+   ★ allowMoves 与裁切是**两层**，不是替代关系：
+     allowMoves 管「搜索树里允许哪些点」，裁切管「棋盘本身有多大」。
+     两者并存 —— 别因为裁了就把 allowMoves 删掉（纵深仍然靠它兜）。
+
+   ★★ 已知边界（2026-10-26 实测，见 `_trash/_probe_crop.mjs`；别指望它治「选点不准」）：
+     前 8 题对照（A = 整盘 + allowMoves，B = 裁成小棋盘，两档都配平贴目）：
+     首选点 **5/8 完全相同**，与 SGF 正解的吻合 **都是 0/8**。
+     原因：选点由 policy 主导，而框外的点本来就被 allowMoves 挡住了 ——
+     裁切去掉的正是"引擎本来也不会走"的地方。
+     能拿到的是**速度**（面积小 → 卷积量小）和「形势雾不再铺满全盘」，
+     不是"更准"。要让推荐点更准，只能动**排序依据**（见 TS_BAND 那段）。
+
+   ★ 为什么矩形要用「棋子兜底」往外扩：moves 里可能有框外的子（解题中途改过框距 /
+     框架关过又开）。裁切若容不下那些子，引擎看到的就是另一个局面（子凭空消失）→ 全错。
+   ★ 为什么框架关掉就不裁：`frameRect()` 返回 null = 没有范围约定 → 维持老行为（整盘、无约束）。
+   ★ 为什么 `settings.tcrop` 必须进 `setupSig()`：配平值（lead0）是按"当前这个棋盘"算出来的，
+     开关一换口径就变 → 旧值必须作废、重新探针。 */
+function tsCropRect() {
+  if (!tsOn() || settings.tcrop === 'off') return null;
+  const fr = frameRect();
+  if (!fr) return null;
+  let x0 = fr.x0, y0 = fr.y0, x1 = fr.x1, y1 = fr.y1;
+  const eat = p => {
+    if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') return;
+    if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+    if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+  };
+  for (const s of state.setup) eat(s);
+  for (const m of state.moves) if (!m.pass) eat(m);
+  if (x0 <= 0 && y0 <= 0 && x1 >= N - 1 && y1 >= N - 1) return null;   // 已经是整盘 → 不折腾
+  return { ox: x0, oy: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+}
+
+/* 全盘 GTP → 小盘 GTP（列字母取 GTP_COLS 前 w 个，行号 = h − y′）。pass 原样。 */
+function gtpToCrop(s, c) {
+  const t = String(s == null ? '' : s);
+  if (!t || t.toLowerCase() === 'pass') return t;
+  const p = fromGTP(t);
+  if (!p) return t;                                            // 解析不了就原样交出去
+  const cx = p.x - c.ox, cy = p.y - c.oy;
+  if (cx < 0 || cx >= c.w || cy < 0 || cy >= c.h) return t;    // 「棋子兜底」保证不会发生
+  return GTP_COLS[cx] + (c.h - cy);
+}
+
+/* 请求裁切：把棋子 / 手顺 / allowMoves 全部换算到小盘，并带上尺寸与偏移。
+   ⚠️ 只动坐标相关字段 —— rules / komi / maxVisits / initialPlayer 一律不碰（配平照旧）。
+   ⚠️ 不需要裁切时**原样返回同一个对象**（调用方拿到的还是老 req）。 */
+function tsCropReq(req) {
+  const c = tsCropRect();
+  if (!c) return req;
+  const conv = s => gtpToCrop(s, c);
+  const q = Object.assign({}, req, {
+    sizeX: c.w, sizeY: c.h,        // main.js 优先用这两个（只传 size 就是方形）
+    crop: c,                       // 回来时按它还原（main.js uncropPayload）
+    boardN: N,                     // 全盘边长（还原用）
+    initialStones: (req.initialStones || []).map(it => [it[0], conv(it[1])]),
+    moves: (req.moves || []).map(it => [it[0], conv(it[1])]),
+  });
+  for (const k of ['allowMoves', 'avoidMoves']) {
+    if (Array.isArray(req[k]))
+      q[k] = req[k].map(it => Object.assign({}, it, { moves: (it.moves || []).map(conv) }));
+  }
+  return q;
+}
+
+/* ==================== 配平贴目（2026-10-25 · P0）====================
+
+   要解决什么：死活题的胜率几乎是常数（题目本身一边倒 → 99.9%），框内二十来个候选的
+   `utility` 差别接近 0，`order` 排序就等于按 policy 抽签 —— 用户看到的「在题目旁边
+   随手走 / 不聚焦」是这个，不是"跑得太远"。（实测基线：2 路带把「离棋子 >2 路」压到
+   **0%**，但**与正解吻合率仍是 42%**，见 TS_BAND 那段。）
+
+   办法：不再固定 `TS_KOMI = 0`，而是每道题先问引擎一句「这盘现在偏多少目」（lead0），
+   再把贴目折成 `k` 让**黑方目差归零** → 胜率回到 50% 附近。
+   胜率对目差的斜率在 50% 处最大（sigmoid 拐点），而死活题的答案本来就是"生死"这种
+   十几二十目的大摆动 —— 回到拐点，斜率才被用满。
+   换个说法：配平之后胜率条不再是「这盘棋谁赢」（跟做题无关），而是「**这道题现在是死是活**」。
+
+   ★★ 三条纪律，动这段之前先看：
+   1. `reportAnalysisWinratesAs = SIDETOMOVE`（engine.cfg）→ `scoreLead` 是**轮走方**视角，
+      必须自己换算成黑方（`blackLeadFrom`，唯一换算口）。别再翻第二次（纪律 11）。
+   2. **摆题阶段恒 0 目**（`tsKomi()` 按阶段分流）：那正是探针的口径。否则自引用 ——
+      拿配平后的值再去当 lead0。
+   3. `pass` **不进** `allowMoves` 白名单（2026-10-25 定案）：训练要对手**抵抗**，
+      不是算清自己已经死了就停一手。配平不是让它更容易停，是给它一个挑手的**理由**。
+
+   已知边界：配平只治「饱和」，不治「外部 300 空点未定」带来的方差 ——
+   死活题（大摆动）够用，官子/半目题仍吃力（那是 P2「填子」的地盘）。见《习题配平方案.md》。 */
+/* 配平上限：**按「引擎实际看到的那张棋盘」的点数等比放大**（2026-10-27 改）。
+   19 路整盘：40 × 361/81 = **178**（> 实测最大 |lead0| 148）。
+   ★ 裁切之后必须换成裁切面积（2026-10-27）：小盘只有 72~90 点，可 8×9 实测
+     |lead0| 就有 **44.7 目**、9×10 是 **57~60 目** —— 因为裁切把白方的外势/大模样裁掉了，
+     框内那点存量优势占盘面的比例天然高得多（整盘 45/361 = 12%，8×9 上 45/72 = 62%）。
+     继续用 178 等于没有上限，一个测歪的 lead0 就能把贴目推到小盘总目数的两三倍。
+     取 **0.9 × 面积**：8×9 → 65、9×10 → 81（都容得下实测值，又挡得住离谱值）。 */
+function tsBalMax() {
+  const c = tsCropRect();
+  if (c) return Math.round(0.9 * c.w * c.h);
+  return Math.round(40 * N * N / 81);
+}
+/* ★★ 配平值从哪来（2026-10-25 定稿，**两次踩坑之后**的形状）：
+
+   试过但**不要**再试的两版：
+   ① 在「开始解题」时另发一个 `window.api.analyze(48 步)` 当探针 —— 它和分析循环抢引擎：
+      两边都带 `terminateId`，互相掐；被掐的那条**要等 main.js 的 90 秒超时**才回来。
+   ② 让探针搭分析管线的「第一趟」、同时把应手挡住等它 —— 压力下（连续改框距/重来）
+      那趟被反复作废，`balNeedProbe` 一直挂着，应手和候选点全被堵死。
+      实测：`_cdp_tsumego` 从 1★ 涨到 7★。
+
+   定稿：**一次请求都不额外发**，两条路都白捡：
+   · 摆题阶段本来就在算（每摆一子 280ms 后一趟，`placeSetupStone` → `scheduleAnalysis(280)`）
+     → 那一趟就是「这道题偏多少目」。它本来就是按 0 目口径发的（`tsKomi()` 摆题恒 0），
+       正好是探针要的口径，不用另问。
+   · 冷启动（摆完立刻点开始）→ 解题第 0 手那一趟同样是「初始局面 + 0 目」，一样能用；
+     目差到手就**掐掉这一趟**、按新贴目重算（那一趟的其余四百步别再白烧）。
+   ★ 判据统一成一句话：**发出去时 `tsKomi()` 还是 0 目、且算的是第 0 手** → 这一趟就是探针。
+     所以两阶段共用一条捕获路径，没有第二个开关会忘记同步。
+   ★ 用 `anaSigAtSend`（发请求那一刻的摆子签名）判断它算的**是不是现在这个局面**：
+     分析是串行的（`anaBusy`），不存在两条请求同时在飞，这个比较是精确的。
+   ★ 也**只能**吃中间报告：实测线上权重（b11c768）跑满 500 visits 要三十来秒，
+     等最终回包再配平，第一手早走完了。门槛与理由见 noteBalProbe。
+   ★ 抢跑（配平没到手就落子）现在**不会再把探针掐死**了 —— 2026-10-28 采用方案 A「应手让路」，
+     见 balWaiting。 */
+let anaSigAtSend = '';       // 最近一次分析**发请求那一刻**的摆子签名（见 setupSig）
+/* ★★ 最近一次分析请求算的是**第几手**（2026-10-28）。
+   为什么必须有它：中间报告**不一定带 `turnNumber`**（实测抢跑时它是 undefined），
+   于是 onProgress 原来那条「`p.turn !== viewAt` 就丢掉」的过滤只能拿 `state.viewAt` 兜底 ——
+   抢跑后 viewAt 已经是 1，at=0 那份探针报告就被当成"第 1 手"喂进 `noteBalProbe(p, 1)`
+   → 只认 at=0 的它一律拒收 → **配平永远折不出来**（实测 30 秒 probe 仍是 null，
+   右侧还把这个初始局面的读数「黑 99.9% / +30.3 目」当成第 1 手显示出来）。
+   分析是串行的（anaBusy 独占），所以"在飞的那一条"就是它，记一个数就够。 */
+let anaAtSend = -1;
+/* ★★ 最近一次分析请求**发出去的时刻**（2026-10-29，方案②用）。
+   为什么需要它：第一级的步数门槛要「按这一趟已经等了多久」自适应 ——
+   冷启动那趟前 40 步要 20 秒，热引擎上只要 2 秒。只看 `anaBusySince` 不行：
+   那是**整个循环**的起点（一轮会跑好几趟），跑到第三趟时它早过 6 秒了。
+   所以单独记「这一条请求什么时候发的」，见 balMinVisits。 */
+let anaSentAt = 0;
+/* ★★ 最近一次分析请求**发出去时用的贴目**（2026-10-28，切题配平报障后加）。
+   为什么需要它：探针正常是在「贴目 = 0」时发的（摆题阶段 tsKomi() 恒 0），
+   但**换一道题 / 换了摆子**之后，`tsKomi()` 还拿着上一题的配平值（它故意不按 sig 回退，
+   见那个函数）→ 这一趟其实是按旧贴目算的。而引擎给的 `scoreLead` **已经含了那个贴目**，
+   `mkBal` 却把 lead0 当「0 目口径」用 → 折出来的贴目整整差一个旧贴目
+   （实测切到第 2 题：旧贴目 39.5，真值 ≈ +12，折出 **−25.5**）。
+   所以 `noteBalProbe` 里要把它加回去，见那个函数。 */
+let anaKomiAtSend = 0;
+/* ★ 「等配平值」的窗口（毫秒）。窗口内**应手先让路**，把引擎空给探针。
+   为什么需要它：探针只认第 0 手（见 noteBalProbe），而别的请求会把它掐掉
+   （`main.js` 的 analyze() 给新请求带 terminateId，后发的掐前一个）。
+   但**必须有上限** —— 无限等就是踩坑②（应手和候选点全被堵死）。
+   ★★ 2026-10-28 从 10 秒提到 **25 秒**（抢跑探针实测逼出来的）。理由：
+      线上权重（b11c768）冷启动第一趟，**前 14.5 秒一条中间报告都没有**
+      （`_trash/_probe_ts_race7`：dt=9 发请求 → dt=14505 才有第一条 `visits=1`）；
+      而"从点开始解题到配平值到手"实测 **9.3~17.1 秒**。10 秒窗口在慢的这一次里
+      必然先到期 → 应手立刻发出去 → 探针被掐 → 配平彻底丢（实测整题按 0 目跑）。
+      25 秒 = 实测最慢 17.1 秒 + 约 45% 余量。
+      代价（写清楚，别当 bug 报）：配平**失败**时 AI 会晚 25 秒才应手；
+      配平成功时 `balFromProbe()` 立刻把窗口清 0（见该函数），所以正常情况下感觉不到。
+   而"等"这件事本身不增加用户等待 —— 那一手本来还得排队跑一趟应手分析（10~30 秒）。
+   **宁可偶尔差一手，绝不卡死。**
+   ★★ 2026-10-28 用户定 **方案 A「应手让路」**：条件从「AI 的第一手」放宽到**任何一手**。
+      原来只对 `moves.length === 0` 生效，于是用户一抢跑（配平没到手就落子）
+      → moves 变 1 → 窗口立刻失效 → AI 应手 350ms 就发出去 → 探针被 terminate。
+      实测（`_trash/_probe_ts_race2.mjs`）两种结局：配平 66.7 秒才到，或 75 秒内**永久丢失**。
+      去掉这个条件之后，抢跑那段时间里**没有任何请求抢引擎**，靠的是**两条**守卫配合：
+        · `maybeDefendMove` 挡住应手（放在 solution 分支**之后**，按正解不占引擎）；
+        · `runAnalysis` 的 `needDefendMove() && !balWaiting()` **同时**挡住 at=1 的分析。
+      缺一条都不成立 —— 只挡应手的话，at=1 的分析照样会把探针掐掉。
+      → 探针独占跑完 → 配平到手 → `balFromProbe()` 里 `balWaitUntil = 0` 立刻放行。
+      代价：抢跑后 AI 最多晚 25 秒才应手，这期间画面只有「计算中…」在转，
+      右侧写「正在等配平贴目 · 算完就应手」。 */
+const TS_BAL_WAIT_MS = 25000;
+/* 绝对上限（毫秒）：探针哪怕还在飞，到点也必须放行应手。
+   为什么需要它：`balWaiting` 第二条判据是「探针还在飞就继续让路」——
+   万一探针那趟卡住（超时兜底最长 analyzeTimeoutMs，47 秒），应手不能陪它一起卡。 */
+const TS_BAL_WAIT_HARD_MS = 45000;
+let balWaitUntil = 0;        // >0 且在未来 = 正在等配平值（由 tsStartSolve / tsResetSolve 设）
+let balHardUntil = 0;        // 同上，但**不可续期**的硬上限（同上两处设）
+/* 「现在是不是在等配平值」。**只有三个地方**该问它：
+   ① 应手链路（`maybeDefendMove`）—— 窗口内先不落子；
+   ② 分析管线的「引擎让给应手」那道守卫 —— 窗口内要反过来把引擎让给分析（那一趟就是探针）；
+   ③ 状态栏那句解释（syncUI）—— 让用户知道 AI 不是在发呆。
+   ⚠️ **别写进 `stillNeedDefend()`**：正解那条路在 260ms 后会用它复检一次，
+      放进去的话整手会被静默丢掉（`defendNote` 还留空，正是「AI 一声不吭」的样子）。
+   ★★ 这里**不再带 `state.moves.length === 0`**（2026-10-28 方案 A，理由见上）。
+      那个条件当年是为 `_cdp_tsumego` 的「走偏了 → 退回 KATAGO」加的：第一版没写它，
+      窗口把退回整段挡住、而测试只等 4 秒 → 退回计数不涨、凭空多一个 ★。
+      现在测试改成**轮询等窗口过**（最多 32 秒 = 窗口 25 秒 + 余量），断言本身没放松 —— 仍是「退回计数必须 +1」。
+      真实用户走偏时配平基本早已到手（窗口只在「还没配平」时开），这点延迟只在配平失败时出现。 */
+/* ★★ 2026-10-28 探针实测补的第二刀：光靠时间窗口不够 ——
+   冷启动那一次，探针 **22.9 秒**才推第一条中间报告、**24.4 秒**才攒到 40 步折出配平
+   （`_trash/_probe_ts_race8`），正好压在 25 秒上限上，再慢一点又回到"配平丢失"。
+   所以加一条**本质判据**：配平还没到手、而引擎上正跑着第 0 手那趟（`anaAtSend === 0` + `anaBusy`）
+   → 就让路。探针一结束（`anaBusy` 落下）或一折出配平（`balFromProbe` 清窗口）立刻放行。
+   `balHardUntil` 是防卡死的兜底（探针那趟最长 analyzeTimeoutMs）。
+   ⚠️ 不要写成只看 `anaBusy`：复盘 / 应手 / 数子也会让它为真，那些不是探针。 */
+const balProbeFlying = () => anaBusy && anaAtSend === 0 && tsOn() && tsPhase() === 'solve';
+const balWaiting = () => Date.now() < balWaitUntil
+  || (Date.now() < balHardUntil && balProbeFlying());
+/* 目差估到多少步才算数（见 noteBalProbe）。40 步实测约 2~3 秒。
+   ★★ 2026-10-29 起它只是**热引擎**的门槛，冷启动那趟按"已经等了多久"抬到 150 ——
+      见 balMinVisits 上面那段。 */
+const TS_BAL_MIN_VISITS = 40;
+/* 冷启动那趟的门槛与判定（2026-10-29，方案②）。
+   为什么必须抬：40 步的 lead0 在裁切/整盘大目差题上偏 2~8 目，偏一次就多一轮
+   「换 komi 重建树」重算 —— 实测那一轮冷启动 30~45 秒、热了 6.8 秒
+   （`_trash/_probe_cold`：6 档共 94 秒，第一级之后那趟占了 35~46 秒）。
+   而冷启动这趟本来就白等 20 秒以上，再多等三四秒把初值测准，是**净赚**。
+   判据用"这一条请求发出去多久了"（`anaSentAt`），不是 `anaBusySince` —— 见声明处。 */
+const TS_BAL_SLOW_MS = 6000;
+const TS_BAL_MIN_VISITS_SLOW = 150;
+function balMinVisits() {
+  /* ★ 摆题阶段**不降门槛**（2026-10-29 实测，三版对照）：
+     降成 40 步会在看题 12 秒时抢先折出（43 步），随即触发一次「换 komi 重建树」——
+     而那次重建要 45 秒（19 路整盘、nnCache 只有 43 个局面），正好砸在用户点
+     「开始解题」之后：**总耗时 70~72 秒，比不降门槛的 57 秒还差**。
+     摆题阶段预热的正确用途是「让引擎热起来 + 填 cache」，不是抢着折出。 */
+  if (!anaSentAt) return TS_BAL_MIN_VISITS;
+  return (Date.now() - anaSentAt >= TS_BAL_SLOW_MS) ? TS_BAL_MIN_VISITS_SLOW : TS_BAL_MIN_VISITS;
+}
+
+/* 决定 lead0 的全部输入：摆子 + 先手 + 棋盘 + 规则 + 权重 + **分析范围**（裁切矩形）。
+   和 `reviewEnvCore` 一个思路 —— **环境核心一致才允许复用**。
+   ⚠️ 不要把 visits 混进来：那是「算得多准」，不是「算的是哪个局面」。
+   ★★ 为什么要把**裁切矩形**（不只是裁切开关）算进来（2026-10-27 用户报障后改）：
+     框距一改，引擎看到的棋盘就从 8×9 变成 9×10 —— `lead0` 与 `komi` 的兑换率、甚至
+     「目差归零」那个点都会跟着换。第一版只带了 `crop|full` 一个标记，于是改框距**不换配平值**：
+     拿 10×11 上折出来的贴目去跑 8×9 的盘，第一手就歪好几目。
+   ★ 只用 `frameRect()`（只看摆子 + 框距），**不看 state.moves**：cropRect 里那段「棋子兜底」
+     会跟着手顺长大，若把它算进签名，用户每走一手出框签名就变 → 配平被反复作废。
+     框距与摆子才是这道题的「环境」，手顺不是。 */
+function frameSig() {
+  const fr = frameRect();
+  return fr ? [fr.x0, fr.y0, fr.x1, fr.y1].join(',') : 'full';
+}
+function setupSig() {
+  const stones = state.setup.map(s => s.color + s.x + ',' + s.y).sort().join(';');
+  return [N, TS_RULE, settings.tfirst, settings.analyzeWeight || '', state.setup.length, stones,
+    settings.tcrop === 'off' ? 'full' : frameSig()].join('|');
+}
+
+/* ★ 这一手要发给引擎的贴目 —— **唯一出口**（所有请求都从 tsAnalyzeExtras 走到这里）。
+   ★★ 2026-10-27：这里**仍然不按 sig 回退**（宁可旧、不要崩：退回 0 目会让胜率条瞬间
+     跳到 99.9%，比错几目难看得多）。「口径变了要重算」由**探针那道门**负责 ——
+     `noteBalProbe` 现在只把「sig 与当前一致」的配平值当成"已配平"，
+     于是框距一改，下一趟 at=0 的分析就会重新折一遍（见那个函数）。
+     分工说清楚：tsKomi 只管**发什么**，noteBalProbe 只管**要不要重算**。 */
+function tsKomi() {
+  const t = state.tsumego;
+  if (!t) return TS_KOMI;
+  if (t.phase !== 'solve') return TS_KOMI;         // 摆题阶段 = 探针口径，恒 0
+  return (t.bal && Number.isFinite(t.bal.komi)) ? t.bal.komi : TS_KOMI;
+}
+
+/* 口径变了（0 目 → 配平值，或配平值 → 校正值）→ **第 0 手的旧胜率立刻作废**。
+   为什么必须显式清：`rememberEval` 只在「搜索量 ≥ 目标 90%」时才允许覆盖已有值
+   （那是防抖动用的），而配平那几趟往往被提前掐在 150~300 步 → 走势图第 0 手会
+   永远停在 0 目口径的 **99.98%**，跟旁边胜率条上的 42% 打架（2026-10-25 实测踩到）。
+   清成"空位"后，下一趟按新口径上屏就会自然填回来（`rememberEval` 见
+   `typeof !== 'number'` 就直接写，不看门槛）。 */
+function dropBalHist() {
+  delete state.history[0];
+  delete state.leads[0];
+  state.histVisits[0] = 0;
+  if (typeof renderCurve === 'function') renderCurve();
+}
+
+/* 由 lead0 造一份配平记录。`k = round(lead0 × 2) / 2`（**整数或半整数**）。
+   ★★ 2026-10-27 两次修正，都别改回去：
+   ① **不能更细**：KataGo 的 komi 只接受整数或半整数 —— 试过 0.1 目精度，
+      引擎当场报 `Must be a integer or half-integer from -400.0 to 400.0` 并丢弃整条请求
+      （`_trash/_bal_new2.txt` 第 14 行）。所以贴目网格就是 0.5，这是硬约束。
+   ② **但也别强制 +0.5**：原来是 `round(lead0) + 0.5`，理由写的是"避开中国规则的 jigo"。
+      那个理由在配平贴目这里是错的（这不是棋规贴目，死活题也不会和棋），代价却是
+      **把整个整数点全丢掉** —— 而裁切小盘上正解就落在整数点上：实测同一题
+      `37.0 → 72.7%`、`38.0 → 约 40%`、`38.5 → 10.7%`。强制 +0.5 只能取 38.5，
+      白白错过 38.0。改成 `round(k×2)/2` 之后整数与半整数都在网格里。
+   ★ 这个初值只是**起点**，不是结论：`lead0` 是用 40 步测的（误差 2~6 目），而且
+     「Δlead / Δkomi」在小盘上实测 1.0~1.15（不是 1.0）—— 所以第一级在小盘上会**过头
+     7~9 目**，必须靠 noteBalWinrate 那几轮按实测残差拉回来。
+   `fixN` = 已经校正过几轮（noteBalWinrate 写），`komi2` = 最后一轮的落点。 */
+function mkBal(lead0, sig, visits) {
+  let k = Math.round(lead0 * 2) / 2;
+  const cap = tsBalMax();
+  const capped = Math.abs(k) > cap;
+  if (capped) k = k > 0 ? cap : -cap;
+  return { komi: k, lead0, capped, sig, visits: visits || 0, at: Date.now(), fixN: 0, leadHist: [] };
+}
+
+/* 配平值的**小缓存**（2026-10-28，切题报障后加）。
+   为什么要有它：换到另一道题时 `t.bal` 必须摘掉（见 tsLoadProblem），否则
+   `tsKomi()` 会拿上一题的贴目去发新题的探针 —— 折出来的值整整差一个旧贴目。
+   可摘掉之后**来回翻题**又得重算一遍（每题 10~30 秒），太浪费。
+   键 = `setupSig()`（摆子 + 先手 + 棋盘 + 规则 + 权重 + 裁切矩形），
+   它一样就说明「同一个环境」，配平值可以原样复用。内存里留 12 条，超出按插入序丢最旧的。 */
+const BAL_CACHE_MAX = 12;
+/* ★★ 跨会话持久化（2026-10-29，方案③）。
+   为什么：内存缓存只管这一次运行 —— 关软件、切出习题模式（`enterTsumego` 会重建
+   `state.tsumego`）就全丢了。而「同一份题集练第二遍」「同一道题反复练」是最常见用法，
+   每次都重跑 40~60 秒很冤。
+   ★ 键就是 `setupSig()`：摆子 + 先手 + 棋盘 + 规则 + 权重 + 裁切矩形都在里面 ——
+     环境一变签名就变，旧值自动失效，不存在"拿旧环境的值套新环境"。
+   ★ 唯一的近似：sig **不含搜索量**（`settings.visits`）。改了深度（500→200）缓存值
+     可能差半目级，但配平本来就是 ±0.5 目的估计，不值得为此作废整份缓存。
+   ★ 上限 60 条（内存 12 条）：跨会话会攒起来，按写入时间丢最旧的。 */
+const BAL_LS_KEY = 'rapacego.balCache.v1';
+const BAL_LS_MAX = 60;
+let balDisk = null;
+function balDiskAll() {
+  if (balDisk) return balDisk;
+  balDisk = {};
+  try {
+    const raw = localStorage.getItem(BAL_LS_KEY);
+    const o = raw ? JSON.parse(raw) : null;
+    if (o && typeof o === 'object' && !Array.isArray(o)) balDisk = o;
+  } catch (e) { balDisk = {}; }
+  return balDisk;
+}
+function balDiskSave() {
+  try { localStorage.setItem(BAL_LS_KEY, JSON.stringify(balDisk || {})); } catch (e) { /* 存不下也能用 */ }
+}
+/* 只留「能重建一个够用的 bal」的字段。fixN / leadHist 是这一轮校正的过程量，
+   跨会话没有意义（下一趟会重新测）。 */
+function balDiskPut(sig, bal) {
+  if (!sig || !bal || !Number.isFinite(bal.komi)) return;
+  const d = balDiskAll();
+  const keys = Object.keys(d);
+  if (!d[sig] && keys.length >= BAL_LS_MAX) {
+    let oldest = keys[0], at0 = Infinity;
+    for (const k of keys) {
+      const v = d[k];
+      const t = (v && Number.isFinite(v.at)) ? v.at : 0;
+      if (t < at0) { at0 = t; oldest = k; }
+    }
+    delete d[oldest];
+  }
+  d[sig] = { komi: bal.komi, lead0: bal.lead0, capped: !!bal.capped, visits: bal.visits || 0, at: Date.now() };
+  balDiskSave();
+}
+function balDiskGet(sig) {
+  const v = sig ? balDiskAll()[sig] : null;
+  if (!v || !Number.isFinite(v.komi)) return null;
+  /* 返回**新对象**：内存里那份会被 noteBalWinrate 改写（fixN / leadHist），
+     不能让磁盘缓存跟着一起变。 */
+  return {
+    komi: v.komi, lead0: v.lead0, capped: !!v.capped, sig: sig,
+    visits: v.visits || 0, at: v.at || 0, fixN: 0, leadHist: [],
+  };
+}
+function balCacheGet(t, sig) {
+  const c = t && t.balCache;
+  if (c && c[sig]) return c[sig];
+  /* ★ 内存没有 → 查磁盘（跨会话）。命中就放进内存，同一进程内不再查第二次。 */
+  const d = balDiskGet(sig);
+  if (d && t) (t.balCache || (t.balCache = {}))[sig] = d;
+  return d;
+}
+function balCachePut(t, sig, bal) {
+  if (!t || !sig || !bal) return;
+  const c = t.balCache || (t.balCache = {});
+  const keys = Object.keys(c);
+  if (!c[sig] && keys.length >= BAL_CACHE_MAX) delete c[keys[0]];
+  c[sig] = bal;
+  balDiskPut(sig, bal);      // ★ 同时落盘（跨会话），见 balDiskAll
+}
+
+/* 让 `t.bal` 跟着**当前这个局面**的签名走。三个调用点，都是「摆子/先手可能变了」的时刻：
+   换题（tsLoadProblem）、改一颗摆子（placeSetupStone）、清空摆子（tsClearSetup）。
+   · 签名对得上 → 什么都不动；
+   · 对不上但缓存里有 → 拿回来（改回原样 / 来回翻题，都是命中缓存，不必重算）；
+   · 都没有 → 置 null。**这一步就是修「切题还用上一题配平」的关键**：
+     `tsKomi()` 见 `t.bal` 为 null 就回 0 目口径，新题的探针才是按 0 目发的（见 noteBalProbe）。
+   ⚠️ 必须在「新的摆子已经写进 state.setup / settings.tfirst」之后调用。 */
+function syncBalToSetup() {
+  const t = state.tsumego;
+  if (!t) return;
+  const sig = setupSig();
+  if (t.bal && t.bal.sig === sig) return;
+  t.bal = balCacheGet(t, sig);
+  t.probe = null;
+}
+
+/* 拿「初始局面那一趟分析」当配平依据（见上面那段）。
+   返回 true 表示这道题的贴目已经就位（新折出来的，或本来就有）。 */
+function balFromProbe() {
+  const t = state.tsumego;
+  if (!t) return false;
+  const sig = setupSig();
+  if (t.bal && t.bal.sig === sig) return true;            // 已有且有效
+  if (t.probe && t.probe.sig === sig && Number.isFinite(t.probe.lead0)) {
+    t.bal = mkBal(t.probe.lead0, sig, t.probe.visits);
+    dlog('配平：lead0=' + t.probe.lead0.toFixed(1) + ' → 贴 ' + t.bal.komi
+      + ' 目（visits ' + (t.probe.visits || 0) + (t.bal.capped ? ' · 已按上限截断' : '') + '）');
+    balCachePut(t, sig, t.bal);   // 来回翻题时直接复用（见 balCachePut）
+    dropBalHist();          // 0 目口径的第 0 手胜率作废（见 dropBalHist）
+    balWaitUntil = 0;       // 配平值到手 → 不必再等，应手马上排
+    balHardUntil = 0;       // 同上：硬上限一起撤（否则「探针在飞」那条还会拖住应手）
+    return true;
+  }
+  return false;
+}
+
+/* ★★ 把引擎从「算别的局面」里抢回来（2026-10-25，实测出来的一个死锁）。
+   场景（`_trash/_diag_bal_warm2.mjs` 实测）：翻到第 3 题时 lastAnalysis 还在算**第 2 题**
+   的局面，500 步在本机要 20+ 秒；这时点「开始解题」——
+     · 探针只认「当前摆子 + 当前先手」（`noteBalProbe` 的 sig 闸门），那趟的签名
+       `9|chinese|b||8|b1,1;...` 和现在的 `9|chinese|w||8|b0,0;...` 差两段 → 整条拒收；
+     · 而 `runAnalysis` 看到 `anaBusy` 又不肯发新请求（只登记 poke）→
+       于是「配平」要等那趟毫不相干的 500 步算完，第一手早走完了。
+   实测日志：整整 25 秒里 `sigOK=false`、`probe=null`，中途报告倒是爬到了 504 步 ——
+   全都白扔。所以进解题/重来时主动掐掉它：那趟的结果本来就会被 sig/gen 丢掉，
+   掐掉不损失任何东西，只是把引擎提前让给真正的探针。
+   ⚠️ 不许无条件掐：万一在飞的就是**当前摆子**（黑先题摆题阶段那一趟），那就是探针本身，
+      掐了反而丢掉现成答案。 */
+function freeEngineForProbe() {
+  if (!anaBusy) return false;
+  if (anaSigAtSend === setupSig()) return false;   // 算的就是当前局面 → 别动它
+  if (window.api && window.api.cancel) window.api.cancel();
+  dlog('配平：掐掉一趟算别的局面的分析（签名不符）');
+  return true;
+}
+
+/* 中间报告 / 最终回包都可调用：把这份报文里的目差记成 t.probe，
+   返回 true = **这次新折出了**配平值（调用方据此决定要不要掐掉这一趟、重算一遍）。
+
+   ★ 为什么必须吃**中间报告**（而不是只等最终回包）：实测 b11c768（线上权重）
+     约 15 visits/s，跑满 500 visits 要**三十来秒**；而中间报告 0.25 秒一条。
+     等最终回包再配平，第一手早走完了 —— 配平就成了装饰。
+   ★ 门槛 `TS_BAL_MIN_VISITS`：太少时目差还是噪声，会把贴目折歪几目。
+     40 步在实测里约 2~3 秒，已经能把"偏二十目"和"偏两目"分清楚。 */
+function noteBalProbe(p, at) {
+  const t = state.tsumego;
+  if (!t || !tsOn()) return false;
+  if (at !== 0) return false;                     // 只认**初始局面**（第 0 手之前）
+  /* 已经按**当前这个口径**配过 → 这份报文不再有意义（防自引用）。
+     ★★ 2026-10-27：判据从「贴目 ≠ 0」改成「贴目 ≠ 0 **且 sig 与当前一致**」。
+        原来那一版在裁切进来之后成了死锁：改框距 → sig 变了 → 应该重折，
+        可 `tsKomi()` 还拿着旧贴目（它故意不按 sig 回退，见那个函数），
+        于是这里一直 return，**配平值永远停在旧框距的口径上**。 */
+  if (tsKomi() !== TS_KOMI && t.bal && t.bal.sig === setupSig()) return false;
+  /* ★ 摆题阶段 `tsKomi()` 恒 0，上面那条判据在那儿永远不成立 —— 于是"命中缓存"
+     （从磁盘读回来的）也会被重新折一遍，白跑一趟。这里补一条与贴目无关的判据：
+     **当前签名已经有配平值了，就不必再折**（改框距 / 改摆子会换签名，仍会重探）。 */
+  if (t.bal && t.bal.sig === setupSig()) return false;
+  if (!p || !p.root) return false;
+  const visits = p.root.visits || 0;
+  if (visits < balMinVisits()) return false;
+  if (anaSigAtSend !== setupSig()) return false;  // 算的不是现在这个摆子（摆子刚改过）
+  /* ★★ lead0 必须是「**贴目 0** 口径」的黑方目差 —— 这是 `mkBal` 的前提（它直接把它当贴目用）。
+     探针平时确实是在贴目 0 时发的（摆题阶段 `tsKomi()` 恒 0），但有两种情况不是：
+       · **换了一道题**：`tsKomi()` 还拿着上一题的配平值（故意不按 sig 回退，见那个函数）；
+       · 解题中途回摆题改了摆子，再点开始解题。
+     这时引擎回的 `scoreLead` 已经把那个贴目算进去了，所以要加回去：
+     `L(0) = L(K) + K`（贴目给白方，抬高它 = 黑方目差变小）。
+     ⚠️ 别删这一项。2026-10-28 用户报「切到别的题还是用上一题的配平」就是它 ——
+        实测 xxqj 第 2 题：按旧贴目 39.5 发的探针折出 **−25.5**，而真值 ≈ **+12**
+        （同一局面在 −25.5 下复测 lead 仍 +36，差值正好对上旧贴目）。 */
+  const komiAtSend = Number.isFinite(anaKomiAtSend) ? anaKomiAtSend : 0;
+  const lead0 = blackLeadFrom(p, at) + komiAtSend;   // SIDETOMOVE → 黑方视角（唯一换算口）
+  if (!Number.isFinite(lead0)) return false;
+  t.probe = { sig: anaSigAtSend, lead0, visits };
+  const had = !!(t.bal && t.bal.sig === anaSigAtSend);
+  return had ? false : balFromProbe();
+}
+
+/* ★★ 配平第二级：**按实测残差把贴目推回去**（2026-10-27 重写，用户报「框距 2/3 时配平后
+   胜率差别仍然非常大」之后）。
+
+   ── 旧版错在哪（实测数据在下面「为什么」那段）──
+   旧版只认 winrate 一条路：`dk = (wr−0.5)/0.10`，且单次最多 **3 目**。
+   可裁切之后第一级给的初值就偏了 **7~9 目**，3 目的预算根本够不着 ——
+   实测（xxqj 第 3 题，500 visits，线上 b11c768）：
+
+     口径        第一级给的 komi   该 komi 下的胜率    真正 50% 的 komi
+     裁切 8×9        45.5            3.4%               ≈38
+     裁切 9×10       60.5            2.8%               ≈51.5
+     整盘 19×19      43.0            ~69%               ≫43（欠冲，方向相反）
+
+   顺带量出了两条硬事实（都是这题扫 komi 扫出来的）：
+     · **裁切小盘上「目差归零」与「胜率 50%」几乎重合**（9×10：lead=0 在 ~52，
+       胜率 50% 在 ~51.5）—— 所以小盘上**按目差残差修正是可靠的**；
+       整盘上两者却能差出几十目（双峰距离远、盘上未定区域多）。
+     · 小盘上胜率对 komi 极陡（8×9 实测 11pp/目、9×10 6.3pp/目，整盘 8~10pp/目），
+       所以第一级那 7~9 目的偏差足以把胜率从 50% 甩到 3%。
+
+   ── 现在的做法（三条一起）──
+   ① **目差残差优先**：`|lead| ≥ 1 目` 时 `dk = lead`（把期望目差 1:1 推回 0）。
+      不再受 3 目限制（`TS_BAL_LEAD_STEP = 10`）—— 偏差本身就是 7~9 目。
+   ② 目差已经归零（|lead| < 1）才退回胜率微调 `dk = (wr−0.5)/0.10`，
+      单次上限放宽到 8 目；两条同号时**取幅度更大的那个**（胜率那句更"急"）。
+   ③ **允许最多 3 轮**（`fixN`），每轮一趟分析；外加「不倒退」保护（见函数里那段）。
+      实测轨迹（xxqj 第 3 题，500 步，黑方视角）：
+        8×9 ：46.5（2.7%）→ 38.5（8.3%）→ 34.5（96.4%，跨过窄口）→ **回退 38.5**
+        9×10：60.5（2.2%）→ 55.5（24.1%）→ 52.5（25.9%）→ 50.5
+      贴目落点从旧版的 42.5 / 57.5 挪到 **38.5 / 50.5**（真值 38 / 51.5）——
+      **配平值本身现在是准的**，剩下的问题是读数：8×9 上 37 目约 73%、38 目约 40%、
+      38.5 目 10.7%（三次复测一致，不是随机噪声），半目对齐之后**几乎没有中间态可选**。
+      这是小盘的物理极限（贴目占盘面 50%+ 时引擎对死活的判断在窄口两侧二值化），
+      想在读数上也拿到 50% 只能靠更细的贴目步长（0.1 目）与更多轮次，实测不值。
+      详见 `习题配平方案.md` §14。
+
+   ★ 保留的老规矩（别删）：
+     · 只认第 0 手（`at !== 0` 直接返回）—— 校正量来自「初始局面」，用户一落子就没这个口径了；
+     · 门槛 150 步 —— 低搜索量的 winrate 会**高估黑方**（实测 40 步 80.5% / 500 步 66.8%），
+       但 lead 没这毛病，所以 ① 那条主路用 lead、不用 winrate；
+     · `anaSigAtSend !== setupSig()` 一律拒收（算的不是现在这盘）；
+     · 口径一变就 `dropBalHist()`（第 0 手的旧胜率立刻作废，见那个函数）。 */
+const TS_BAL_SLOPE = 0.10;     // Δ胜率/目：19 路实测 0.081~0.102；小盘实测 0.063~0.11（同一量级，沿用）
+const TS_BAL_WR_TOL = 0.08;    // |胜率 − 50%| 超过它才校
+const TS_BAL_WR_VISITS = 150;  // 40 步的 winrate 会高估黑方，必须等 150 步
+const TS_BAL_WR_STEP = 8;      // 胜率通道单次最多让 8 目（原来是 3 —— 小盘上一轮走不动）
+const TS_BAL_LEAD_TOL = 1.0;   // |lead| 超过它 = 目差还没归零 → 走 ① 那条主路
+const TS_BAL_LEAD_STEP = 10;   // 目差通道单次最多让 10 目（实测偏差 7~9 目）
+const TS_BAL_FIX_MAX = 6;      // 最多校几轮。★ 2026-10-27 从 4 提到 6：夹逼是二分，
+                               //   从 4.5 目的区间压到半目要 3 步；实测 8×9 第 1 题走到第 5 轮才踩到 38.0
+                               //   （4 轮时会停在 37.5~38.5，读数差 30~40pp）。收敛就提前退出，只有陡题才用满。
+
+function noteBalWinrate(p, at) {
+  const t = state.tsumego;
+  if (!t || !tsOn()) return false;
+  if (at !== 0) return false;
+  /* ★★ 2026-10-29：**摆题阶段也校正**（原来这里要求 `tsPhase() === 'solve'`）。
+     理由：预热趟就发生在摆题阶段，而二级校正（每改一档贴目就要重建一次树）是整条链
+     最贵的一段。用户在摆题阶段看题、调框距的那几十秒正好能把它跑掉 —— 等点
+     「开始解题」时贴目已经校正过，`balFromProbe()` 直接命中，0 秒配平。
+     原来那条限制的理由（"摆题阶段没有'这道题有多难'这回事"）管的是**讲解文案**，
+     与配平无关，不该套在这里。 */
+  if (!tsPhase()) return false;
+  const b = t.bal;
+  if (!b || b.sig !== setupSig()) return false;
+  if ((b.fixN || 0) >= TS_BAL_FIX_MAX) return false;
+  if (!p || !p.root) return false;
+  /* ★ 门槛跟着「计算深度」走：原来写死 150，用户把深度调到 150 以下就**永远不校正**
+     （而校正恰恰是裁切小盘上唯一能把 7~9 目偏差拉回来的东西）。
+     取 150 与「目标 × 0.8」的较小者 —— 主路走的是目差残差，低搜索量对它影响小。 */
+  const wrNeed = Math.min(TS_BAL_WR_VISITS,
+    Math.max(60, Math.round((settings.visits || ANALYZE_VISITS) * 0.8)));
+  if ((p.root.visits || 0) < wrNeed) return false;
+  if (anaSigAtSend !== setupSig()) return false;
+  const wr = blackWinFrom(p, at);                 // SIDETOMOVE → 黑方视角（唯一换算口）
+  const lead = blackLeadFrom(p, at);
+  if (!Number.isFinite(wr)) return false;
+  b.wr1 = wr;
+  b.lead1 = lead;
+  const err = Math.abs(wr - 0.5);
+
+  /* ★★ 记录「贴目 → 目差」样本，用来**实测** Δlead/Δkomi（正割法）。
+     为什么必须实测：公式默认「贴 1 目就收回 1 目目差」，那个比值在裁切小盘上是
+     **1.0~1.15**（可接受），但在**整盘的大目差题**上能到 **2.4** —— 实测 xxqj 第 12 题
+     （31 摆子、lead0 69 目，框距 2 整盘）：komi 65.5 → lead +8.3；komi 74 → lead −12.1，
+     也就是 8.5 目贴目收回了 20.4 目。按 1:1 就一步跨到对面（94.4% → 10.9%），
+     而回退保护只退一次 → 终点停在 18.3%（距 50% 31.7pp）。
+     有了两个样本就能把真实汇率解出来，下一轮按它折算（74 那轮：dk = −12.1/2.4 = −5 → 69）。
+     ⚠️ 必须有下限/上限（0.8~2.5）：相邻两轮的读数本身有 ±2~4 目噪声，
+        样本差太小时比值会算出天文数字。 */
+  if (Number.isFinite(wr)) {
+    const h = b.leadHist || (b.leadHist = []);
+    const rec = { k: b.komi, lead: Number.isFinite(lead) ? lead : NaN, wr };
+    if (!h.length || h[h.length - 1].k !== b.komi) h.push(rec);
+    else Object.assign(h[h.length - 1], rec);
+    while (h.length > 6) h.shift();
+  }
+  const leadRatio = (() => {
+    const h = b.leadHist || [];
+    if (h.length < 2) return 1;                           // 只有一个样本 → 按 1:1
+    const p = h[h.length - 2], q = h[h.length - 1];
+    if (!Number.isFinite(p.lead) || !Number.isFinite(q.lead)) return 1;
+    const dkAbs = Math.abs(q.k - p.k), dl = Math.abs(q.lead - p.lead);
+    if (dkAbs < 0.5 || dl < 0.5) return 1;                 // 差太小 → 估算不可靠
+    return Math.max(0.8, Math.min(2.5, dl / dkAbs));
+  })();
+
+  /* ★★ 夹逼（2026-10-27 第三次修，实测逼出来的）：裁切 8×9 上**半目 = 30~50pp**
+     （实测 37.5 目 90.2% / 38 目 41.7% / 38.5 目 10.7%），按斜率外推必然整段跨过去 ——
+     实测同一题两次跑出来的终点是 38.0→43.5% 和 37.5→91.9%，差别只在于 K1 是 45.5 还是 42。
+     这种曲线**唯一稳的办法是二分**：只要手上已有一个「>50%」的和一个「<50%」的样本，
+     就取两者中点（0.5 网格对齐），不再外推。区间宽度每轮减半，两三轮就能压到半目。
+     ★ 不设「宽度阈值」：宽度 0.5 时中点会落在端点上，下面 `k2 === b.komi`/越界判断会收工。 */
+  const bracket = (() => {
+    const h = b.leadHist || [];
+    let lo = null, hi = null;        // lo = komi 给小了（黑太强，wr>50%）；hi = komi 给大了
+    for (const s of h) {
+      if (!Number.isFinite(s.wr)) continue;
+      if (s.wr > 0.5 && (!lo || s.k > lo.k)) lo = s;
+      if (s.wr <= 0.5 && (!hi || s.k < hi.k)) hi = s;
+    }
+    if (!lo || !hi || lo.k >= hi.k) return null;
+    return { lo: lo.k, hi: hi.k };
+  })();
+
+  /* ★★ 不倒退（2026-10-27，实测逼出来的）：小盘上胜率对贴目**极陡** ——
+     同一个局面 35 目 → 96%、38.5 目 → 10.7%（二次复测都是这个数，不是随机噪声），
+     所以一轮步长稍大就会**跨过那个窄口**，从「太黑」直接跳到「太白」。
+     旧版没有这层保护，实测出现过 38.5（8.3%）→ 34.5（96.4%）这种越调越糟的轨迹。
+     规矩：这一轮的误差比**上一轮**更差（+2pp 以上）→ 退回上一轮那个贴目并收工，
+     因为它是目前实测过的唯一点里最好的。只回退一次（`reverted`），不会来回拉锯。 */
+  if (b.prevK !== undefined && b.prevK !== b.komi
+    && err > (b.prevErr || 1) + 0.02 && !b.reverted && !b.lastBisect && !bracket) {
+    /* ★★ 「不倒退」的两个例外（2026-10-27 实测补）：
+       · `!b.lastBisect`：二分走出来的步**不算跑偏** —— 它是「在两个跨过 50% 的样本之间取中点」，
+         落到哪一侧都是信息，区间本来就要减半；退回去等于把刚拿到的信息扔掉。
+       · `!bracket`：**只要手上已经有跨过 50% 的两个样本，变差也是进步**（区间被夹小了）。
+         实测裁切 8×9：39（24.5%）→ 37.5（86.5%，跨过 50%）→ 旧规则判「更差」退回 39
+         → 收工在 24.1%（差 26pp）；允许它继续二分（37.5~39 → 38）就能落在 45% 左右。
+       这条保护真正要拦的是「同一个方向上越走越远」（没有跨过 50% 的那种瞎跳），
+       例如早先实测的 38.5（8.3%）→ 34.5（96.4%）在同一口径下会被 bracket 接住并二分，
+       而不是被退回。
+       斜率外推的步照旧受这条约束：没有 bracket 时跳过头就得退。 */
+    const back = b.prevK;
+    b.reverted = true;
+    b.komi = back;
+    b.komi2 = back;
+    dlog('配平回退：' + b.wr1.toFixed(3) + ' 比上一轮 ' + (b.prevErr || 0).toFixed(3)
+      + ' 更差 → 贴目退回 ' + back);
+    dropBalHist();
+    return true;
+  }
+  b.prevK = b.komi;
+  b.prevErr = err;
+  if (b.reverted) return false;                    // 已经回退过一次 → 不再自动调（防拉锯）
+  if (err <= TS_BAL_WR_TOL
+    && !(Number.isFinite(lead) && Math.abs(lead) >= TS_BAL_LEAD_TOL)) {
+    return false;                                  // 两条都够平 → 收工
+  }
+
+  /* 两条通道，同号时取幅度大的 */
+  let dkLead = NaN, dkWr = NaN;
+  if (Number.isFinite(lead) && Math.abs(lead) >= TS_BAL_LEAD_TOL) {
+    /* ★ 除以实测汇率（正割法），不是除以 1（见上面 leadHist 那段） */
+    const d = lead / leadRatio;
+    dkLead = Math.max(-TS_BAL_LEAD_STEP, Math.min(TS_BAL_LEAD_STEP, d));
+  }
+  if (Math.abs(wr - 0.5) > TS_BAL_WR_TOL) {
+    const d = (wr - 0.5) / TS_BAL_SLOPE;
+    dkWr = Math.max(-TS_BAL_WR_STEP, Math.min(TS_BAL_WR_STEP, d));
+  }
+  /* 网格对齐：**整数或半整数**（KataGo 只收这种，见 mkBal 那段）。
+     ★ 不是「强制 +0.5」—— 整数点必须留着，实测 38.0 → 40%、38.5 → 10.7%。 */
+  const cap = tsBalMax();
+  let k2, why;
+  if (bracket) {
+    /* ★ 夹逼优先（见上面 bracket）：跨过 50% 的两个样本在手 → 只取中点 */
+    why = '夹逼 ' + bracket.lo + '~' + bracket.hi;
+    /* ★ 中点再对齐到 0.5 网格：mid = (lo+hi)/2，snap = round(mid×2)/2 = round(lo+hi)/2。
+       （别写成 round((lo+hi)*2)/2 —— 那是把中点乘 2，实测会得到 79.5 这种天文数字。） */
+    k2 = Math.round(bracket.lo + bracket.hi) / 2;
+    if (k2 <= bracket.lo || k2 >= bracket.hi) return false;   // 已压到半目 → 收工
+    b.lastBisect = true;
+  } else {
+    b.lastBisect = false;
+    let dk;
+    if (Number.isFinite(dkLead)) {
+      dk = dkLead; why = '目差 ' + (lead >= 0 ? '+' : '') + lead.toFixed(1)
+        + (leadRatio === 1 ? '' : '（汇率 ×' + leadRatio.toFixed(2) + '）');
+      if (Number.isFinite(dkWr) && Math.abs(dkWr) > Math.abs(dkLead) && dkWr * dkLead > 0) {
+        dk = dkWr; why += ' + 胜率 ' + (wr * 100).toFixed(1) + '%';
+      }
+    } else if (Number.isFinite(dkWr)) {
+      dk = dkWr; why = '胜率 ' + (wr * 100).toFixed(1) + '%';
+    } else {
+      return false;                                // 两条都够平 → 收工
+    }
+    /* ★ 已经靠近（|wr−50%| < 35pp）就把步长减半：那个区间里真实斜率是估的 2 倍以上，
+       照着算出来的步长一步就跨到对面（实测 39.0 → 36.5 直接 24% → 66%）。
+       阈值 0.35 是实测定的：8×9 在 39.0（23.8%，err 0.262）那一轮若不减半会落到 36.5（66%），
+       减半则落到 37.5（≈55%）—— 前者误差 15pp、后者 5pp。 */
+    if (err < 0.35) dk = dk * 0.5;
+    k2 = Math.round((b.komi + dk) * 2) / 2;
+  }
+  if (Math.abs(k2) > cap) k2 = k2 > 0 ? cap : -cap;
+  if (k2 === b.komi) return false;                 // 对齐后没动 → 别再空转（不消耗轮次）
+  b.fixN = (b.fixN || 0) + 1;
+  dlog('配平校正#' + b.fixN + '：' + why + ' → 贴目 ' + b.komi + ' → ' + k2);
+  b.komi2 = k2;
+  b.komi = k2;                                    // tsKomi() 立刻改口，下一趟就按新贴目发
+  b.corrected = true;
+  /* ★ 校正结果也写回缓存（2026-10-29，方案③）：原来只有第一级（`balFromProbe`）写缓存，
+     于是"来回翻题 / 下次再练"复用的是**第一级那个偏 2~8 目的初值**，等于白校正一场。
+     现在每校正一档就更新一次，缓存里始终是当前最好的那个值。 */
+  balCachePut(t, b.sig, b);
+  dropBalHist();                                  // 上一档贴目算的第 0 手胜率也作废
+  return true;                                    // 调用方据此掐掉这一趟、按新贴目重算
 }
 
 /* ★ 「局面代」：每次进入/重置局面就 +1（进入练习、开始解题、重来、重摆、清空都算）。
@@ -5078,6 +6019,16 @@ function tsBumpSeq() { defendSeq++; }
 function tsResetBoardState() {
   /* ★ 局面被重置 → 让**在飞的防守请求**作废（它算的是别的局面，回来会乱插一手）。 */
   tsBumpSeq();
+  /* ★ 配平（2026-10-25）：`bal` / `probe` 这里**都不清**。它们只跟「摆子 + 先手 +
+     权重」有关，重来 / 换阶段都只是动手顺，摆子没变 → 配平值继续有效（省一趟分析）。
+     ★★ 但**真正换了局面**（换题 / 改摆子 / 清空）时必须清，而且是在**调用方**清：
+        `tsLoadProblem` / `placeSetupStone` / `tsClearSetup` 都调 `syncBalToSetup()`。
+        光靠「setupSig 对不上」是不够的 —— 那只能让旧值失效，
+        可 `tsKomi()` 故意不按 sig 回退，于是新局的探针仍按**旧贴目**发出去，
+        折出来的贴目整整差一个旧贴目（2026-10-28 用户报的「切题还用上一题的配平」）。
+     但「等配平值的窗口」要清：它是一次性的，谁要等谁在重置之后自己设（开始解题 / 重来）。 */
+  balWaitUntil = 0;
+  balHardUntil = 0;              // 硬上限同理（两个一起清，别只清一个）
   state.moves = [];
   state.candidates = []; state.candAt = -1;
   state.ownership = null; state.ownAt = -1;
@@ -5217,6 +6168,42 @@ function tsSetProblem() {
 }
 
 /* 载入题集里的第 i 道题（0 起）。成功返回 true。 */
+/* ★★ 摆题阶段的预热（2026-10-29，方案①）。
+   为什么要有它：冷启动第一趟实测 40~60 秒，其中 **21~48 秒是引擎第一次真搜**
+   （Metal 编译 kernel + 权重首次前向：前几十秒一条中间报告都没有，
+   `_trash/_probe_cold` 两次分别 21.4 秒 / 47.6 秒）。
+   而「打开题集 / 切题」到「开始解题」之间，用户在看题、调框距 —— 这段时间
+   引擎**完全空转**：`tsLoadProblem` 以前一个分析请求都不发（只有手动摆子才发）。
+   进摆题阶段就把第 0 手那趟发出去，一举三得：
+     · 冷启动开销藏进"看题"里；
+     · 这一趟本来就是**配平探针**（摆题阶段 `tsKomi()` 恒 0，与解题同一口径）；
+     · nnCache 填热 → 后面每次换 komi 重算都变快（实测 45s → 6.8s）。
+   守卫（缺一条都会帮倒忙）：
+     · 引擎没就绪 → 什么都不做，等 `applyEngineStatus` 就绪那一刻再叫一次；
+     · 已经有分析在飞（旧题遗留 / 复盘）→ 不抢，免得互相掐；
+     · 这道题已经配过且签名一致（命中缓存）→ 不用再算；
+     · 翻题会连续调 `tsLoadProblem` → 600ms 防抖，只算最后停在的那一题。 */
+const TS_WARM_DELAY_MS = 600;
+/* 预热趟的搜索量上限。不必跑满 500 步（19 路约 67 秒）：
+   折第一级只要 40~150 步，填 cache 也是越多越慢越费电。200 步实测约 40 秒（冷）。 */
+const TS_WARM_VISITS = 200;
+let tsWarmTimer = 0;
+function tsWarmSetup(delay) {
+  if (tsWarmTimer) { clearTimeout(tsWarmTimer); tsWarmTimer = 0; }
+  tsWarmTimer = setTimeout(() => {
+    tsWarmTimer = 0;
+    const t = state.tsumego;
+    if (!t || t.phase !== 'setup') return;
+    if (!state.setup.length) return;                 // 空盘没什么可算
+    if (!engineReady) return;                        // 就绪后由 applyEngineStatus 再叫
+    if (anaBusy) return;                             // 有请求在飞 → 不抢
+    /* ★ 命中缓存（`t.bal` 已是当前签名）也要预热：配平不用算了，但**冷启动还得消化** ——
+       不预热的话点「开始解题」后第一趟 500 步照样要 20~47 秒才出第一条报告，
+       比配平本身还久。预热趟此时只干两件事：编译/加载 + 填 nnCache。 */
+    scheduleAnalysis(0, true);
+  }, delay == null ? TS_WARM_DELAY_MS : delay);
+}
+
 function tsLoadProblem(i, why) {
   const s = tsSet();
   const t = state.tsumego;
@@ -5255,7 +6242,22 @@ function tsLoadProblem(i, why) {
   state.myColor = tsMyColor();
   state.toMove = p.first;
   state.names = { b: '', w: '' };
+  /* ★★ 换到另一道题 → **上一题的配平值必须在这里摘掉**（2026-10-28 用户报障）。
+     `tsResetBoardState` 是故意不清 `bal`/`probe` 的（它只服务「重来 / 换阶段」，摆子没变）；
+     但换题时摆子变了，而 `tsKomi()` 是**故意不按 sig 回退**的（宁可旧不要崩）→
+     不摘就会出现用户看到的那两句抱怨：
+       ① 贴目栏 / 胜率卡一直摆着**上一题**的数，看着像"没重新配平"；
+       ② 新题的探针是**按上一题的贴目**发的 → 折出来的贴目整整差一个旧贴目
+          （实测 xxqj 第 2 题：旧 39.5，真值 ≈ +12，折出 **−25.5**，胜率直接顶在 100%）。
+     已经配过的那道题从缓存里取回来（键 = `setupSig()`，同一个环境），来回翻题就不必重算。
+     ⚠️ 位置必须在 `settings.tfirst` / `state.setup` 都写完之后 —— 本函数算的正是新题的签名。 */
+  syncBalToSetup();
   tsResetBoardState();        // 手顺 / 候选全清（顺带 +1 局面代，在飞的应手会作废）
+  /* ★ 逐手快照也得清（2026-10-28 同一个报障）：`anaAt[0]` 是**上一题**第 0 手的读数，
+     而 `evalForView()` 里它排在 `lastEval` 前面（见那个函数）→ 切题后右侧胜率卡
+     会一直摆着上一题的数（实测：切到第 2 题后仍写着「黑 55.6% / −0.1 目」，那是第 1 题的）。
+     这就是用户说的「还是用上一题的配平信息」的另一半。 */
+  state.anaAt = {};
   /* ★ 记下"这份题集练到第几题"（2026-10-16）：下次打开这份题集直接定位过来。
      写在这里而不是 tsGotoProblem 里 —— 翻题、面板点开、切模式回来都要记，
      而它们最终都会经过 tsLoadProblem（唯一的载入出口）。 */
@@ -5263,6 +6265,9 @@ function tsLoadProblem(i, why) {
   draw();
   syncTsumegoUI();
   syncUI();
+  /* ★ 预热（2026-10-29）：进摆题阶段就把第 0 手那趟发出去 —— 冷启动开销与
+     第一级配平都藏进"看题 / 调框距"的时间，见 tsWarmSetup。 */
+  tsWarmSetup();
   if (why) flash(why);
   return true;
 }
@@ -5352,9 +6357,19 @@ function tsStartSolve() {
   tsResetBoardState();
   draw();
   syncTsumegoUI();
+  /* ★ 配平（2026-10-25）：进解题之前先看「这道题偏多少目」有没有着落。
+     · 摆题阶段每摆一子都会算一趟（280ms），那一趟就是答案 → 这里只做**折算**，不发请求。
+     · 还没算完（摆完立刻点开始）→ 若这一手是 AI 走的，先**有限地等**一会儿它的结果
+       （`balWaitUntil`，见 maybeDefendMove）；等不到就按 0 目起步，
+       第 0 手那一趟回来时会自动补上（见 runAnalysisOnce 里的捕获分支）。 */
+  const balOk = balFromProbe();
+  balWaitUntil = balOk ? 0 : Date.now() + TS_BAL_WAIT_MS;
+  balHardUntil = balOk ? 0 : Date.now() + TS_BAL_WAIT_HARD_MS;
+  if (!balOk) freeEngineForProbe();   // 引擎还被「别的局面」占着 → 抢回来，见 freeEngineForProbe
   syncUI();
   scheduleAnalysis(0, true);
   flash('开始解题 · ' + (settings.tfirst === 'b' ? '黑先' : '白先')
+    + ' · ' + (t.bal ? '配平 ' + t.bal.komi + ' 目' : '配平中…')
     + (t.defend === 'solution' ? ' · 对手按正解应对'
       : t.defend === 'ai' ? ' · 另一方由 KATAGO 走' : ' · 两边都由你走'));
 }
@@ -5383,6 +6398,12 @@ function tsResetSolve() {
   tsResetBoardState();
   draw();
   syncTsumegoUI();
+  /* ★ 配平（2026-10-25）：重来只是清手顺，摆子没变 → 配平值照旧有效；
+     万一上一次没测得（引擎当时没就绪），这一趟 at=0 会再测一次，不额外等待。 */
+  const balOk2 = balFromProbe();
+  balWaitUntil = balOk2 ? 0 : Date.now() + TS_BAL_WAIT_MS;
+  balHardUntil = balOk2 ? 0 : Date.now() + TS_BAL_WAIT_HARD_MS;
+  if (!balOk2) freeEngineForProbe();   // 同上：重来时也可能被别的局面占着
   syncUI();
   scheduleAnalysis(0, true);
   flash('已回到这道题的初始局面');
@@ -5394,6 +6415,7 @@ function tsClearSetup() {
   tsBumpSeq();                    // 摆子清空 = 局面变了，在飞的请求作废（见 defendSeq）
   state.setup = [];
   t.nextColor = settings.tfirst;
+  syncBalToSetup();               // 空盘 = 另一个局面 → 旧贴目作废（见 syncBalToSetup）
   draw();
   syncTsumegoUI();
 }
@@ -5428,6 +6450,9 @@ function placeSetupStone(x, y, forceErase) {
   /* 初始局面变了 → 之前的候选点/形势作废（局面已经不是那个局面了） */
   state.candidates = []; state.candAt = -1;
   state.ownership = null; state.ownAt = -1;
+  /* 配平值也跟签名走：改一颗子 → 上一版的贴目作废（否则解题时还按它发探针，
+     折出来的值差一个旧贴目，见 syncBalToSetup）；改回来 → 命中缓存，不必重算。 */
+  syncBalToSetup();
   resetAnalysisState();
   draw();
   syncTsumegoUI();
@@ -5540,7 +6565,9 @@ function stillNeedDefend() {
   const t = state.tsumego;
   if (!(settings.mode === 'tsumego' && !!t && t.phase === 'solve')) return false;
   /* ★ 2026-10-17：「按正解」与「KATAGO」都要**对手**应手，只有「我下两边」不用。
-     所以这里判 !== 'both'，不再只认 'ai'。 */
+     所以这里判 !== 'both'，不再只认 'ai'。
+     ★ 配平的等待窗口**故意不在这里**（见 `balWaiting` 的注释）—— 它只该影响
+       「谁占用引擎」和「应手什么时候落」，不该影响"这个局面还需不需要应手"这个事实判断。 */
   if (t.defend === 'both') return false;
   if (t.showAnswer) return false;          // ★ 正在展示参考答案 → 不许接在答案后面继续走
   if (state.noGame || state.result) return false;
@@ -5629,6 +6656,17 @@ async function maybeDefendMove() {
     dlog('正解缺位 → 交给引擎');
   }
 
+  /* ★★ 配平窗口内，**要叫引擎**的应手先让路（2026-10-28 方案 A「应手让路」）。
+     为什么放在 solution 分支**之后**：按正解那一手不占引擎（`solutionReply()` 只读棋谱），
+     没理由跟着等 —— 放在前面会让「抢跑 + 按正解」也凭空慢最多 25 秒。
+     为什么必须让路：探针只认第 0 手（见 noteBalProbe），而引擎一次只算一个请求，
+     应手一发出去就把探针 terminate 掉（实测：抢跑时配平永久丢失，整题按 0 目算）。
+     窗口内**引擎没人抢** —— 除了这里，还有 runAnalysis 那道对称的守卫挡着 at=1 的分析，
+     缺一条都不成立。配平一到手 `balFromProbe()` 就把 `balWaitUntil` 清 0，应手马上排。
+     ⚠️ 只在这里挡，**不写进 stillNeedDefend()** —— 那条路 260ms 后还要复检一次（见 balWaiting）。
+     ⚠️ 必须重排，不能静默 return（这个定时器是「需要应手」的唯一入口，2026-10-14 踩过）。 */
+  if (balWaiting()) { scheduleDefendMove(Math.min(400, balWaitUntil - Date.now() + 50)); return; }
+
   const myTok = ++defendToken;
   const mySeq = defendSeq;          // ★ 记下"我是替哪个局面算的"
   defendBusy = true;
@@ -5653,9 +6691,12 @@ async function maybeDefendMove() {
         komi: settings.komi,
         size: N,
         maxVisits: Math.max(200, settings.visits),
+        /* ★ 主进程那条兜底原来固定 90 秒 —— 19 路 / 深档位下它其实不够，会把
+           「应手还在算」误判成超时（然后 `局面已变，这手作废`）。跟着棋盘放大。 */
+        timeoutMs: analyzeTimeoutMs(),
       }, tsAnalyzeExtras());
 
-      const res = await window.api.analyze(req);
+      const res = await window.api.analyze(tsCropReq(req));
       dlog('回应：ok=' + (res && !res.error && !res.cancelled)
         + ' cancelled=' + !!(res && res.cancelled) + ' err=' + ((res && res.error) || '—'));
       /* 局面被重置过 / 手数变了（重来、重摆、悔棋）→ 丢弃，什么都不落 */
@@ -5683,10 +6724,14 @@ async function maybeDefendMove() {
           if (!inside.length) { t.defendNote = '引擎给的应手全在框外（已丢弃）'; return; }
           infos = inside;
         }
-        /* ★ 方案 3（兜底，2026-10-17）：候选里只留贴题的（离棋子 ≤ TS_BAND 路）。
+        /* ★ 方案 3（兜底，2026-10-17）：候选里只留局部区域里的点。
            正常是空操作（请求里的 allowMoves 已经把搜索限在带内）；万一 allowMoves 失效、
-           或者带太窄退回整框，这一层挡住"引擎跑到远处大场"。一个不剩就保留原列表。 */
-        const localMoves = filterLocalMoves(infos, TS_BAND);
+           或者带太窄退回整框，这一层挡住"引擎跑到远处大场"。
+           ★ 2026-10-26：这里曾用 **tight**，要求与请求里给对手的那一份同口径。
+           ★ 2026-10-27：tight 停用 → 跟着请求一起换成 **wide**。**两处必须同档**，
+             否则"请求里允许、兜底又砍掉"会白丢一手（那正是 2026-10-26 记下的坑）。
+           一个不剩就保留原列表。 */
+        const localMoves = filterLocalMoves(infos, fr, false);
         if (localMoves.length) infos = localMoves;
         const top = infos.find(m => m.order === 0) || infos[0];
         if (!top) { t.defendNote = '引擎没给候选点'; return; }
@@ -5994,7 +7039,7 @@ function setTkaicolorEnabled(on) {
 
 /* ---------------- 引擎分析 ---------------- */
 
-/*单次分析的目标搜索量。
+/*单次分析的目标搜索量（`settings.visits` 为 0 / 非法时的兜底）。
    ★ 2026-10-04 从 1600 降到 500 —— 这是「推荐点要实时出现」的关键。
      问题不在我们的显示逻辑，而在**引擎一次只能算一个请求**：
      旧局面的分析要跑满 1600 visits（约 2~3 秒）才轮到新局面，
@@ -6006,7 +7051,9 @@ function setTkaicolorEnabled(on) {
        1600 visits：0.7 秒，胜率波动更小（0.2% vs 0.7%）
      → 慢一倍换来的精度提升很小，而响应速度是**能直接感觉到的**，所以选 500。
    ★ 2026-10-04 后续：用户要求「做成可调」，所以这个常量只当**默认值**用，
-     实际取值在 settings.visits（「新对局」面板 → 计算深度，见 VISIT_OPTS）。 */
+     实际取值在 settings.visits（「新对局」面板 → 计算深度，见 VISIT_OPTS）。
+   ★ 2026-10-26：一度降到 300，**当天改回 500** —— 300 步在 19 路死活题上候选点飘得明显，
+     而默认档是"用户不调就用它"的那一档，宁可按老的 500（配合按棋盘放大的超时，不会误判）。 */
 const ANALYZE_VISITS = 500;
 /* 搜索量低于此值时先不显示候选点。
    ★ 2026-10-04 从 150 降到 20 —— 用户对照 KaTrain 指出：
@@ -6018,14 +7065,42 @@ const ANALYZE_VISITS = 500;
      只保留一个极低门槛，是为了滤掉 visits=0/1 那种纯噪声（点的排序会乱跳）。 */
 const HINT_MIN_VISITS = 20;
 
-/* 渲染端等一次分析请求回来最多等多久（毫秒）——见 runAnalysisOnce 里的 Promise.race。
-   取值理由：
-     · 正常一次分析 0.4~1.5 秒（500 visits，实测中位 472ms）；
-     · 引擎切到一个全新局面重建搜索树最慢约 1~3 秒；
-     · 就算「计算深度」调到最大档（用户能选到的上限）也远在 25 秒内。
-   25 秒是「不可能有这么慢的正常请求」的界线 —— 超过它就不是慢，是那条路断了。
-   ⚠️ 别调太小：调成 5 秒会在深档位下把正常请求误判成超时，反而让分析一直在重排。 */
-const ANALYZE_TIMEOUT_MS = 25000;
+/* 渲染端等一次分析请求回来最多等多久（毫秒）—— 按**棋盘 × 搜索量**缩放。
+
+   ★★ 2026-10-26 之前这是个固定 25 秒的常量，那个数字是按「9 路 / 500 步」拍的
+     （实测 28.5 秒，其实已经贴着线了）。放到 19 路就必然误判：xxqj 那套题
+     500 步实测要 **20~46 秒** → 每一趟都被判超时 → 重排 → `terminate` **毁掉搜索树**
+     → 从 0 重算 → 三连「连续无响应」。用户看到的「胜率条抖 / 算一半没了 / 等很久」
+     有一半是这条线造成的。所以这里不能再拍死一个数。
+
+   ★ 这套预算**两端共用一个来源**：渲染端把它塞进请求（`timeoutMs`），主进程照着它兜底。
+     不这么做的话，主进程那个固定 90 秒会把这里的放宽整个吃掉。 */
+
+/* 每步（visit）的耗时预算，按棋盘点数在 55~95ms 之间线性插值。
+   依据（本机 + 262M 权重 b11c768，裸引擎、热引擎、盘面各不相同的实测）：
+     · 9 路 300 步 10.4~32.9 秒 → 33~105ms/步
+     · 19 路 300 步 17.7~23.5 秒 → 56~75ms/步
+   （是的，9 路反而更不稳定 —— 9 路每步要重开搜索的面更大。所以两个都按区间上沿取，
+     宁可在死请求上多等十秒，也不要把它误判成超时：误判的代价是**毁树重算**。） */
+function analyzeVisitCost(size) {
+  const n = size || N || 19;
+  const t = Math.max(0, Math.min(1, (n * n - 81) / (361 - 81)));   // 9 路 0 → 19 路 1
+  return 55 + 40 * t;
+}
+
+/* 超时预算 = 固定项 + 每步预算 × 搜索量。
+   · **固定项 30 秒 = 冷启动 / 建树余量**：引擎刚加载时 Metal 第一次编译内核，
+     实测头 20 多秒只攒到 5 步（那不是"慢"，是还没开始跑）；换棋盘 / 换局面重建搜索树
+     也要几秒。没有这一项，冷启动必然被判超时，而超时 → terminate → 毁树，正好是最坏的连锁。
+     （实测冷启动最坏一跑：9 路 315 步 55.3 秒。所以冷启动**仍可能**偶尔撞线一次 ——
+      撞了也无妨，重排那一次引擎已经是热的，一次就过。）
+   · **上限 180 秒**：极端档位（19 路 × 1500 步以上）真的算不完就不硬撑了，
+     让超时逻辑给用户一句明确的话，而不是无限「计算中」。
+   实测对照（19 路 / 300 步）：公式给 58.5 秒，真实 18~25 秒 → 约 2.4 倍余量。 */
+function analyzeTimeoutMs(size, visits) {
+  const v = visits || settings.visits || ANALYZE_VISITS;
+  return Math.round(Math.min(180000, 30000 + v * analyzeVisitCost(size)));
+}
 
 /* ★ 分析链路的轻量埋点（2026-10-07 新增）。
    为什么要它：用户报「AI 落子后马上悔棋，选点/形势有时卡住不显示」，
@@ -6057,7 +7132,8 @@ const anaDiag = {
 function alog(msg) { /* 已撤：见上面的说明 */ }
 
 /* 连续超时计数（成功一次就归零）。超时后要主动重排一次，但不能无限重排 ——
-   引擎真挂了的时候，无限重排会变成每 25 秒一次的无效空转，日志和界面都在刷。 */
+   引擎真挂了的时候，无限重排会变成「每 analyzeTimeoutMs() 一次的无效空转」，
+   日志和界面都在刷。 */
 let anaTimeouts = 0;
 /* 「anaBusy 是什么时候置上的」——给顶栏那个「刷新」按钮判断"是真卡了还是正在算"。
    置上时间超过 REFRESH_STUCK_MS 就一定不是正常请求（正常一次 0.4~1.5 秒）。 */
@@ -6340,8 +7416,10 @@ async function runAnalysis() {
      于是分析循环不停发请求 → 防守请求每次都被掐掉 → 对方永远不应子。
      （2026-10-12 端到端测试实测到的就是这个：手数停在 1，AI 一声不吭。）
      数子 / 复盘那两条守卫是同一个道理，这里照办：
-     **轮到防守方时把引擎让给它**，防守落子后会 syncUI → 分析自然接着排。 */
-  if (needDefendMove() || defendBusy) { anaDiag.note('习题防守中提前return'); return; }
+     **轮到防守方时把引擎让给它**，防守落子后会 syncUI → 分析自然接着排。
+     ★ 配平等待窗口是**反过来**的：这几秒里应手故意不动（`balWaiting`），
+       而"轮到的这一趟分析"正是探针 —— 所以要把窗口从这条守卫里排掉。 */
+  if (defendBusy || (needDefendMove() && !balWaiting())) { anaDiag.note('习题防守中提前return'); return; }
   if (!engineReady) { anaDiag.failEarly.notReady++; anaDiag.note('引擎未就绪提前return'); alog('run 引擎未就绪 → 不发'); return; }
   if (anaBusy) { anaPoke = true; anaDiag.failEarly.busy++; alog('run 已有请求在飞 → 只登记 poke'); return; }
   anaBusy = true;
@@ -6352,8 +7430,28 @@ async function runAnalysis() {
   try {
     /* 上限只是防止意外死循环（正常一轮只会跑十几次）。 */
     for (let guard = 0; guard < 500; guard++) {
-      if (scoreBusy || reviewBusy || defendBusy || needDefendMove() || !engineReady) { anaDiag.note('数子/复盘/防守/引擎掉了 中断循环'); alog('run 循环中断：数子/复盘/防守/引擎掉了'); break; }
+      if (scoreBusy || reviewBusy || defendBusy || (needDefendMove() && !balWaiting()) || !engineReady) { anaDiag.note('数子/复盘/防守/引擎掉了 中断循环'); alog('run 循环中断：数子/复盘/防守/引擎掉了'); break; }
       if (gen !== gameGen) { anaDiag.note('换局中断循环'); alog('run 循环中断：换局/换棋谱（代 ' + gen + '→' + gameGen + '）'); break; }   // ★ 换局 / 换棋谱了：剩下的欠账全部作废
+
+      /* ★★ 配平窗口内：**引擎只该算探针（at=0）**，别拿当前局面（at=1…）去占它
+         （2026-10-28 方案 A 实测出来的第二条坑）。
+         抢跑 350ms 时探针往往还没发出去（`scheduleAnalysis` 有去抖），于是这里先算
+         viewAt=1 → 那趟回来时 `p.turn=1 ≠ 0`，`noteBalProbe` 只认 at=0 → 永远折不出配平。
+         实测症状：抢跑后 45 秒仍写着「配平中…」，整题按 0 目跑（右侧 +32.7 目）。
+         判据：`t.probe` 的签名对上就不再重复（`noteBalProbe` 一收到就设它，
+         随即 `balFromProbe()` 把窗口清 0 → 下一轮自然恢复正常优先序）。 */
+      if (tsOn() && tsPhase() === 'solve' && state.viewAt !== 0
+          && balWaiting() && tsKomi() === TS_KOMI) {
+        const probeSigOk = !!(state.tsumego && state.tsumego.probe
+          && state.tsumego.probe.sig === setupSig());
+        if (!probeSigOk) {
+          anaDiag.note('配平窗口：先算探针 at=0');
+          alog('run 配平窗口先算探针 at=0（当前 viewAt=' + state.viewAt + '）');
+          const ok0 = await runAnalysisOnce(0);
+          if (!ok0) { anaDiag.note('配平窗口：探针那趟没成功 → 退出循环'); break; }
+          continue;
+        }
+      }
 
       /* ① 先算**当前看着的局面** —— 胜率条 / 候选点 / 形势雾要它上屏（最高优先）。 */
       const cur = state.viewAt;
@@ -6408,6 +7506,17 @@ async function runAnalysisOnce(at) {
   const gen = gameGen;          // ★ 记下这一请求属于哪一代（换局后就作废）
   anaReqGen = gen;             // onProgress 的中间报告也按它过滤
 
+  /* ★ 这一趟算不算「配平探针」（2026-10-25）：习题模式下，**算的是第 0 手（初始局面），
+     而且发出去时贴目还是 0 目**（= 这时 `tsKomi()` 还没配平值）。
+     摆题阶段与解题阶段共用这一条判据 —— 两阶段的口径本来就一样（`tsKomi()` 摆题恒 0），
+     所以只留一个开关，不会再出现"某个分支忘了同步"（那是踩坑②的一部分）。
+     ★ 配平之后 `tsKomi()` ≠ 0 → 这条自然失效，不会拿配平后的目差当 lead0（防自引用）。 */
+  const balSentAsProbe = tsOn() && at === 0 && tsKomi() === TS_KOMI;
+  anaAtSend = at;                            // ★ 中间报告靠它认"这是第几手"（见声明处）
+  anaSentAt = Date.now();                    // ★ 这一趟什么时候发的（见 balMinVisits）
+  anaKomiAtSend = tsOn() ? tsKomi() : 0;     // ★ 这一趟实际发的贴目（见声明处，noteBalProbe 要用）
+  if (tsOn()) anaSigAtSend = setupSig();     // 记下这一趟算的是**哪个摆子局面**
+
   const req = {
     initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
     moves: state.moves.slice(0, at)
@@ -6432,18 +7541,36 @@ async function runAnalysisOnce(at) {
      后果不是"这一手没算"，而是**整个分析链路停摆**：
      选点不再刷新、胜率条冻住、棋盘上方那行「计算中… N」定在一个数字上不动，
      点悔棋、回看、落子都不管用，只能重启软件。这正是用户报的现象。
-     加这一层之后，最坏情况是「这一手晚 25 秒」，而不是整个软件卡死。 */
+     加这一层之后，最坏情况是「这一手晚 analyzeTimeoutMs() 那么久」（9 路 / 300 步约 47 秒，
+     19 路 / 300 步约 59 秒），而不是整个软件卡死。 */
   let res;
+  /* ★ 这一趟的等待预算：自己用，同时告诉主进程（`timeoutMs`）——
+     主进程那个兜底固定 90 秒，不跟着放大就等于把这里的放宽吃掉。
+     ★ 只算一次（别在两处各调一次函数：改档位是热切换，中间可能变）。 */
+  const budget = analyzeTimeoutMs();
   try {
     res = await Promise.race([
-      window.api.analyze(Object.assign({
-        maxVisits: settings.visits || ANALYZE_VISITS,   // ★ 每次请求现读 —— 所以改档位是**热切换**
+      window.api.analyze(tsCropReq(Object.assign({
+        /* ★ 每次请求现读 —— 所以改档位是**热切换**。
+           ★★ 摆题阶段只用 TS_WARM_VISITS（2026-10-29 预热）：这一趟的用途是
+           ① 把引擎编译/权重加载的冷启动开销吃掉（藏进用户看题调框距的时间）
+           ② 折出第一级配平（40 步就够，150 步更准）
+           ③ 把 nnCache 填热（后面换 komi 重算的每趟会快一个数量级）
+           跑满 500 步在 19 路上要 60 秒以上，对上面三件事都是浪费。 */
+        maxVisits: (tsOn() && tsPhase() === 'setup')
+          ? TS_WARM_VISITS
+          : (settings.visits || ANALYZE_VISITS),
+        timeoutMs: budget,                       // 主进程照着它兜底（见 main.js 的 budget）
         includeOwnership: state.showTerritory,   // 形势雾的数据（不增加搜索量）
       }, req, /* ★ 习题练习：先手方(initialPlayer) + 框架约束(allowMoves)。
                      放在最后 = 不能被 req 覆盖掉（漏了这两个，题就做不严谨：
-                     引擎会自己猜先手，还会推荐框架外的脱先点）。 */
-        tsAnalyzeExtras())),
-      new Promise(r => setTimeout(() => r({ error: '分析请求超时（渲染端 25 秒没有响应）' }), ANALYZE_TIMEOUT_MS)),
+                     引擎会自己猜先手，还会推荐框架外的脱先点）。
+                     ★ 裁切（tsCropReq）套在**最外面**：它要把上面这些字段里的坐标
+                     全部换算成小盘口径，所以必须是最后一步（见它自己的注释）。 */
+        tsAnalyzeExtras()))),
+      new Promise(r => {
+        setTimeout(() => r({ error: '分析请求超时（渲染端 ' + Math.round(budget / 1000) + ' 秒没有响应）' }), budget);
+      }),
     ]);
   } catch (e) {
     res = { error: String((e && e.message) || e) };
@@ -6452,6 +7579,10 @@ async function runAnalysisOnce(at) {
   /* ★ 这一趟期间**换过局 / 换过棋谱** → 这次结果整体作废（一个字段都不写）。
      放在所有分支之前：连「记 history」都不做，那些手已经不属于现在这盘棋了。 */
   if (gen !== gameGen) { alog('once at=' + at + ' 作废：期间换过局（代 ' + gen + '→' + gameGen + '）'); return false; }
+
+  /* （2026-10-25）原来这里有一段「配平探针」的专用分支：探针搭「第一趟分析」的便车、
+     还要挡住应手等它回来。实测那会让应手和候选点在压力下全被堵死（`_cdp_tsumego` 1★→7★）。
+     现在探针就是**普通的 at=0 分析**，结果在下面那段里顺手捕获，不再有独立分支。 */
 
   /* ★ 被 cancel 掐掉的结果是**搜索中途的半成品**（visits 很少、胜率还没收敛）——
      绝不能上屏，否则胜率条会瞬间跳到一个极端值、过几秒又弹回来
@@ -6502,6 +7633,27 @@ async function runAnalysisOnce(at) {
     return false;
   }
   anaTimeouts = 0;                 // 有结果回来了 → 计数归零
+
+  /* ★ 配平（2026-10-25）：这一趟如果算的是**初始局面、且是按 0 目口径发的**，
+     它的目差就是 lead0 —— 记下来折算成贴目，之后的请求（含应手）就带上新贴目。
+     正常早就从中间报告里拿过了（`noteBalProbe`，见 onProgress）；这里兜的是
+     「计算深度调得很小、中间报告一条都没落在门槛之上」那种情况。
+     ★ 新折出来 + 已经在解题 → 这一趟是按 0 目算的、没意义了，按新贴目重算一遍。
+       ★ 2026-10-29：摆题阶段也重排了（原来这里判 `tsPhase() === 'solve'`）——
+         现在摆题阶段就在配平（预热趟），不重排的话引擎要按 0 目把整趟白跑完。
+       正轮到 KATAGO 应手 → 也不排（引擎让给它），它那一手本身就是配平口径。 */
+  if (balSentAsProbe) {
+    if (noteBalProbe(res, at)) {
+      syncUI();
+      if (!needDefendMove()) scheduleAnalysis(0, true);
+    }
+  } else if (noteBalWinrate(res, at)) {
+    /* ★ 第二级（按胜率过冲）：这一趟是按 k1 发的配平趟，胜率仍偏 → 再让几目重算。
+       ⚠️ 必须和上面互斥（`else`）：探针那一趟的 winrate 是**0 目口径**（几乎必是 100%），
+          拿它算过冲会把贴目推飞。 */
+    syncUI();
+    if (!needDefendMove()) scheduleAnalysis(0, true);
+  }
 
   /* 补历史欠账（at ≠ 当前局面）：只记这一手的胜率，画面别动。 */
   if (at !== state.viewAt) {
@@ -6578,10 +7730,16 @@ function rememberEval(at, blackWin, blackLead, visits) {
   const v = (typeof visits === 'number' && visits > 0) ? visits : 0;
   const target = settings.visits || ANALYZE_VISITS;        // 底栏「计算深度」
   const SETTLED = target * 0.9;                            // 「够准」的搜索量门槛
+  /* ★ 习题配平（2026-10-25 深夜）：**第 0 手的口径会变**（0 目 → lead 配平 → 胜率校正），
+     每次都换一个贴目，旧值和新值根本不可比。所以这两道门槛对它**一律放行**：
+     否则走势图第 0 手会永远停在第一档口径的值上（实测：胜率条 39.5%，走势图 99.98%），
+     而那正好是用户嘴里「初始双方胜率相差很大」的那一格。
+     只放开第 0 手：1 手以后口径固定，防抖动的意义照旧。 */
+  const balAt0 = at === 0 && tsOn() && tsKomi() !== TS_KOMI;
   if (typeof state.history[at] === 'number') {             // 这一格已经有值了
     const old = state.histVisits[at] || 0;
-    if (v < SETTLED) return;              // ① 粗算不许覆盖
-    if (v < old) return;                  // ② 不许倒退（用更少的搜索量改写）
+    if (!balAt0 && v < SETTLED) return;        // ① 粗算不许覆盖
+    if (!balAt0 && v < old) return;            // ② 不许倒退（用更少的搜索量改写）
   }
   if (typeof blackWin === 'number') state.history[at] = blackWin;
   if (typeof blackLead === 'number') state.leads[at] = blackLead;
@@ -6677,8 +7835,10 @@ function applyAnalysis(p, at) {
   $('eval-lead').textContent = signed(lead) + ' 目';
   $('eval-lead-w').textContent = signed(-lead) + ' 目';
 
-  /* 存一份给「AI 要不要认输」判断用（它需要知道自己落后多少） */
-  state.lastEval = { blackWin, lead };
+  /* 存一份给「AI 要不要认输」判断用（它需要知道自己落后多少）。
+     ★ 2026-10-28 加 `at`：右侧胜率卡要按手数取数（回看时不能拿别的手冒充，见 evalForView）。
+     读它的地方只认 blackWin / lead，加一个字段不影响。 */
+  state.lastEval = { blackWin, lead, at };
 
   /* 形势（ownership）—— 放在 HINT_MIN_VISITS 那道门槛**之前**：
      雾是「渐变收敛」的，早一点显示出来观感更好（看不清就淡一点，不该从无到有地跳）
@@ -7056,6 +8216,7 @@ if (window.api) {
   const applyEngineStatus = s => {
     const a = readEngineState(s, 'analyze'), p = readEngineState(s, 'play'),
       c = readEngineState(s, 'coach');
+    const wasReady = engineReady;          // ★ 预热要认「false → true」这一跳（见下面那一段）
     engineReady = !!a.ready;
     engineReadyPlay = !!p.ready;
     coachReady = !!c.ready;
@@ -7078,6 +8239,13 @@ if (window.api) {
        分析引擎就绪 → 立刻算当前局面；对弈引擎就绪 → 轮到 AI 就让它落子。 */
     syncUI();
     checkEngineReloaded();      // 「设置」里改完路径的重启 → 两个都就绪才算重启完成
+    /* ★★ 分析引擎刚就绪、而现在停在摆题阶段 → 立刻开始预热（2026-10-29）。
+       为什么必须在这里也接一次：用户常见顺序是「先打开题集看题，再点灯加载引擎」——
+       那一趟 tsLoadProblem 发生在引擎就绪之前，`tsWarmSetup` 里 `!engineReady` 直接返回，
+       没有这一句就等于预热永远不触发（灯绿之后引擎继续空转，直到点「开始解题」）。
+       ⚠️ 只认 false → true 这一跳：`applyEngineStatus` 任何一次状态推送都会走到这里，
+          每次都调 `tsWarmSetup(0)` 会不停清掉那个 0ms 定时器，反而永远轮不到执行。 */
+    if (!wasReady && engineReady && tsOn() && tsPhase() === 'setup') tsWarmSetup(0);
   };
 
   /* ---------- 顶栏引擎状态灯（2026-10-05 新增） ----------
@@ -7221,7 +8389,7 @@ if (window.api) {
   /* ---------- 顶栏「刷新」按钮（2026-10-06 晚新增，用户要求） ----------
      用途：出现「推荐点不显示 / 棋盘上方『计算中… N』定住不动」时的**急救键**。
      为什么必须有它（而不是只靠自动恢复）：分析链路上有两条"等引擎回话"的路
-     （主进程 90 秒、渲染端 25 秒），但都可能因为别的原因没兜住；
+     （主进程 90 秒、渲染端 analyzeTimeoutMs()），但都可能因为别的原因没兜住；
      一旦那一次 await 永不返回，`anaBusy` 就永远占着 → 整个分析链路停摆，
      用户能做的只有重启软件。有了它，用户自己点一下就放开、重排、并顺手救引擎。
 
@@ -7301,6 +8469,14 @@ if (window.api) {
     /* ★ 换局 / 换棋谱之后，旧请求的中间报告一律不要（anaReqGen 还停在上一代）——
        否则它们会往刚清空的界面上写数据。 */
     if (anaReqGen !== gameGen) return;
+    /* ★★ 换了一道题 / 改了摆子 → 上一趟的中间报告不能画到新题上（2026-10-28）。
+       `gameGen` 只管「换局 / 换棋谱」，**换题不走它**（`tsLoadProblem` 只清手顺）——
+       而两道题可能都是 at=0，于是上一题那份报告的 `pAt` 恰好等于新题的 `viewAt`，
+       `applyAnalysis` 照画不误：胜率卡上留着上一题的数（用户报的「切题还用上一题」）。
+       判据用**发请求那一刻的摆子签名**（`anaSigAtSend`），和 `noteBalProbe` 同一个闸门；
+       分析是串行的，新请求一发就会把旧的那趟 terminate 掉，所以这里不会误杀自己。
+       ⚠️ 只对习题模式生效：棋谱复盘 / 对弈那套没有「摆子签名」这回事。 */
+    if (tsOn() && anaSigAtSend !== setupSig()) return;
     /* ★★ 只认分析引擎的报告（2026-10-06 审查发现）。
        对弈引擎（AI 思考时）用的也是同一个通道，但它是人类棋风权重 + 你选的段位档，
        数字和分析引擎不一样；而它那次请求的手数恰好等于当前手数，
@@ -7308,7 +8484,60 @@ if (window.api) {
        还会污染走势曲线和 state.lastEval。主进程现在也会带 `engine` 且只推分析引擎的，
        这里再挡一道（两边都拦，任一侧改动都不会漏）。 */
     if (!p || p.engine !== 'analyze') return;
-    if (typeof p.turn === 'number' && p.turn !== state.viewAt) return;
+    /* ★★ 2026-10-28：配平没到手时，**「第 0 手」的报告即使不是当前局面也要收**。
+       原因是实测出来的（`_trash/_probe_ts_race2.mjs`）：用户在配平折完之前抢着落子
+       → `balWaiting` 失效（它带 `moves.length === 0`）→ 对手是 KATAGO 时 200ms 后
+       就排应手，而应手和分析是**同一个引擎**（main.js 每条新请求都带 terminateId
+       掐掉前一个）→ 探针那趟被掐，中间报告也全被这条过滤丢掉 →
+       配平只能等应手跑完再重算：实测从 **9~17 秒变成 66.7 秒**，
+       这期间整题按 0 目口径跑（胜率条 100%、候选无差别），等于配平白做。
+       现在这条只喂 `noteBalProbe` / `noteBalWinrate`（**不上屏**）——
+       后面的 `applyAnalysis` 仍会因 `at !== viewAt` 自己丢掉，画面不会被别的局面污染。 */
+    /* ★★ 2026-10-28 补一刀：`p.turn` **可能不存在**（实测：中间报告里 `turnNumber` 是 undefined）。
+       只认它的话，at=0 的探针报告会被当成"当前局面"吞掉 —— 抢跑后 viewAt 已是 1，
+       于是 `noteBalProbe(p, 1)` 一律拒收，配平永远折不出来（诊断实测 30 秒 probe 仍是 null）。
+       所以用「在飞请求的 at」（`anaAtSend`）兜底；分析是串行的，这个值就是这一份报文的 at。 */
+    const pAt = (typeof p.turn === 'number') ? p.turn
+      : (anaAtSend >= 0 ? anaAtSend : state.viewAt);
+    if (pAt !== state.viewAt) {
+      if (pAt === 0 && tsOn() && tsPhase() === 'solve') {
+        const sigOk = !!(state.tsumego.bal && state.tsumego.bal.sig === setupSig());
+        if (!sigOk) {
+          if (noteBalProbe(p, 0)) {
+            syncUI();
+            if (window.api && window.api.cancel) window.api.cancel();
+          }
+        } else if (noteBalWinrate(p, 0)) {
+          syncUI();
+          if (window.api && window.api.cancel) window.api.cancel();
+        }
+      }
+      return;
+    }
+    /* ★ 配平（2026-10-25）：中间报告是 lead0 的**主要**来源 —— 500 visits 要三十来秒
+       （b11c768 实测 ~15 visits/s），等最终回包再配平，第一手早走完了。
+       见 noteBalProbe 上面那段。返回 true = 刚折出配平值。
+       · 解题阶段：这一趟是按 0 目发的，已经没用了 → **掐掉**，让下一趟按配平口径重算。
+         掐掉安全：分析是串行的（`anaBusy` 独占），此刻在飞的就是这一趟。
+         不掐的代价 = 引擎还要把剩下四百多步算完（实测三十多秒），配平后的结果才排上队。
+         被掐的那一趟会走 runAnalysisOnce 的 cancelled 分支，它自己会重排一次。
+       · 摆题阶段：什么都不用做 —— `tsKomi()` 摆题恒 0，下一趟还是同一口径。 */
+    if (noteBalProbe(p, state.viewAt)) {
+      syncUI();
+      /* ★★ 摆题阶段**不掐**（2026-10-29 实测：掐了反而更慢）。
+         实测对照（19 路整盘、第 2 题）：
+           · 摆题阶段折出就掐 → 那趟只填了 43 个局面的 nnCache，换 komi 后要**重建**
+             一整棵树，实测 45 秒，正好全砸在用户点「开始解题」之后（总 70 秒）；
+           · 摆题阶段不掐、让它跑满上限 → cache 填满 200 个局面，那棵树是白捡的热度。
+         摆题阶段本来就在"用户看题"的时间里跑，没什么可省的；
+         解题阶段则相反（用户在等），必须掐。 */
+      if (tsPhase() === 'solve' && window.api && window.api.cancel) window.api.cancel();
+    } else if (noteBalWinrate(p, state.viewAt)) {
+      /* 第二级：目差已配平、但胜率仍偏（19 路实测 72.8%）→ 按胜率再过冲几目。
+         这条报告是按**旧贴目**发的，已经作废 → 掐掉，让下一趟按新贴目重算。 */
+      syncUI();
+      if (window.api && window.api.cancel) window.api.cancel();
+    }
     applyAnalysis(p, state.viewAt);
     draw();
     renderCommentBox();      // 中间报告也在刷新「这一手的分析」那块文字（见 runAnalysisOnce 里的注释）
@@ -10051,14 +11280,18 @@ async function pickCandidatesAt(at) {
   }
   if (!engineReady) { needEngine('analyze', '推荐落点讲解'); return null; }
   const before = state.moves.slice(0, at);
-  const res = await window.api.analyze({
+  /* ★ 习题模式下这两条也要带框架约束（2026-10-26）。原来它们只看 settings.rules / komi，
+     完全不知道 allowMoves 这回事 —— 于是「推荐落点讲解」拿到的候选可以落在框外，
+     用户看到的就是"引擎跑到题目外面去了"。tsAnalyzeExtras() 会一并盖掉 rules/komi
+     （习题要用题目的口径），所以这里不必再自己读 settings。 */
+  const res = await window.api.analyze(tsCropReq(Object.assign({
     initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
     moves: before.map(mv => [mv.color === 'b' ? 'B' : 'W', mv.pass ? 'pass' : toGTP(mv.x, mv.y)]),
     rules: (RULES[settings.rules] || RULES.chinese).kata,
     komi: settings.komi,
     size: N,
     maxVisits: reviewVisits(),
-  });
+  }, tsAnalyzeExtras())));
   /* ⚠️ 候选点在 res.moves（主进程从 moveInfos 转出来的），**不在** res.root 里。 */
   const list = ((res && res.moves) || [])
     .filter(x => x && x.move && (x.visits || 0) >= 2)
@@ -10366,14 +11599,14 @@ async function runAnalysisExplain(force) {
         why.textContent = '（想听「为什么」，得先把 KataGo 加载起来 —— 它要先算一下当时的局面）';
         return;
       }
-      const res = await window.api.analyze({
+      const res = await window.api.analyze(tsCropReq(Object.assign({
         initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
         moves: before.map(mv => [mv.color === 'b' ? 'B' : 'W', mv.pass ? 'pass' : toGTP(mv.x, mv.y)]),
         rules: (RULES[settings.rules] || RULES.chinese).kata,
         komi: settings.komi,
         size: N,
         maxVisits: reviewVisits(),
-      });
+      }, tsAnalyzeExtras())));
       /* ⚠️ 候选点在 res.moves（主进程从引擎的 moveInfos 转出来的），
          **不在** res.root 里 —— res.root 只是 rootInfo（winrate/scoreLead/visits）。 */
       const list = ((res && res.moves) || [])

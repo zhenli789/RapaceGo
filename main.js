@@ -1120,6 +1120,62 @@ function coachExplain(req) {
 ipcMain.handle('coach:explain', (_e, req) => coachExplain(req || {}));
 ipcMain.handle('coach:cancel', () => ({ ok: coachCancel() }));
 
+/* ---------- 习题裁切：把「小棋盘」上的结果换算回全盘（2026-10-27） ----------
+
+   背景：习题练习模式下，渲染端（`app.js` 的 `tsCropReq`）会把「框架」当成一张真实的
+   小棋盘发给引擎（boardXSize/boardYSize）—— 这样引擎的搜索、policy、ownership
+   全都只覆盖框内那几十个点，画面那 19 路完全不参与计算。
+
+   代价是：引擎回来的所有坐标都是**小盘口径**（`moveInfos` / `pv` / `actualMove`），
+   `ownership` 与 `policy` 数组则是 **w×h** 而不是 n×n。全部在这里换算回全盘，
+   于是渲染端「发请求」以外的地方一行都不用改（候选点、形势雾、应手、讲解都当整盘用）。
+
+   ★ 只在这个 rec 带 crop 时执行 —— 对弈 / 复盘 / 框架关掉 / 数子 全都走原路径。
+   ★ 框外的 ownership 填 **0（中立）**：形势雾不给框外上色，正是"不分析全局"的本意。
+   ★ 还原不出来的坐标**原样保留**（宁可留个读不懂的字符串让上层过滤，
+     也别换成半个地址 —— 那会变成"AI 落在莫名其妙的地方"这种更难查的错）。 */
+const GTP_ROWS = 'ABCDEFGHJKLMNOPQRST';
+function uncropPayload(p, crop, pn) {
+  if (!p || !crop) return p;
+  const W = crop.w, H = crop.h, ox = crop.ox, oy = crop.oy;
+  const back = s => {
+    const t = String(s == null ? '' : s);
+    if (!t || t.toLowerCase() === 'pass') return s;
+    const m = /^([A-T])(\d{1,2})$/.exec(t);
+    if (!m) return s;
+    const cx = GTP_ROWS.indexOf(m[1]);
+    const cy = H - parseInt(m[2], 10);
+    if (cx < 0 || cx >= W || cy < 0 || cy >= H) return s;
+    return GTP_ROWS[cx + ox] + (pn - (cy + oy));
+  };
+  /* 小盘数组 → 全盘数组：按 (x,y) 搬过去，框外留 0 */
+  const arr = a => {
+    const out = new Array(pn * pn).fill(0);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const v = a[y * W + x];
+        if (v !== undefined) out[(y + oy) * pn + (x + ox)] = v;
+      }
+    }
+    return out;
+  };
+  if (Array.isArray(p.ownership) && p.ownership.length === W * H) p.ownership = arr(p.ownership);
+  /* ⚠️ policy **比棋盘多一位**：末元素是 pass 的概率（实测 6×5 → 31、19×19 → 362，
+     见 app.js 的 pickByHumanPolicy，它按 `length === N*N+1` 判断可用）。
+     所以不能跟 ownership 共用 arr()，否则整条 policy 作废（拟人落子会退化成按 prior 抽）。 */
+  if (Array.isArray(p.policy) && p.policy.length === W * H + 1) {
+    const out = arr(p.policy.slice(0, W * H));
+    out[pn * pn] = p.policy[W * H];                    // pass 位搬到新的最后一格
+    p.policy = out;
+  }
+  for (const m of (p.moves || [])) {
+    m.move = back(m.move);
+    if (Array.isArray(m.pv)) m.pv = m.pv.map(back);
+  }
+  if (p.actualMove) p.actualMove = back(p.actualMove);
+  return p;
+}
+
 /* ---------- 协议 ---------- */
 function onLine(e, line) {
   let msg;
@@ -1176,6 +1232,13 @@ function onLine(e, line) {
       payload.actualRank = i;                      // 0 = 就是 AI 首选；-1 = 被剪枝了
     }
   }
+
+  /* ★★ 习题裁切：把这一条报文从「小盘口径」换回「全盘口径」（2026-10-27）。
+     位置**必须**在 actualMove / actualRank 之后 —— 那两行是拿 `rec.moveList`（请求里的
+     小盘坐标）和 payload.moves 的**原值**比的，两边得同为小盘才比得对；
+     还原完两边都是全盘，仍然对得上。之后再往下（collect / 进度 / resolve）拿到的
+     就都是全盘坐标了，渲染端不需要知道裁切这回事。 */
+  if (rec.crop) uncropPayload(payload, rec.crop, rec.boardN);
 
   /* ★ 复盘（多回合）：逐条累积，**收齐再回**。
      原来每条 isDuringSearch===false 都会 resolve → 第一条就把 promise 结掉，
@@ -1289,8 +1352,11 @@ function analyze(e, req) {
       moves: req.moves || [],
       rules: req.rules || 'chinese',
       komi: (typeof req.komi === 'number') ? req.komi : 7.5,
-      boardXSize: req.size || 19,
-      boardYSize: req.size || 19,
+      /* ★ 2026-10-27 习题裁切：渲染端（tsCropReq）会把「框架」当成一张真实的小棋盘，
+         用 sizeX / sizeY 传进来（可以不是方形）。不裁切时只有 size（方形），
+         行为与以前**完全一样** —— 别把这里的优先级写反，否则对弈/复盘会被裁成 1×1。 */
+      boardXSize: req.sizeX || req.size || 19,
+      boardYSize: req.sizeY || req.size || 19,
       analyzeTurns: turns,
       maxVisits: req.maxVisits || 400,
       /* ⚠️ 合法范围 0.001~1000000（实测传 0 引擎直接报
@@ -1388,9 +1454,17 @@ function analyze(e, req) {
          · 只要引擎还在出消息（每手都推中途报告，见 reportDuringSearchEvery），就一直算；
          · 连续 stallMs 毫无音讯 → 认定卡死，把已算到的交回去（不比原来更差）；
          · 另加一个绝对上限，防止异常情况下永久占着分析引擎。
-       普通分析（单局面）仍然是固定 90 秒 —— 它没有中途报告之外的心跳。 */
+       普通分析（单局面）原来也是固定 90 秒 —— 它没有中途报告之外的心跳。
+       ★ 2026-10-26：这个 90 秒也不够用了 —— 19 路 × 500 步在这台机器上实测
+       20~46 秒，深档位（1500 步以上）直接过百秒，于是「还在算」被判成超时。
+       现在改成**听渲染端的**：请求里带 `timeoutMs`（渲染端按棋盘 × 搜索量算的，
+       见 renderer/app.js 的 analyzeTimeoutMs），这里只比它多留 10 秒当兜底 ——
+       谁算的那个数只该有一个来源。没带（老代码 / 别的调用）才回落到 90 秒。 */
     const REV_STALL = 180000, REV_CAP = 6 * 3600 * 1000;
-    const budget = 90000;
+    const asked = Number(req && req.timeoutMs);
+    const budget = (Number.isFinite(asked) && asked > 0)
+      ? Math.min(300000, asked + 10000)     // 上限 5 分钟：再久就不是慢，是那条路断了
+      : 90000;
     const timer = collect ? null : setTimeout(() => {
       const rec = e.pending.get(id);
       if (rec && !rec.done) {
@@ -1405,6 +1479,11 @@ function analyze(e, req) {
       collect, expect: turns.length, turns: [], moveList: req.moves || [],
       maxVisits: q.maxVisits,
       stallMs: REV_STALL, capTimer: null,
+      /* ★ 习题裁切（2026-10-27）：这份请求算的是「小棋盘」，回来的坐标要换算回全盘。
+         crop 由渲染端给（见 app.js 的 tsCropReq），boardN = 全盘边长。
+         不裁切时两者都是空 → onLine 里那段整段跳过，一个字节都不碰。 */
+      crop: (req.crop && req.crop.w > 0 && req.crop.h > 0) ? req.crop : null,
+      boardN: Number(req.boardN) > 0 ? Number(req.boardN) : 19,
     };
     e.pending.set(id, rec);
     if (collect) {
@@ -1479,6 +1558,18 @@ function cancel(e) {
       e.lastId = null;
       return { ok: true };
     }
+    /* ★★ 单局面分析也必须**真让引擎停下**（2026-10-25 实测补的漏）。
+       原来这里只在前端 resolve，一条指令都不给引擎 —— 它还闷头把整趟算完
+       （500 visits 在本机二十多秒），后发的那趟只能在后面排队。
+       实测证据（习题「开始解题」那一步）：掐掉之后整整 **12 秒零中途报告**、
+       新请求的 visits 死死卡在 3；配平探针要 22 秒才攒到 40 步，
+       而等待窗口只有 10 秒 → 于是「配平」永远配不上、等于装饰。
+       终止格式与复盘那条完全一致（terminate 自己也必须有 id，理由见上面 collect 分支）。 */
+    try {
+      e.proc.stdin.write(JSON.stringify({
+        id: id + '#term', action: 'terminate', terminateId: id,
+      }) + '\n');
+    } catch (err) { /* 写不进去也没关系：本地照样把 promise 结掉 */ }
     rec.done = true; e.pending.delete(id); clearTimeout(rec.timer);
     /* ★ 必须打上 cancelled 标记：这时候 rec.best 是**搜索中途的半成品**
        （visits 很少、胜率还没收敛）。前端若把它当正常结果上屏，

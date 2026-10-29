@@ -71,12 +71,14 @@ const out = await js(`(async function(){
      ⚠️ 注释里也**不能写反引号** —— 它会把模板字符串提前截断（刚踩过，报的是
      「missing ) after argument list」，位置指向模板开头，很难联想）。 */
   const squash = t => String(t || '').trim().split(String.fromCharCode(10)).join(' ').split(String.fromCharCode(13)).join(' ');
-  R['④ 分组'] = groups.length === 3
-    ? ('✓ 3 组：' + [...groups].map(g => {
+  /* ★ 2026-10-28：从"必须正好 3 组"改成"至少 3 组" —— 分组只增不减（现在是 5 组），
+     写死数字的话每加一组这条就假红一次，反而把真问题埋掉。 */
+  R['④ 分组'] = groups.length >= 3
+    ? ('✓ ' + groups.length + ' 组：' + [...groups].map(g => {
         const h = g.querySelector('h3, .setgroup-h');
         return h ? squash(h.textContent) : '(无标题)';
       }).join(' ｜ '))
-    : ('★ ' + groups.length + ' 组（期望 3：KataGo / LoGos / 数据）');
+    : ('★ 只有 ' + groups.length + ' 组（至少要 KataGo / LoGos / 数据 三组）');
   const qh = [...document.querySelectorAll('.setgroup .qh')];
   R['④ 问号'] = qh.length === 2
     ? ('✓ 2 个，说明分别 ' + qh.map(q => (q.dataset.tip || '').length).join(' / ') + ' 字')

@@ -52,8 +52,50 @@ KATAGO takes either colour, and the opponent has **three settings**: **follow th
 (default for imported collections — it replays the SGF's main line, never tenukis; if you
 deviate it falls back to KATAGO; **SGF variations are now parsed too**, so an alternative
 correct branch is followed instead of being treated as a deviation), **KATAGO** (search
-restricted to **within 2 lines of a stone**, so it no longer wanders off to the frame corner),
-and **play both sides** (you alternate colours yourself));
+restricted to **within 2 lines of a stone** — the same band for both sides; it cannot land
+**on the dashed frame line** itself: at frame distance ≥3 that line is
+excluded outright, and at 1–2 only the points hugging a stone are kept),
+and **play both sides** (you alternate colours yourself)); in tsumego mode the rules are fixed
+(Chinese), the engine's **analysis scope defaults to "inside the frame only"** — the board sent
+to KataGo is literally cropped to the frame (a corner problem becomes roughly 9×9), so nothing
+outside it is computed at all: faster, and the ownership fog only covers the frame; switch it to
+"full board" for the old behaviour (19×19 search with a legal-move whitelist). ★ Cropping does
+**not** make the suggested moves better (8-problem A/B, both balanced: top move identical on
+5/8, solution match 0/8 either way) — move choice is dominated by the policy net, and the points
+outside the frame were already excluded as legal moves; cropping only saves compute.
+The **komi is balanced per problem** — the engine first measures how many points
+the problem already favours Black, then hands that over to White as komi so both sides start
+near 50%. Two hard facts learned from measurement: KataGo's `komi` **only accepts integers or
+half-integers** (asking for 38.9 fails the whole query), and on a cropped board "1 komi point
+= 1 point of lead recovered" does **not** hold (measured ratio 1.0–1.15), so the first guess
+overshoots by 7–9 points (2.4 on large-lead full-board problems). The program therefore
+re-corrects on the **measured score lead** for up to 6 rounds: the conversion rate is
+**measured** from two consecutive rounds instead of assumed 1:1, once two samples straddle 50%
+it only **bisects** between them (extrapolating across the narrow neck always overshoots),
+the step halves when close, and a round that got worse is rolled back (unless it was the
+bisection midpoint). Measured: cropped 8×9 settles 44 → 38 (45.3%), full-board 19×19
+43.5 → 43 (54.6%), and a 31-stone full-board problem 65 → 70.5 (65.4%, limited by the 500-visit
+reading noise, ±25pp on the same komi). The cap scales with the board
+the engine actually sees (178 on 19×19, 65 on a cropped 8×9): initial leads on 19×19 problems
+routinely reach 50–150 points (sampled from the 347 Xuan Xuan Qi Jing problems: median 50.5,
+max 148), and a fixed 40-point cap left **six out of ten problems unbalanced**. A fixed komi of
+0 is why KataGo used to drift inside one-sided life-and-death problems: every candidate sat at
+99.x%, so ranking collapsed into sampling. After balancing, the win-rate bar reads "**is this
+group alive right now**" instead of "who wins this game". Knowing the boundary: on a cropped
+board the **komi lands right but the win-rate reading may still sit at 30–45% or 55–70%** —
+with the frame's points alone, komi has to cover half the board, and half a point of komi
+swings 30–60 percentage points (measured 72.7% at 37, ≈40% at 38, 10.7% at 38.5). Switch the
+scope to "full board" if you want a flatter curve. Changing the frame distance or the scope
+re-balances automatically (the engine is looking at a different board). Switching to another
+problem also re-balances (komi shows "balancing…" first); flipping back to a problem you already
+balanced reuses its value instead of recomputing.
+**Opening a problem set starts warming the engine in the background** — while you read the problem
+and tweak the frame, the engine is already analysing its initial position, so by the time you hit
+"Start solving" the komi is usually ready (measured: cold start "click to komi" drops from 21–48 s
+to 6–14 s). Balanced values are **saved locally**, so practising the same problem after restarting
+the app reuses them (measured: 0 s).
+It is an engine-side setting only: it never touches the record, scoring or
+review;
 scratch-play ("what if") board; 9/13/19 lines; Chinese / Japanese / Korean / Ming-Qing rules;
 5 time-control presets with byo-yomi beeps and **loss on time**.
 The **mode button** in the top bar (it shows the current mode; click it for a drop-down:

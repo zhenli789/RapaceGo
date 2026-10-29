@@ -553,9 +553,270 @@ const out = await js(`(async function(){
        ★ 这一条是**看截图**才发现的：它原来把题目摆子写成「让 13 子」、
          贴目写 settings.komi（而实际发给引擎的是 0）。底栏状态行当时已经修了，
          但右栏是另一个渲染处。 */
-    step('右栏「对局信息」按习题口径显示（题目摆子 / 贴目 0）',
-      $('info-komi').textContent === '0' && /题目摆子/.test($('info-hc').textContent),
-      '贴目=' + $('info-komi').textContent + ' · 让子栏=' + $('info-hc').textContent);
+    /* ★ 2026-10-25 改判据：贴目不再是固定的 0，而是**配平贴目**（tsKomi）。
+       两种合法状态：① 探针还没落地 → 写「配平中…」（2026-10-28 起；以前写 0，
+       用户会以为这题不贴目）；② 已落地 → 与 bal.komi 一致。
+       （判据写成"跟真实状态一致"，而不是"必须等于某个数" —— 配平值取决于引擎对这道题的评估。） */
+    const balNow = state.tsumego.bal;
+    const komiTxt = $('info-komi').textContent;
+    step('右栏「对局信息」按习题口径显示（题目摆子 / 贴目 = 配平值，未配平时写「配平中…」）',
+      /题目摆子/.test($('info-hc').textContent)
+      && (balNow ? komiTxt === String(balNow.komi) : komiTxt === '配平中…'),
+      '贴目=' + komiTxt + ' · 配平=' + (balNow ? balNow.komi + '（lead0 ' + balNow.lead0.toFixed(1) + '）' : '未配平'));
+
+    /* ★ 2026-10-25 P0「配平贴目」的纯函数判据（不需要真引擎，也不会改局面）。
+       ★★ 2026-10-27 按**重写后**的算法改判据（用户报「框距 2/3 时配平后胜率差别仍很大」）：
+         ① 网格 = 整数或半整数（不是强制 +0.5）   ② 解题阶段用配平值 / 摆题恒 0
+         ③ SIDETOMOVE → 黑方视角                  ④ 上限按「引擎实际看到的那张盘」
+         ⑤ 摆子 / **框距** / 裁切开关 三者都进签名（框距那条正是用户报的 bug）
+         ⑥ noteBalProbe 的门槛 + 「改框距后必须能重折」（旧版在这里死锁）
+         ⑦ noteBalWinrate 的目差残差优先 / 步长减半 / 轮次上限 / 不倒退 */
+    {
+      /* ⚠️ 先把裁切关掉再取签名/算上限：裁切面积小的时候（框距 1 → 0.9×16=14）
+         mkBal(20) 会被上限截断，断言基准就不稳了。整盘上限恒 178。
+         收工前一律还原（tc0 / tf0 / td0 在下面存着）。 */
+      const N0 = N, tc0 = settings.tcrop, td0 = settings.tdist, tf0 = settings.tframe;
+      settings.tcrop = 'off';
+      const sig0 = setupSig();
+      /* 网格：整数与半整数都要在。旧版强制 +0.5 把整数点全丢了，而裁切小盘上
+         正解恰好落在整数点（实测 38.0 → 40%、38.5 → 10.7%）。 */
+      const b182 = mkBal(18.2, sig0);          // round(36.4)/2 = 18
+      const b186 = mkBal(18.6, sig0);          // round(37.2)/2 = 18.5
+      const b188 = mkBal(18.9, sig0);          // round(37.8)/2 = 19
+      const keepPh = state.tsumego.phase, keepBal = state.tsumego.bal, keepProbe = state.tsumego.probe;
+      const keepH0 = state.history.slice(), keepL0 = state.leads.slice(), keepHV0 = state.histVisits.slice();
+      state.tsumego.phase = 'solve'; state.tsumego.bal = b182;
+      const kSolve = tsKomi();
+      state.tsumego.phase = 'setup';
+      const kSetup = tsKomi();
+      state.tsumego.phase = keepPh; state.tsumego.bal = keepBal;
+      const leadW = blackLeadFrom({ root: { currentPlayer: 'W', scoreLead: -7 } }, 0);
+      const leadB = blackLeadFrom({ root: { currentPlayer: 'B', scoreLead: 7 } }, 0);
+      /* 上限：**按引擎实际看到的那张盘**（2026-10-27）。
+         整盘 = 40×N²/81（9 路 40 / 19 路 178）；裁切 = 0.9×W×H（8×9 → 65）。
+         N 是模块级 let，临时改完必须还原。 */
+      N = 9; const cap9 = tsBalMax();
+      N = 19; const cap19 = tsBalMax();
+      const capHi = mkBal(80, sig0).komi, capLo = mkBal(-80, sig0).komi;
+      N = N0;
+      /* 裁切分支：强制框架开着，否则 cropR = null，这一档就白验了 */
+      settings.tcrop = 'on'; settings.tframe = 'auto'; settings.tdist = 2;
+      const cropR = tsCropRect();
+      const capCrop = tsBalMax();
+      /* 签名：摆子 / 框距 / 裁切开关 —— 三者任一变化都必须换口径 */
+      const sigT2 = setupSig();                 // 框距 2、裁切
+      settings.tdist = 3; const sigT3 = setupSig();
+      settings.tcrop = 'off'; const sigFull = setupSig();
+      settings.tcrop = 'off'; settings.tdist = td0; settings.tframe = tf0;
+      state.setup.push({ x: 0, y: 0, color: 'b' });
+      const sig1 = setupSig();
+      state.setup.pop();
+      /* noteBalProbe：三条必须被拦的路 + 一条必须通过的路 + 一条「改框距后重折」 */
+      const keepSig = anaSigAtSend;
+      state.tsumego.phase = 'solve';
+      /* 已按**当前口径**配过 → 同一份报文不再重折（防自引用） */
+      state.tsumego.bal = mkBal(20, sig0); state.tsumego.probe = null;
+      anaSigAtSend = sig0;
+      const dup = noteBalProbe({ root: { currentPlayer: 'B', scoreLead: -30, visits: 200 } }, 0);
+      const dupKomi = state.tsumego.bal.komi;
+      state.tsumego.bal = null; state.tsumego.probe = null;
+      anaSigAtSend = sig0;
+      const lowV = noteBalProbe({ root: { currentPlayer: 'B', scoreLead: 20, visits: 20 } }, 0);
+      anaSigAtSend = 'different-sig';
+      const badSig = noteBalProbe({ root: { currentPlayer: 'B', scoreLead: 20, visits: 200 } }, 0);
+      anaSigAtSend = sig0;
+      const goodV = noteBalProbe({ root: { currentPlayer: 'B', scoreLead: 20, visits: 200 } }, 0);
+      const foldedKomi = state.tsumego.bal ? state.tsumego.bal.komi : null;
+      /* ★ 改框距之后：bal 的 sig 已经过期，但 tsKomi() 还拿着旧贴目（它故意不按 sig 回退）。
+         旧版 noteBalProbe 的门是「tsKomi() !== 0 就 return」→ 永远不再探针 = 死锁。
+         现在门是「tsKomi() !== 0 **且 bal.sig 与当前一致**」→ 这里必须能重新折出来。 */
+      state.tsumego.bal = mkBal(20, 'stale-sig'); state.tsumego.probe = null;
+      anaSigAtSend = setupSig();
+      const reFold = noteBalProbe({ root: { currentPlayer: 'B', scoreLead: -12, visits: 200 } }, 0);
+      const reKomi = state.tsumego.bal ? state.tsumego.bal.komi : null;
+      state.tsumego.phase = keepPh; state.tsumego.bal = keepBal;
+      state.tsumego.probe = keepProbe; anaSigAtSend = keepSig;
+      state.history = keepH0; state.leads = keepL0; state.histVisits = keepHV0;
+      settings.tcrop = tc0;
+      step('配平：lead0 取整到「整数 / 半整数」网格（18.2→18、18.6→18.5、18.9→19）',
+        b182.komi === 18 && b186.komi === 18.5 && b188.komi === 19,
+        b182.komi + ' / ' + b186.komi + ' / ' + b188.komi);
+      step('配平：解题阶段 tsKomi() 用配平值', kSolve === 18, 'tsKomi=' + kSolve);
+      step('配平：摆题阶段 tsKomi() 恒 0（探针口径，防自引用）', kSetup === 0, 'tsKomi=' + kSetup);
+      step('配平：scoreLead 从 SIDETOMOVE 换算成黑方视角（白走 −7 → 黑 +7 / 黑走 +7 → 黑 +7）',
+        leadW === 7 && leadB === 7, '白走=' + leadW + ' 黑走=' + leadB);
+      step('配平：上限按「哪张盘」分档 —— 整盘 9 路 40 / 19 路 178，裁切 0.9×W×H',
+        cap9 === 40 && cap19 === 178
+        && (!cropR || capCrop === Math.round(0.9 * cropR.w * cropR.h)),
+        '9路=' + cap9 + ' 19路=' + cap19
+        + ' 裁切=' + (cropR ? cropR.w + '×' + cropR.h + '→' + capCrop : '无框'));
+      step('配平：整盘 19 路 +80 目不再被截到 40（80 / −80）',
+        capHi === 80 && capLo === -80, '+80→' + capHi + ' −80→' + capLo);
+      step('配平：摆子一变 setupSig 就变（旧配平自动失效）', sig1 !== sig0, '变了=' + (sig1 !== sig0));
+      /* ★★ 用户 2026-10-27 报障的根因就在这条：旧版签名只带「裁切开/关」，
+         改框距 → 引擎换了张盘 → 贴目没跟着换（拿 10×11 的值跑 8×9 的盘）。 */
+      step('配平：改框距 → setupSig 就变（旧版改框距不重算 = 用户报的那个 bug）',
+        sigT2 !== sigT3, '框距2 与 框距3 相同？' + (sigT2 === sigT3));
+      step('配平：裁切开/关 → setupSig 也变（整盘与裁切各算各的贴目）',
+        sigFull !== sigT2, '整盘与裁切相同？' + (sigFull === sigT2));
+      step('配平：已按当前口径配平 → 同一份报文不再重折（防自引用）',
+        dup === false && dupKomi === 20, '重折=' + dup + ' komi=' + dupKomi);
+      step('配平：中间报告搜索量不够（20 步）不认', lowV === false, 'noteBalProbe=' + lowV);
+      step('配平：发请求时的摆子签名对不上就不认（摆子刚改过）', badSig === false, 'noteBalProbe=' + badSig);
+      step('配平：够 200 步 + 签名对上 → 立刻折出贴目（+20 目 → 20）',
+        goodV === true && foldedKomi === 20, 'noteBalProbe=' + goodV + ' komi=' + foldedKomi);
+      step('配平：框距变了（旧 bal 的 sig 过期）→ 新一次探针要能重折（旧版在这里死锁）',
+        reFold === true && reKomi === -12, '重折=' + reFold + ' komi=' + reKomi);
+
+      /* ⑨⑩ freeEngineForProbe：只该在「在飞的那趟算的不是现在这个局面」时掐。
+         锁的是 2026-10-25 实测出来的死锁（_trash/_diag_bal_warm2.mjs）：
+         翻题遗留的分析占着引擎 20+ 秒 → sig 对不上、整条被拒，而 runAnalysis 见 anaBusy
+         又不肯发新请求 → 探针永远排不上，配平等于装饰（实测 25 秒里 probe 一直是 null）。
+         ⚠️ 这里只验**返回值**（= 决策），不数 cancel 被调了几次：window.api 是 contextBridge
+           暴露的，整个对象被冻结，赋值桩不上去（试过，改写静默失败 → 计数恒 0）。
+         真"掐一下"也无害 —— 在飞的那趟走 cancelled 分支，自己会重排。 */
+      const keepBusy2 = anaBusy;
+      anaBusy = false; anaSigAtSend = 'different-sig';
+      const fpIdle = freeEngineForProbe();
+      anaBusy = true; anaSigAtSend = setupSig();
+      const fpSame = freeEngineForProbe();
+      anaBusy = true; anaSigAtSend = 'different-sig';
+      const fpStale = freeEngineForProbe();
+      anaBusy = keepBusy2; anaSigAtSend = keepSig;
+      step('配平：没在飞 / 在飞的**就是当前局面** → 都不许掐（别掐掉现成答案）',
+        fpIdle === false && fpSame === false, '没在飞=' + fpIdle + ' 同一局面=' + fpSame);
+      step('配平：在飞的那趟算的是**别的局面** → 掐掉它，把引擎让给探针',
+        fpStale === true, 'freeEngineForProbe=' + fpStale);
+
+      /* ⑪~⑰ noteBalWinrate：第二级校正（2026-10-27 **重写**成「目差残差优先」）。
+         锁住五件事，每条都是实测逼出来的（数据见 习题配平方案.md §14）：
+         ① **目差残差优先**：裁切后第一级就偏 7~9 目，旧版只许 3 目根本够不着；
+         ② 目差归零（|lead|<1）才退回胜率通道；
+         ③ 靠近（|wr−50%|<35pp）步长**减半** —— 窄口处真实斜率是估的两倍，整步会跨过去；
+         ④ 最多 6 轮（二分把 4.5 目压到半目要 3 步；fixN 太小会卡在半路）；
+         ⑤ **不倒退** —— 本轮比上轮更差就退回上轮并收工（实测 38.5→34.5 越调越糟），
+            但「二分步」和「手上已有跨 50% 的两样本」这两个例外不回退（否则把刚拿到的
+            信息扔掉，实测会停在 24.1%）；
+         ⚠️ 这里把 tcrop 关掉，让上限固定 178 —— 否则裁切面积小的时候
+            mkBal(20) 会被上限截断（框距 1 时 0.9×16=14），断言基准就不稳了。 */
+      const keepBal3 = state.tsumego.bal, keepPh3 = state.tsumego.phase;
+      const tc3 = settings.tcrop;
+      settings.tcrop = 'off';
+      const sigW = setupSig();
+      state.tsumego.phase = 'solve'; anaSigAtSend = sigW;
+      const run = (bal, pkt) => {
+        state.tsumego.bal = bal;
+        const changed = noteBalWinrate(pkt, 0);
+        const x = state.tsumego.bal;
+        /* 诊断串：断言失败时能看出是哪道门先关（sig / anaSig / phase / 步数 / 上限） */
+        const dbg = 'sig=' + (bal.sig === setupSig()) + ' ana=' + (anaSigAtSend === setupSig())
+          + ' ph=' + tsPhase() + ' on=' + tsOn() + ' v=' + pkt.root.visits
+          + ' need=' + Math.min(150, Math.max(60, Math.round((settings.visits || 500) * 0.8)))
+          + ' wr=' + blackWinFrom(pkt, 0) + ' ld=' + blackLeadFrom(pkt, 0) + ' cap=' + tsBalMax();
+        return { changed, komi: x.komi, komi2: x.komi2, fixN: x.fixN || 0, reverted: !!x.reverted, dbg };
+      };
+      const rOk = run(mkBal(20, sigW), { root: { currentPlayer: 'B', winrate: 0.52, visits: 200 } });
+      const rWr = run(mkBal(20, sigW), { root: { currentPlayer: 'B', winrate: 0.80, visits: 200 } });
+      const rLead = run(mkBal(20, sigW), { root: { currentPlayer: 'B', winrate: 0.65, scoreLead: 6, visits: 200 } });
+      const rFlat = run(mkBal(20, sigW), { root: { currentPlayer: 'B', winrate: 0.30, scoreLead: 0.4, visits: 200 } });
+      const rMax = (() => {
+        const b = mkBal(20, sigW); b.fixN = 6;               // = TS_BAL_FIX_MAX
+        return run(b, { root: { currentPlayer: 'B', winrate: 0.95, scoreLead: 8, visits: 300 } });
+      })();
+      const rBack = (() => {
+        const b = mkBal(20, sigW); b.prevK = 22; b.prevErr = 0.05; b.komi = 20;
+        return run(b, { root: { currentPlayer: 'B', winrate: 0.02, scoreLead: 8, visits: 300 } });
+      })();
+      const rLow = run(mkBal(20, sigW), { root: { currentPlayer: 'B', winrate: 0.95, visits: 50 } });
+      state.tsumego.bal = mkBal(20, sigW);
+      const wrAt1 = noteBalWinrate({ root: { currentPlayer: 'B', winrate: 0.90, visits: 300 } }, 1);
+      /* ★ 恢复 tcrop / bal / phase 必须等到**下面所有 run() 都跑完**（2026-10-27 踩过）：
+         原来这一行就写在这儿，而 ⑱⑲⑳（汇率 / 夹逼 / 不倒退例外）是后来追加在后面的，
+         于是它们跑在「tcrop 已恢复」的口径下 → setupSig() 变了 → sig=false、ana=false →
+         noteBalWinrate 一律返回 false，三条断言全挂在「改了=false」上。
+         诊断串里的 cap=73（=0.9×9×9，裁切）vs 178（整盘）就是这条的指纹。 */
+      step('配平：胜率已在 ±8pp 内且目差归零 → 不再校正（贴目不动）',
+        rOk.changed === false && rOk.komi === 20, '改了=' + rOk.changed + ' komi=' + rOk.komi);
+      step('配平：只有胜率信息时走胜率通道，且靠近后步长减半（0.80 → 只挪 1.5 → 21.5）',
+        rWr.changed === true && rWr.komi === 21.5 && rWr.fixN === 1,
+        '改了=' + rWr.changed + ' komi=' + rWr.komi + ' 轮次=' + rWr.fixN);
+      step('配平：目差没归零 → 走目差通道（+6 目，减半 → 20+3=23），不再被旧的 3 目上限卡住',
+        rLead.changed === true && rLead.komi === 23,
+        '改了=' + rLead.changed + ' komi=' + rLead.komi);
+      step('配平：目差已归零（0.4 目）→ 退回胜率通道（30% → 20−1=19）',
+        rFlat.changed === true && rFlat.komi === 19, '改了=' + rFlat.changed + ' komi=' + rFlat.komi);
+      step('配平：校正轮次用完（6 轮）→ 不再调（二分把 4.5 目压到半目要 3 步）',
+        rMax.changed === false && rMax.komi === 20, '改了=' + rMax.changed + ' komi=' + rMax.komi);
+      step('配平：本轮比上一轮更差 → 退回上一轮贴目并收工（实测 38.5→34.5 越调越糟）',
+        rBack.changed === true && rBack.komi === 22 && rBack.reverted === true,
+        '改了=' + rBack.changed + ' komi=' + rBack.komi + ' 回退=' + rBack.reverted);
+      step('配平：校正要求够 150 步 / 且只认第 0 手（50 步和第 1 手都不认）',
+        rLow.changed === false && wrAt1 === false, '50步=' + rLow.changed + ' 第1手=' + wrAt1);
+      /* ⑱ 汇率（2026-10-27 正割法）：整盘大目差题上 Δlead/Δkomi 实测能到 **2.4**
+         （xxqj 第 12 题：komi 65.5 → lead +8.3，komi 74 → lead −12.1）。
+         按 1:1 折算就一步跨到对面（94.4% → 10.9%），回退保护只退一次 → 终点 18.3%。
+         手上已有两个样本时必须按**实测汇率**折算步长。 */
+      const rRatio = (() => {
+        const b = mkBal(20, sigW);
+        b.komi = 70;
+        b.leadHist = [{ k: 60, lead: 10 }];      // 上一个样本：60 目时黑优 10 目
+        return run(b, { root: { currentPlayer: 'B', winrate: 0.90, scoreLead: -10, visits: 300 } });
+      })();
+      step('配平：两个样本 → 按实测汇率折算（Δlead/Δkomi=2 → 目差 −10 只挪 −5，不是 −10）',
+        rRatio.changed === true && rRatio.komi === 65,
+        '改了=' + rRatio.changed + ' komi=' + rRatio.komi
+          + (rRatio.changed && rRatio.komi === 65 ? '' : ' | ' + rRatio.dbg));
+      /* ⑲ 夹逼：临界点附近**半目 = 30~50pp**（实测裁切 8×9：37.5→90.2%、38→41.7%、
+         38.5→10.7%），按斜率外推必然整段跨过去 —— 实测同一题两次跑出 38.0→43.5% 与
+         37.5→91.9%，差别只在 K1（45.5 vs 42）。所以一旦有「跨过 50% 的两个样本」，
+         就只能取中点（二分），不再外推。中点还要对齐 0.5 网格：
+         (37.5+42)/2 = 39.75 → 40（**不是** round((lo+hi)*2)/2 = 79.5 那种写错法）。 */
+      const rBis = (() => {
+        const b = mkBal(20, sigW);
+        b.komi = 37.5;
+        b.leadHist = [{ k: 42, lead: -3, wr: 0.065 }];    // 42 目时只有 6.5%（komi 太大）
+        return run(b, { root: { currentPlayer: 'B', winrate: 0.902, scoreLead: 6.9, visits: 300 } });
+      })();
+      step('配平：两个样本跨过 50% → 取中点二分（37.5 的 90.2% 与 42 的 6.5% → 39.75→40）',
+        rBis.changed === true && rBis.komi === 40,
+        '改了=' + rBis.changed + ' komi=' + rBis.komi
+          + (rBis.changed && rBis.komi === 40 ? '' : ' | ' + rBis.dbg));
+      /* ⑳ 「不倒退」的两个例外（2026-10-27）：二分步、以及**已有跨过 50% 的样本**时，
+         本轮变差也不算跑偏 —— 那是把区间夹小了，不是跳飞了。
+         实测裁切 8×9：39（24.5%）→ 37.5（86.5%，跨过 50%）→ 旧规则判"更差"退回 39 →
+         收工在 24.1%（差 26pp）；允许继续二分（37.5~39 → 38.5）就能落到 45% 附近。
+         ⚠️ 中点 38.25 落在两个网格正中间，Math.round(76.5)/2 取上界 → 38.5（不是 38）。 */
+      const rNoRev = (() => {
+        const b = mkBal(20, sigW);
+        b.komi = 37.5;
+        b.prevK = 39; b.prevErr = 0.255;                  // 上一轮 39 目读 24.5%
+        b.leadHist = [{ k: 39, lead: 0.6, wr: 0.245 }];
+        return run(b, { root: { currentPlayer: 'B', winrate: 0.865, scoreLead: 0.7, visits: 300 } });
+      })();
+      step('配平：已有跨过 50% 的样本 → 变差也不回退，继续二分（37.5~39 → 38.5）',
+        rNoRev.changed === true && rNoRev.komi === 38.5 && rNoRev.reverted === false,
+        '改了=' + rNoRev.changed + ' komi=' + rNoRev.komi + ' 回退=' + rNoRev.reverted
+          + (rNoRev.changed && rNoRev.komi === 38.5 ? '' : ' | ' + rNoRev.dbg));
+      /* ★ 配平那一节的收尾：口径与状态一律还原（见上面「恢复必须等所有 run 跑完」）。 */
+      settings.tcrop = tc3;
+      state.tsumego.bal = keepBal3; state.tsumego.phase = keepPh3;
+
+      /* ⑭⑮⑯ 超时预算与默认计算深度（2026-10-26）。
+         为什么要把这组数字焊进测试：原来是固定 25 秒，而 19 路 300~500 步实测要
+         18~46 秒 —— 每一趟都被判超时 → terminate 毁树 → 从 0 重算，用户看到的就是
+         「算一半没了 / 胜率条抖」。这组断言锁的是「别再退回一个固定值」。
+         ⚠️ 数字是 analyzeTimeoutMs 的算式结果（30000 + 步数 × 每步预算），
+            每步预算 9 路 55ms / 19 路 95ms —— 见 renderer/app.js 的 analyzeVisitCost。 */
+      const t9 = analyzeTimeoutMs(9, 300), t19 = analyzeTimeoutMs(19, 300);
+      const tMax = analyzeTimeoutMs(19, 5000);
+      step('超时：按棋盘放大（9 路 46.5 秒 / 19 路 58.5 秒），不再是一个固定的 25 秒',
+        t9 === 46500 && t19 === 58500, '9路=' + t9 + ' 19路=' + t19);
+      step('超时：搜索量也算进去，且有硬上限（19 路 × 5000 步 → 180 秒）',
+        t19 > t9 && tMax === 180000, '19×300=' + t19 + ' 19×5000=' + tMax);
+      step('默认计算深度 = 500（2026-10-26 一度降到 300，当天按用户要求改回 500）',
+        settings.visits === 500 && ANALYZE_VISITS === 500,
+        'settings.visits=' + settings.visits + ' ANALYZE_VISITS=' + ANALYZE_VISITS);
+    }
 
     /* ★ 「先手」那一行现在只有 label + 一组开关（2026-10-17 起；原来还挂着「目标 净杀」）。
        仍然量一次：nowrap + 不出卡片 —— 这一行是"卡片高度恒定"里最容易变异的一行。 */
@@ -680,7 +941,10 @@ const out = await js(`(async function(){
       defaultName('b') + ' / ' + defaultName('w'));
 
     const t46 = Date.now();
-    while (state.moves.length < 1 && Date.now() - t46 < 25000) await sleep(500);
+    /* ★ 2026-10-26：默认深度回到 500 后，9 路一手 500 步最坏要三十几秒（还有配平那几趟排队）。
+       判据不变（"最终会不会落子"），只是把等待窗口从 25 秒放宽到 60 秒 —— 这一条一直是
+       "等不够"的假红（旧注释里就写着"等 25 秒的老 flake"）。 */
+    while (state.moves.length < 1 && Date.now() - t46 < 150000) await sleep(500);
     step('KATAGO 先手会自己落第一子（而且是黑棋）',
       state.moves.length >= 1 && state.moves[0].color === 'b',
       '手数=' + state.moves.length + ' 首手色=' + (state.moves[0] && state.moves[0].color)
@@ -722,7 +986,7 @@ const out = await js(`(async function(){
      而同一个 run 后面「提示③ 让候选点显示出来 → 4 个点」是过的，
      说明链路没问题、是等待时间不够。断言的应该是**候选点在哪**，不是它多快出来。 */
   const t5 = Date.now();
-  while (!(state.candidates || []).length && Date.now() - t5 < 20000) await sleep(500);
+  while (!(state.candidates || []).length && Date.now() - t5 < 60000) await sleep(500);
   const cands = state.candidates || [];
   const inFrame = cands.filter(c => fr && c.x >= fr.x0 && c.x <= fr.x1 && c.y >= fr.y0 && c.y <= fr.y1);
   step('候选点全部落在框架内（allowMoves 生效）',
@@ -766,6 +1030,76 @@ const out = await js(`(async function(){
       pts.length > 0 && far === 0 && (frameFar === 0 ? pts.length === area : pts.length < area),
       '框内点=' + area + '（其中离棋子 >2 路的 ' + frameFar + ' 个）· 允许点=' + pts.length
       + ' · 允许点里离棋子 >2 路的 ' + far + ' 个');
+
+    /* ★★ 2026-10-27：**取消两档** —— 对手（KATAGO 应手那一方）也改回 wide（用户要求）。
+       背景：2026-10-26 曾把对手收成 tight（≤1 路 ∪ 腹地 2 路），治过了"外皮上的随手一手"；
+       但 347 题实测里正解首手有 12 题（3.5%）正落在"离棋子 2 路、却在摆子外接矩形外"的那圈
+       外皮上 —— 对手被按下 tight 就等于看不见最强的抵抗手段。退回 wide 后脱先仍由
+       「2 路半径 + 人工框线上的点被 trim 剔掉」兜住。
+       验三件事（两处口径必须一致，否则"请求允许、兜底又砍"会白丢一手）：
+         ① 两个玩家都有条目、都不为空（空 moves 会被主进程丢掉 → 引擎完全不约束）；
+         ② 两方点集**完全相同** —— 不再按角色收窄；
+         ③ 与该局面 regionPoints(fr,false) 的 wide 逐点一致（防止哪天又偷偷加回"对手收紧"）。 */
+    {
+      const aiC = tsAIColor();
+      const listOf = p => ((ex.allowMoves || []).find(e => e.player === p) || {}).moves || [];
+      const myPts = listOf(aiC === 'b' ? 'W' : 'B');
+      const aiPts = listOf(aiC === 'b' ? 'B' : 'W');
+      const widePts = regionPoints(frameRect(), false).map(([x, y]) => toGTP(x, y));
+      const same = (a, b) => a.length === b.length && a.every(s => b.includes(s));
+      const offWide = myPts.concat(aiPts).filter(s => !widePts.includes(s)).length;
+      step('allowMoves 两方都是 wide（2026-10-27 起不再按角色分档）',
+        myPts.length > 0 && aiPts.length > 0 && same(myPts, aiPts)
+          && myPts.length === widePts.length && offWide === 0,
+        'KATAGO=' + aiC + ' · 我的允许点=' + myPts.length + ' · 对手的允许点=' + aiPts.length
+        + ' · regionPoints(wide)=' + widePts.length + ' · 不在 wide 里的点=' + offWide + '（必须 0）');
+    }
+
+    /* ★★ 2026-10-26 二修：**人工框线（那道虚线框）上的点，不许进允许集合**。
+       为什么单独验：用户说的"边框边缘"是**练习题自己画的框**，不是棋盘边。框距 4 时
+       这条线离棋子至少 3 路（数学上不可能踩到，_trash/_probe_trim.mjs 347 题实测 0 个）；
+       但框距 1~2 时框比引擎的战术半径还窄，旧规则下 342/347 题都有允许点正好落在框线上。
+       这里**直接喂一个 bbox+1 的假框**给 regionPoints（不动 settings.tdist 的 UI 流程，
+       只临时改这个数值，避免触发重算），两种狠度各验一次：
+         · 框距 ≤2：只剔「离棋子 ≥2 路」的框线点（贴身的扳/立必须留）；
+         · 框距 ≥3：框线上一律不踩（"棋飘出题目"的那一手不追）。
+       撞 8 点地板时允许原样返回（宁可给引擎余地，也不能无点可选）——那种情况集合会 ≤8 点。 */
+    {
+      const b1 = stoneBox();
+      if (b1) {
+        const fake = {
+          x0: Math.max(0, b1.x0 - 1), y0: Math.max(0, b1.y0 - 1),
+          x1: Math.min(N - 1, b1.x1 + 1), y1: Math.min(N - 1, b1.y1 + 1),
+        };
+        const onEdge = (x, y) => x === 0 || x === N - 1 || y === 0 || y === N - 1;
+        const onLine = ([x, y]) => !onEdge(x, y)
+          && (x === fake.x0 || x === fake.x1 || y === fake.y0 || y === fake.y1);
+        const dStone = ([x, y]) => {
+          let d = 99;
+          for (const [sx, sy] of st55) d = Math.min(d, Math.max(Math.abs(x - sx), Math.abs(y - sy)));
+          return d;
+        };
+        const keepTd = settings.tdist;
+
+        /* ① 框距 ≤2 的档：框线上的"贴身点"留下，其余剔掉 */
+        settings.tdist = 1;
+        const small = [regionPoints(fake, true), regionPoints(fake, false)];
+        const badNear = small.flat().filter(p => onLine(p) && dStone(p) >= 2).length;
+        const keptNear = small.flat().filter(p => onLine(p) && dStone(p) < 2).length;
+        const nSmall = small.map(a => a.length);
+        /* ② 框距 ≥3 的档：框线上一个都不留 */
+        settings.tdist = 4;
+        const big = regionPoints(fake, true);
+        const badLine = big.filter(onLine).length;
+        settings.tdist = keepTd;                       // ★ 无论如何都要还原
+
+        step('人工框线上的点不进允许集合（框距 ≤2：只留贴身；≥3：一个不留）',
+          (badNear === 0 || nSmall[0] <= 8 || nSmall[1] <= 8) && (badLine === 0 || big.length <= 8),
+          '假框=bbox+1 ' + JSON.stringify(fake) + ' · 框距1 时 tight/wide='
+          + nSmall[0] + '/' + nSmall[1] + ' 点（框线上≥2 路的违规 ' + badNear + '，留着的贴身点 ' + keptNear + '）'
+          + ' · 框距4 时 tight=' + big.length + ' 点（框线上 ' + badLine + ' 个 ← 必须 0）');
+      }
+    }
   }
 
   /* ---------- 6. 落正解 → AI 应对 ---------- */
@@ -773,7 +1107,7 @@ const out = await js(`(async function(){
   tryPlay(15, 4, false);       // Q15：白棋的杀着
   /* 等 AI 应手 —— 给足时间：引擎一次只算一个请求，防守请求可能要排队/重试 */
   const t2 = Date.now();
-  while (state.moves.length < 2 && Date.now() - t2 < 20000) await sleep(500);
+  while (state.moves.length < 2 && Date.now() - t2 < 60000) await sleep(500);
   step('我方落子成功', state.moves.length > before, before + ' → ' + state.moves.length);
   step('对方由 AI 应对（强引擎）', state.moves.length >= 2,
     '手数=' + state.moves.length + ' · 防守说明=' + (state.tsumego.defendNote || '（空）'));
@@ -987,7 +1321,11 @@ const out = await js(`(async function(){
         }
       const tr65 = solutionFallbacks;
       tryPlay(off65.x, off65.y, false);
-      await sleep(4000);          // 退回引擎之后，应手要几秒（还要排队）
+      /* ★ 2026-10-28 方案 A（应手让路）：配平窗口内 AI 应手会等，最多 TS_BAL_WAIT_MS=25 秒
+         —— 这里改成轮询等，别写死 4 秒（写死的话窗口一挡就假失败）。
+         断言本身**没放松**：退回计数必须 +1。 */
+      const tAwait65 = Date.now();
+      while (solutionFallbacks <= tr65 && Date.now() - tAwait65 < 32000) await sleep(200);
       step('走偏了 → 不再按正解摆，自动退回 KATAGO（退回计数 +1）',
         solutionFallbacks > tr65,
         '落下 ' + off65.x + ',' + off65.y + ' · 手数=' + state.moves.length
@@ -1105,6 +1443,36 @@ const out = await js(`(async function(){
         }
         step('抽查 4 道题（含最后一题）：摆子 / 先手 / 正解都自洽', bad === 0,
           det.join(' · ') + ' · 不自洽=' + bad);
+
+        /* ---------- 10.8.5 换一道题 → 必须重新配平（2026-10-28 用户报障）----------
+           以前 tsLoadProblem 不清 t.bal，而 tsKomi() 故意不按 sig 回退 →
+           新题的探针是**按上一题的贴目**发出去的，折出来的贴目整整差一个旧贴目
+           （实测 xxqj 第 2 题折成 −25.5，真值 ≈ +12）；同时右侧胜率卡被上一题残留的
+           state.anaAt[0] 顶着，看起来就是「没重新配平」。
+           现在的判据三条：换题后 bal 置空 + tsKomi 回 0 目口径（探针才准）+ 卡片写「计算中…」；
+           再换回去要命中缓存（不重算）。 */
+        {
+          tsLoadProblem(0); await sleep(250);
+          $('btn-ts-start').click();
+          const tFold = Date.now();
+          while (!(state.tsumego.bal && state.tsumego.bal.sig === setupSig())
+            && Date.now() - tFold < 60000) await sleep(200);
+          const k1 = state.tsumego.bal ? state.tsumego.bal.komi : null;
+          const foldMs = Math.round((Date.now() - tFold) / 100) / 10;
+          tsLoadProblem(1); await sleep(250);
+          const bal2 = state.tsumego.bal;
+          const komi2 = tsKomi();
+          const wr2 = $('eval-wr').textContent || '';
+          tsLoadProblem(0); await sleep(250);
+          const backKomi = state.tsumego.bal ? state.tsumego.bal.komi : null;
+          step('换到第 2 题：贴目置空 + 回 0 目口径（探针才按 0 目发）+ 胜率卡不残留上一题的数',
+            Number.isFinite(k1) && bal2 === null && komi2 === 0 && wr2.indexOf('计算中') >= 0,
+            '第 1 题配平=' + k1 + '（' + foldMs + ' 秒）→ 换题后 bal=' + String(bal2)
+            + ' tsKomi=' + komi2 + ' 卡片=' + JSON.stringify(wr2));
+          step('换回第 1 题：命中缓存，配平值原样回来（不重算）',
+            backKomi === k1, '回来=' + backKomi + ' 原来=' + k1);
+          tsLoadProblem(0); await sleep(200);
+        }
 
         /* ★★ 2026-10-17：变化树（新增）。两件事一起验：
            ① 树的主链必须与「正解」主线**逐手一致** —— 建树时把变体接错位置/漏接节点，
