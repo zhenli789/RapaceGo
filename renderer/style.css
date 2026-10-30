@@ -232,6 +232,26 @@ select {
   cursor: pointer;
 }
 
+/* ---------- 顶栏「对手棋力」下拉：自绘箭头 + 按最宽文案定宽 ----------
+   2026-10-29 用户报「这个框比里面的字宽出一截」。根因不是 padding：
+   浏览器给 <select> **自动定宽**时会把 optgroup 的缩进算进去，而这一栏的组名
+   （「职业棋风 · 按年份（1800–2023）」，180px）远长于任何一档的文案 ——
+   实测同一条 option 有 / 无 optgroup：96.5px vs 82px。原生箭头本身还占 20px。
+   所以：外观归零（appearance:none）+ 自己画那个小箭头，宽度交给
+   app.js 的 sizeLevelSelect() —— 用 canvas 量最宽的一档，只加必要留白。
+   ⚠️ 只作用于顶栏这一个（外面套了 .selbox）；面板里的 #m-level 是 flex:1，不参与。 */
+.selbox { position: relative; display: inline-flex; align-items: center; flex: none; }
+.selbox > select { appearance: none; -webkit-appearance: none; padding: 0 22px 0 8px; }
+.selbox::after {
+  content: '';
+  position: absolute; right: 8px; top: 50%;
+  width: 6px; height: 6px; margin-top: -5px;
+  border-right: 1.5px solid var(--text-dim);
+  border-bottom: 1.5px solid var(--text-dim);
+  transform: rotate(45deg);
+  pointer-events: none;            /* 点箭头 = 点下拉本身 */
+}
+
 /* ---------- 主体 ---------- */
 main { flex: 1; display: flex; min-height: 0; }
 
@@ -291,9 +311,14 @@ main { flex: 1; display: flex; min-height: 0; }
 
 /* ---------- 侧栏 ---------- */
 /* ★ 左栏（2026-10-05 新增，用户要求）：手数列表 + 讲解框。
-   宽度和右栏接近，棋盘两侧对称一点；内边距方向反过来（padding 在左，右为 0）。 */
+   内边距方向反过来（padding 在左，右为 0）。
+   ★ 2026-10-30 用户要求「适当加宽左侧卡片、右栏不动」：284 → 316px（+32）。
+     实测（窗口 1361×791）：棋盘是**受高度限制**的（wrap 高 693 vs 宽 781）→
+     加宽这 32px **棋盘一点没变小**，只是把棋盘两侧那 94px 的横向余量吃掉一部分。
+     代价只出现在极窄窗口（minWidth 1020，那里棋盘本来就被宽度限制）：
+     棋盘 434 → 402px。⚠️ 右栏 .side 的 296px 一个字节没动。 */
 .left {
-  width: 284px;
+  width: 316px;
   flex: none;
   display: grid;
   grid-template-rows: minmax(0, 3fr) minmax(0, 5fr);

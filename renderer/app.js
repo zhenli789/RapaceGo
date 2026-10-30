@@ -63,7 +63,11 @@ const settings = {
      这个是**谁坐哪一边**。两者相同 = KATAGO 先动手。 */
   taicolor: 'w',
   tframe: 'auto',      // 死活框架：'auto' 自动框 / 'off' 不加框架
-  tdist: 4,            // 框架距离：框边比题目棋子最外沿再多留几路（角上典型小题 → 约 9×9）
+  /* 框架距离：框边比题目棋子最外沿再多留几路（2026-10-29 用户要求默认 4 → 3）。
+     ★ 为什么 3 是个合适的地板：框距 ≥3 时「框线上」的点一律被剔掉（见 frameBorderSet / trim），
+       而 ≤2 时框线贴着引擎的贴身半径，解题中新子可能压在框线上 → 那口气在裁切盘里不存在
+       （界面判活、引擎判提，见 `习题裁切框边问题.md`）。所以默认停在 3，别往 2 调。 */
+  tdist: 3,
   /* ★ 2026-10-27：引擎的分析范围 —— 'on' = **把真实棋盘裁成框架那么大**发给引擎
      （画面仍是全盘，坐标由主进程还原），'off' = 老行为（整盘棋盘 + allowMoves 白名单）。
      开关存在的唯一目的是 A/B 对照（裁切不会让选点变准，只让它更快、形势雾不再铺满全盘，
@@ -1263,6 +1267,12 @@ function exitDraft() {
   state.candAt = s.candAt;
   state.history = s.history;
   state.histVisits = s.histVisits || [];
+  /* ★ 2026-10-29：草稿里那几个局面的**分析快照**要摘掉 —— 对应的手已经不存在了。
+     原来只还原 moves / history，快照留着（saveAnaSnapshot 是照存的，用户要看草稿的分数），
+     于是草稿下过的第 n 手那份数字会冒充"用户接下来新下的第 n 手"（与换线同理）。 */
+  for (const k in state.anaAt) {
+    if (+k > state.moves.length) delete state.anaAt[k];
+  }
   resetAnalysisState();                  // history 被整体换回来了 → 欠账与上屏标记一起作废重来
   Object.assign(state.clock, s.clock);   // 保持同一个 clock 对象（renderClocks 一直指着它）
   state.result = s.result;
@@ -4562,7 +4572,7 @@ function applyFrameChange() {
 /* 改框距（唯一的入口：面板的数字框、练习卡的两个加减按钮都走它） */
 function setFrameDist(v) {
   const n = parseInt(v, 10);
-  settings.tdist = Math.max(TDIST_MIN, Math.min(TDIST_MAX, Number.isFinite(n) ? n : 4));
+  settings.tdist = Math.max(TDIST_MIN, Math.min(TDIST_MAX, Number.isFinite(n) ? n : 3));
   applyFrameChange();
 }
 
@@ -4744,6 +4754,25 @@ function syncRulesUI(rules, withKomi) {
 
 $('m-rules').onchange = () => syncRulesUI($('m-rules').value, true);
 
+/* ★ 顶栏那个下拉「按最宽的一档文案定宽」（2026-10-29 用户要求：框比字宽出一截）。
+   为什么不靠 CSS：<select> 的自动宽度是浏览器按 **option + optgroup 缩进 + 原生箭头**
+   一起算的，这一栏的组名比任何一档都长得多，没法在样式里"减掉"那部分。
+   这里用 canvas 按同一套字体量出最宽一档的文字宽度，再加左右留白与箭头区（见 style.css
+   的 .selbox）。量的是**文字**，所以字体回退（雅黑/苹方）变了也跟着对。
+   ⚠️ 只给顶栏 sel-level 用；面板 m-level 是 flex:1，不该定宽。 */
+const SEL_PAD_L = 8, SEL_PAD_R = 22, SEL_BORDER = 2;   // 与 .selbox > select 的 padding / 边框一致
+
+function sizeLevelSelect(sel) {
+  if (!sel || !sel.options.length) return;
+  const cs = getComputedStyle(sel);
+  const cv = document.createElement('canvas').getContext('2d');
+  if (!cv) return;
+  cv.font = cs.fontStyle + ' ' + cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+  let w = 0;
+  for (const o of sel.options) w = Math.max(w, cv.measureText(o.textContent).width);
+  sel.style.width = Math.ceil(w + SEL_PAD_L + SEL_PAD_R + SEL_BORDER) + 'px';
+}
+
 /* ---------- 对手棋力下拉（真实段位） ----------
    顶栏 sel-level 与面板 m-level 都从 RANKS 生成，避免两处手写不同步。 */
 function fillLevelSelects() {
@@ -4751,7 +4780,8 @@ function fillLevelSelects() {
     const sel = $(id);
     if (!sel) continue;
     sel.textContent = '';
-    for (const g of RANK_GROUPS) {
+    /* ★ 分组顺序 = 下拉里的显示顺序。「最强引擎」单独一组、排最前（见 ENGINE_LEVEL）。 */
+    for (const g of [STRONG_GROUP, ...RANK_GROUPS]) {
       const og = document.createElement('optgroup');
       og.label = g;
       for (const r of RANKS) {
@@ -4764,6 +4794,7 @@ function fillLevelSelects() {
       if (og.children.length) sel.appendChild(og);
     }
     sel.value = settings.level;
+    if (id === 'sel-level') sizeLevelSelect(sel);   // 顶栏按最宽文案定宽（面板不动）
   }
 }
 
@@ -4928,7 +4959,7 @@ $('m-start').onclick = () => {
   const cr = $('seg-tcrop');
   if (cr) settings.tcrop = (cr.querySelector('.on') || { dataset: {} }).dataset.v || settings.tcrop;
   const dv = parseInt($('inp-tdist').value, 10);
-  settings.tdist = Number.isFinite(dv) ? Math.max(0, Math.min(10, dv)) : 4;
+  settings.tdist = Number.isFinite(dv) ? Math.max(0, Math.min(10, dv)) : 3;
   /* （2026-10-17：原来这里还读一档「题目目标」sel-tgoal —— 随判定/提示一起删了） */
   /* 类型以面板上亮着的那一个为准（点它时已经改过 settings.mode，这里再对齐一次） */
   const nt = $('seg-ntype').querySelector('.on');
@@ -7420,6 +7451,15 @@ async function runAnalysis() {
      ★ 配平等待窗口是**反过来**的：这几秒里应手故意不动（`balWaiting`），
        而"轮到的这一趟分析"正是探针 —— 所以要把窗口从这条守卫里排掉。 */
   if (defendBusy || (needDefendMove() && !balWaiting())) { anaDiag.note('习题防守中提前return'); return; }
+  /* ★★ 最强引擎档（2026-10-29）：轮到它走时，那一手**就是当前局面的完整分析**
+     （同一个分析引擎、同一份强权重）→ 分析链必须让路。理由与上面习题防守**一模一样**：
+     main.js 的 analyze() 会给新请求带 terminateId，**后发的掐掉前一个**。
+     两条链同时发就是互掐：分析被掐 → 那条自愈分支 120ms 后重排 → 掐掉应手 → 应手重试…
+     （习题练习 2026-10-12 实测过这个死循环：手数停在 1，AI 一声不吭。）
+     ★ 判据用 `aiTurnPending()` 而不是 `aiBusy`：syncUI 到 maybeAIMove 之间有 120ms 空档，
+       那段时间发出去的分析正好会被应手掐掉、反过来再掐应手 —— 一半的概率撞上。
+       它落子后会 syncUI → scheduleAnalysis，分析自然接上，不会漏算。 */
+  if (isEngineLevel() && aiTurnPending()) { anaDiag.note('最强引擎应手中提前return'); return; }
   if (!engineReady) { anaDiag.failEarly.notReady++; anaDiag.note('引擎未就绪提前return'); alog('run 引擎未就绪 → 不发'); return; }
   if (anaBusy) { anaPoke = true; anaDiag.failEarly.busy++; alog('run 已有请求在飞 → 只登记 poke'); return; }
   anaBusy = true;
@@ -7431,6 +7471,10 @@ async function runAnalysis() {
     /* 上限只是防止意外死循环（正常一轮只会跑十几次）。 */
     for (let guard = 0; guard < 500; guard++) {
       if (scoreBusy || reviewBusy || defendBusy || (needDefendMove() && !balWaiting()) || !engineReady) { anaDiag.note('数子/复盘/防守/引擎掉了 中断循环'); alog('run 循环中断：数子/复盘/防守/引擎掉了'); break; }
+      /* ★ 最强引擎档轮到它走 → 立刻收手（理由见函数开头那条守卫）。这里必须**也**拦一道：
+         循环中间局面没变，但「轮到谁走」可能刚变（用户刚落子、AI 还没发出请求），
+         若不拦，这一轮的下一条请求会掐掉 AI 刚发出的应手。 */
+      if (isEngineLevel() && aiTurnPending()) { anaDiag.note('最强引擎应手中 中断循环'); alog('run 循环中断：最强引擎该应手了'); break; }
       if (gen !== gameGen) { anaDiag.note('换局中断循环'); alog('run 循环中断：换局/换棋谱（代 ' + gen + '→' + gameGen + '）'); break; }   // ★ 换局 / 换棋谱了：剩下的欠账全部作废
 
       /* ★★ 配平窗口内：**引擎只该算探针（at=0）**，别拿当前局面（at=1…）去占它
@@ -7655,11 +7699,23 @@ async function runAnalysisOnce(at) {
     if (!needDefendMove()) scheduleAnalysis(0, true);
   }
 
-  /* 补历史欠账（at ≠ 当前局面）：只记这一手的胜率，画面别动。 */
+  /* 补历史欠账（at ≠ 当前局面）：画面别动，但**数据要留全**。
+     ★★ 2026-10-29 修：原来这里只 rememberEval（写 history / leads），**不存快照**。
+        于是「用户刚落下、立刻被 AI 应手盖掉」的那一手在 anaAt 里永远空着 ——
+        解说词卡的分数 / 胜率 / 目数损失 恒为「还在算」，而推荐点 / PV / 直觉选点
+        （读的是上一手、有快照）却正常，卡片只填了半张脸。用户报的就是这个。
+     门槛用 settleThreshold()：补账这趟的结果用户看不见它「在收敛」，
+        宁可等它算准再一次给出数字，也不要先给一个过几秒又变的暂行值（纪律：数字不跳）。 */
   if (at !== state.viewAt) {
-    if (((res.root && res.root.visits) || 0) >= HINT_MIN_VISITS) {
+    const v = (res.root && res.root.visits) || 0;
+    if (v >= HINT_MIN_VISITS) {
       /* ★ 带上这次的搜索量（第四个参数）—— 门槛靠它判断「够不够准」，见 rememberEval */
-      rememberEval(at, blackWinFrom(res, at), blackLeadFrom(res, at), (res.root && res.root.visits) || 0);
+      rememberEval(at, blackWinFrom(res, at), blackLeadFrom(res, at), v);
+    }
+    if (v >= settleThreshold() && saveAnaSnapshot(res, at)) {
+      /* 存进去的那一手可能正是「眼前这一手的前一手」→ 卡片上的推荐点/PV/直觉选点
+         就是等它才齐的，必须重画一次（原来不会有人在这里刷新文字框）。 */
+      renderCommentBox();
     }
     return true;
   }
@@ -7716,6 +7772,12 @@ async function runAnalysisOnce(at) {
         每一级都比上一级高 2.4 倍，于是每一级都通过了 1.25 倍那道门，数字照跳不误。
         「逐级放宽」对逐级增长的报告序列没有任何拦截力 —— 必须用**目标值的绝对比例**当门槛。
      ⚠️ 别改成「永不覆盖」：早期算的那几手会永远停在粗算值上，回看也不会变准。 */
+
+/* 「这一手的搜索量够不够准」的**唯一门槛**（目标值的 90%）。
+   rememberEval / evalSettled / 补账存快照（runAnalysisOnce）三处共用同一个数 ——
+   别各写一份，差一点就会出现「曲线已经算准了、解说词卡却说还在算」。 */
+function settleThreshold() { return (settings.visits || ANALYZE_VISITS) * 0.9; }
+
 function rememberEval(at, blackWin, blackLead, visits) {
   if (!(at >= 0)) return;
   if (state.draft && at > state.draft.from) return;
@@ -7728,8 +7790,7 @@ function rememberEval(at, blackWin, blackLead, visits) {
   if (at > state.moves.length) return;
 
   const v = (typeof visits === 'number' && visits > 0) ? visits : 0;
-  const target = settings.visits || ANALYZE_VISITS;        // 底栏「计算深度」
-  const SETTLED = target * 0.9;                            // 「够准」的搜索量门槛
+  const SETTLED = settleThreshold();                       // 「够准」的搜索量门槛
   /* ★ 习题配平（2026-10-25 深夜）：**第 0 手的口径会变**（0 目 → lead 配平 → 胜率校正），
      每次都换一个贴目，旧值和新值根本不可比。所以这两道门槛对它**一律放行**：
      否则走势图第 0 手会永远停在第一档口径的值上（实测：胜率条 39.5%，走势图 99.98%），
@@ -7755,24 +7816,73 @@ function rememberEval(at, blackWin, blackLead, visits) {
    「下完显示一个数字，过会儿再看又不是这个数」。
    改成：没算准就显示「…」，算准了才出数字。数字一旦出现就不会再变。 */
 function evalSettled(at) {
-  const target = settings.visits || ANALYZE_VISITS;
-  return (state.histVisits[at] || 0) >= target * 0.9;
+  return (state.histVisits[at] || 0) >= settleThreshold();
 }
 
 /* 引擎给的是「轮到走棋那一方」的胜率 —— 统一换算成黑方视角（at 只用于兜底判断该谁走） */
 function blackWinFrom(p, at) {
-  const cp = String((p.root && p.root.currentPlayer) || '').toUpperCase();
-  const side = cp === 'B' ? 'b' : cp === 'W' ? 'w' : sideToMove(at);
-  return side === 'b' ? p.root.winrate : 1 - p.root.winrate;
+  return engineSide(p, at) === 'b' ? p.root.winrate : 1 - p.root.winrate;
 }
 
 /* 同上，换算「黑方领先目数」（正 = 黑优）—— 走势图「目差」纵轴用 */
 function blackLeadFrom(p, at) {
   const root = p && p.root;
   if (!root || typeof root.scoreLead !== 'number') return undefined;
-  const cp = String(root.currentPlayer || '').toUpperCase();
-  const side = cp === 'B' ? 'b' : cp === 'W' ? 'w' : sideToMove(at);
-  return side === 'b' ? root.scoreLead : -root.scoreLead;
+  return engineSide(p, at) === 'b' ? root.scoreLead : -root.scoreLead;
+}
+
+/* 这份报文算的是「轮到哪一方」的局面：以引擎回的 root.currentPlayer 为准（权威），
+   没有才按手数推。applyAnalysis / blackWinFrom / blackLeadFrom / saveAnaSnapshot 必须同一套口径。 */
+function engineSide(p, at) {
+  const cp = String((p && p.root && p.root.currentPlayer) || '').toUpperCase();
+  return cp === 'B' ? 'b' : cp === 'W' ? 'w' : sideToMove(at);
+}
+
+/* ★★ 把一个局面的分析结果存成**快照**（第 at 手之后的局面）。
+   视角口径：`blackWin` / `lead` / `moves[].lead` 是**黑方视角**；
+   `moves[].win` 保持**轮走方视角**（理由见下面那段，别"顺手"统一）。
+   2026-10-29 从 applyAnalysis 里拆出来的，起因是用户的报障：
+     「对弈第 1 手的解说词卡上半是数字，分数 / 胜率 / 目损却永远写着『还在算』」。
+   根因：原来只有 applyAnalysis 里存快照，而它**只在报文描述的局面 === viewAt 时**才被调用
+   （结果路径前面有 `at !== viewAt` 的提前 return、中途报告被 onProgress 的 `pAt !== viewAt` 挡掉）。
+   对弈时用户落子后 AI 几百毫秒就应手 ⇒ viewAt 立刻变成下一手 ⇒ 用户刚下那手的报文只能走
+   「补账」分支，那条分支只写 history/leads，**不留快照** ⇒ anaAt[k] 永远空着。
+   而卡片上的推荐点 / PV / 直觉选点读的是 anaAt[k-1]（上一手，有快照）——
+   于是卡片只填了半张脸。现在拆成独立函数，补账那一路也能存（见 runAnalysisOnce）。
+   ★ 存的门槛由**调用方**决定：上屏那一路每份报文都存（要立刻有东西看）；
+     补账那一路只在搜索量够了才存（免得数字先跳一次，见 runAnalysisOnce）。 */
+function saveAnaSnapshot(p, at) {
+  if (!p || !p.root) return false;
+  if (typeof at !== 'number') at = state.viewAt;
+  /* 越界不收 —— 与 rememberEval 同一条纪律：越界的 at 会把数组撑出幽灵格子
+     （悔棋 / 换线后队列里残留的欠账），界面会显示根本不存在的第 N 手。
+     ★ 试下（草稿）里的局面**照存**（用户要能在那儿看分数），由 exitDraft 统一摘掉。 */
+  if (!(at >= 0) || at > state.moves.length) return false;
+
+  const side = engineSide(p, at);
+  const blackWin = side === 'b' ? p.root.winrate : 1 - p.root.winrate;
+  if (typeof blackWin !== 'number') return false;        // 没有胜率 → 这张快照没东西可显示
+  const lead = side === 'b' ? p.root.scoreLead : -p.root.scoreLead;
+
+  /* 候选点：lead 换算成黑方视角（目差是有符号量，取反即可）。
+     ★★ 但 `win` **保持轮走方视角原值**（m.winrate）—— 不能换算成黑方视角再比大小：
+        「推荐最佳选点」= 找出**走棋方自己最想下的那一手**，也就是 m.winrate 最大的那个。
+        换成黑方视角后取 max，轮白走时就会挑到白方最差的一手（2026-10-29 修；
+        原来写的是 `-w`，连概率都不是了）。 */
+  const toBlackLead = v => (typeof v === 'number' ? (side === 'b' ? v : -v) : v);
+  const ms = (p.moves || []).map(m => ({
+    gtp: m.move,
+    prior: m.prior,
+    order: m.order,
+    win: m.winrate,                       // 轮走方视角（= 下这一手的人自己的胜率）
+    lead: toBlackLead(m.scoreLead),
+    pv: Array.isArray(m.pv) ? m.pv.slice(0, 8) : [],
+  }));
+  /* 「推荐最佳选点」按**胜率**排（引擎的 moveInfos 是按访问量排的，不是按胜率） */
+  let best = null;
+  for (const m of ms) if (typeof m.win === 'number' && (!best || m.win > best.win)) best = m;
+  state.anaAt[at] = { at, side, blackWin, lead, visits: (p.root && p.root.visits) || 0, moves: ms, best };
+  return true;
 }
 
 /* p = 分析结果；at = 这是「第几手之后」的局面。
@@ -7791,9 +7901,9 @@ function applyAnalysis(p, at) {
      引擎（RapaceGo/engine.cfg 里 reportAnalysisWinratesAs = SIDETOMOVE）返回的
      winrate / scoreLead / moveInfos[].winrate 全部是「**轮到走棋那一方**」的视角 ——
      已用极端贴目的对照实验验证过（轮白走时 scoreLead<0 表示白方落后）。
-     所以这里只做一次「轮走方 → 黑方」的换算，不能再多转一次。 */
-  const cp = String((p.root && p.root.currentPlayer) || '').toUpperCase();
-  const side = cp === 'B' ? 'b' : cp === 'W' ? 'w' : sideToMove(at);
+     所以这里只做一次「轮走方 → 黑方」的换算，不能再多转一次。
+     ★ 判定收在 engineSide() 里（blackWinFrom / blackLeadFrom / saveAnaSnapshot 共用）。 */
+  const side = engineSide(p, at);
 
   const blackWin = side === 'b' ? p.root.winrate : 1 - p.root.winrate;
   const whiteWin = 1 - blackWin;
@@ -7804,23 +7914,9 @@ function applyAnalysis(p, at) {
      下一手、这份报文不能拿去画候选点了，它本身仍然是对的、该留下来 ——
      「解说词」卡回看那一手时要靠它。原来的顺序是先 `return false`，
      自动对弈（每手间隔短）时前一手的数据整批丢掉，那一手就永远显示"还在算"。
-     ⚠️ win / lead 一律换算成**黑方视角**（纪律 11：引擎原值是"轮走方视角"，
-        轮到白走时符号会反）。 */
-  {
-    const toBlack = v => (typeof v === 'number' ? (side === 'b' ? v : -v) : v);
-    const ms = (p.moves || []).map(m => ({
-      gtp: m.move,
-      prior: m.prior,
-      order: m.order,
-      win: toBlack(m.winrate),
-      lead: toBlack(m.scoreLead),
-      pv: Array.isArray(m.pv) ? m.pv.slice(0, 8) : [],
-    }));
-    /* 「推荐最佳选点」按**胜率**排（引擎的 moveInfos 是按访问量排的，不是按胜率） */
-    let best = null;
-    for (const m of ms) if (typeof m.win === 'number' && (!best || m.win > best.win)) best = m;
-    state.anaAt[at] = { at, side, blackWin, lead, visits: (p.root && p.root.visits) || 0, moves: ms, best };
-  }
+     ★ 2026-10-29：存的动作搬进 saveAnaSnapshot（补账那一路也要存）；
+       它自己换算视角，这里不再重复一遍。 */
+  saveAnaSnapshot(p, at);
 
   /* ① 报文与当前局面不符：这不是"当前局面的结果"，一个界面字段都不该写。
      为什么必须挡：请求在飞的时候用户落子 / AI 应手，回来的报文属于**上一个**局面；
@@ -7935,6 +8031,19 @@ const RANK_GROUPS = [
   '职业棋风 · 按年份（1800–2023）',              // 2 — proyear_*
 ];
 
+/* ★★ 2026-10-29 用户要求：「对手棋力」再加一档「最强引擎」——
+   它不是 humanSLProfile 段位（那个最多到业余 9 段），而是**完整算力的 KATAGO**：
+   分析引擎的强权重 + 每手满 500 步，取它认为最强的那一手。
+   和习题练习里 KATAGO 的「应手」是同一条路（`api.analyze` + `order === 0`）。
+   ★ 为什么单列一组、不塞进段位表：段位表是**一把连续尺子**（20 级~9 段），
+     这一档不在那把尺子上（官方原文没有对应关系），混进去等于给它编一个段位。
+   ★ AI_STRONG_VISITS 是**下限**：底栏「计算深度」调得更深时它跟着变深
+     （对手的搜索量和给你看分析用的搜索量本来就该一致，否则同一局面两套读数）。 */
+const ENGINE_LEVEL = 'engine_max';
+const STRONG_GROUP = '最强引擎（非段位模型）';
+const AI_STRONG_VISITS = 500;
+const isEngineLevel = () => settings.level === ENGINE_LEVEL;
+
 /* [档位值, 显示名, 分组下标, 一句话水平说明]
    ★ 说明是「圈内粗略换算 + 典型特征」，**不是官方标定** —— 官方没有换算表。
    「约业余 X 段」指网络平台的段位体系（野狐/弈城那种 1d~9d），
@@ -7992,11 +8101,24 @@ for (let y = 2023; y >= 1800; y--) {
 }
 const RANKS = RANK_ROWS_ALL.map(([v, label, gi, note]) =>
   ({ v, label, group: RANK_GROUPS[gi], note }));
+/* ★ 「最强引擎」排在最前（段位表那三组一个字节都没动，见 ENGINE_LEVEL 的注释）。 */
+RANKS.unshift({
+  v: ENGINE_LEVEL, label: '最强引擎', group: STRONG_GROUP,
+  note: '完整算力的 KATAGO（强权重 · 每手满 ' + AI_STRONG_VISITS + ' 步起）· 不是段位模型',
+});
 const RANK_MAP = new Map(RANKS.map(r => [r.v, r]));
 
 /* AI 每手搜索量。档位由网络决定，visits 只影响这手算得稳不稳 —— 给个够用的固定值。
    （别再用 visits 当难度旋钮：那样既费时间又不准，低段位照样能算得比标称强。） */
 const AI_VISITS = 400;
+
+/* 「最强引擎」这一档每手搜多少（2026-10-29）。
+   = max(AI_STRONG_VISITS, 底栏「计算深度」)：500 步是**下限**，
+   用户把计算深度调到 800/1500 时它跟着变深 —— 对手的搜索量和给你看分析用的搜索量
+   本来就该是同一个数，两套口径会让同一局面出现两个「最强手」。 */
+function strongAIVisits() {
+  return Math.max(AI_STRONG_VISITS, settings.visits || ANALYZE_VISITS);
+}
 
 let aiBusy = false;
 let aiRetry = 0;         // AI 这一手没落成时的重试计数（防止局面被打断后停摆）
@@ -8010,7 +8132,10 @@ function isMyTurn() {
   return sideToMove(state.viewAt) === state.myColor;
 }
 
-function needAIMove() {
+/* 「现在轮到对手走」——**不**看引擎状态、也**不**看 aiBusy。
+   ★ 为什么单独抽出来（2026-10-29）：最强引擎档的应手和分析请求抢同一个引擎，
+     分析链要靠这条判据**让路**（见 runAnalysis 的守卫），两处必须同一套口径。 */
+function aiTurnPending() {
   return settings.mode === 'play'
     && !state.noGame            // ★ 未开局：AI 也不落子（否则执白时一启动它就自己下起来了）
     && !state.draft              // ★ 试下（草稿）时 AI 不自动落子 —— 是你在摆，不是在下棋
@@ -8021,12 +8146,19 @@ function needAIMove() {
        这里直接掐住：连续两 pass 就**一手都不再下**，把局面交给数子。
        （2026-10-18 之前只靠 `!state.result`，慢了半拍就会出现 3 个、4 个连着的 pass。） */
     && !isTerminal()
-    && engineReadyPlay           // ★ 是「对弈引擎」就绪，不是分析引擎
-    && !aiBusy
     && state.viewAt === state.moves.length
     /* ★ 2026-10-18：双方都自动时，**两个颜色轮到时都要落子**（不看 isMyTurn），
        只受人按的「暂停」约束。 */
     && (state.autoBoth ? !state.autoPaused : !isMyTurn());
+}
+
+function needAIMove() {
+  return aiTurnPending()
+    /* ★★ 最强引擎档用的是**分析引擎**（强权重），不是 human 段位引擎 ——
+       它不需要「对弈权重」，所以这里也得换成分析引擎的就绪标志。
+       （2026-10-29 加档时改；写成 engineReadyPlay 的话，这档会一直"等引擎"。） */
+    && (isEngineLevel() ? engineReady : engineReadyPlay)
+    && !aiBusy;
 }
 
 function scheduleAIMove(delay) {
@@ -8049,6 +8181,15 @@ function pickAIMove(res) {
   /* 引擎首选是 pass（该收束了）→ 直接 pass。官方配方里也是这么处理的。 */
   const first = infos.find(m => m.order === 0) || infos[0];
   if (first && String(first.move).toLowerCase() === 'pass') return 'pass';
+
+  /* ★★ 最强引擎档（2026-10-29）：**永远取首选**（访问量最高那一手）——
+     不抽样、也不像段位档那样"偶尔换第二手"。这一档卖的就是「每手都下它认为最强的」，
+     加随机就把承诺毁了。（human 权重才需要降级/拟人，强权重不需要。） */
+  if (isEngineLevel()) {
+    const g = first && first.move;
+    if (!g) return null;
+    return String(g).toLowerCase() === 'pass' ? 'pass' : fromGTP(g);
+  }
 
   /* ---- 拟人落子：按人类概率抽样 ---- */
   if (settings.humanLike) {
@@ -8115,6 +8256,12 @@ async function maybeAIMove() {
       syncUI();
       return;
     }
+    /* ★★ 最强引擎档（2026-10-29 用户要求）：不走 human 段位引擎，
+       改用**分析引擎的强权重**出最强应手 —— 和习题练习里 KATAGO 的应对同一条路
+       （`api.analyze` + 取 `order === 0`，见 pickAIMove）。
+       ⚠️ 与那条路的差别只有一处：这里还要**顺手把结果存成快照**（见下面）。 */
+    const strong = isEngineLevel();
+    const at = state.viewAt;                  // = 手数（aiTurnPending 已核过）
     const req = {
       initialStones: state.setup.map(s => [s.color === 'b' ? 'B' : 'W', toGTP(s.x, s.y)]),
       moves: state.moves.slice(0, state.viewAt)
@@ -8122,17 +8269,32 @@ async function maybeAIMove() {
       rules: (RULES[settings.rules] || RULES.chinese).kata,
       komi: settings.komi,
       size: N,
-      maxVisits: AI_VISITS,
-      profile: settings.level,
+      maxVisits: strong ? strongAIVisits() : AI_VISITS,
       /* 拟人落子要用 policy（人类先验）来抽样。⚠️ includePolicy 是**外层字段**
-         —— 官方文档明确：除了它和 maxVisits，其余参数都必须放 overrideSettings，否则无效。 */
-      includePolicy: settings.humanLike,
+         —— 官方文档明确：除了它和 maxVisits，其余参数都必须放 overrideSettings，否则无效。
+         ★ 最强引擎档不抽样，也就不需要 policy（分析引擎默认不返回它）。 */
+      includePolicy: !strong && settings.humanLike,
     };
+    if (strong) {
+      /* · **不带 profile**：分析引擎加载的是**强权重**，而 humanSLProfile 是 human 权重
+           专有的 —— 强权重收到它会报 `Unknown human SL network profile`（实测）。
+         · **带 timeoutMs**：main.js 的超时兜底是听渲染端的（19 路 500 步要几十秒，
+           不传就按 90 秒算，深档位必然误判超时）。
+         · **带 initialPlayer**：空盘开局（第一手）时引擎会自己猜谁先走，猜的是**白先**
+           （纯黑摆子才推成黑先）—— 明说一句，AI 执黑时才不会按"白棋的思路"选点。
+           有手顺时引擎本来就知道谁走，带上也无害。 */
+      req.timeoutMs = analyzeTimeoutMs(N, req.maxVisits);
+      req.initialPlayer = sideToMove(at) === 'b' ? 'B' : 'W';
+    } else {
+      req.profile = settings.level;
+    }
     const expectLen = state.moves.length;
     const gen = gameGen;                      // ★ 这一手属于哪一局
-    /* ★ 走「对弈引擎」（human 权重）—— 分析引擎不参与落子，
-       否则两条请求会在同一个进程里互相 terminate。 */
-    const res = await window.api.playMove(req);
+    /* ★ 默认走「对弈引擎」（human 权重）—— 分析引擎不参与落子，
+       否则两条请求会在同一个进程里互相 terminate。
+       ★ 最强引擎档**就是**那个例外：它要的正是分析引擎（分析链这时已经让路，
+         见 runAnalysis 里那条 `isEngineLevel() && aiTurnPending()` 的守卫）。 */
+    const res = strong ? await window.api.analyze(req) : await window.api.playMove(req);
 
     /* ★ 换了局（新对局 / 打开棋谱）→ 这手整体作废。
        光看手数不够：两边都是空盘时 `state.moves.length` 都是 0，下面的检查会"恰好通过"，
@@ -8158,6 +8320,18 @@ async function maybeAIMove() {
       retry = true;
       flash('AI 这一步没算出来（' + ((res && res.error) || '未知') + '），重试中…');
       return;
+    }
+
+    /* ★★ 最强引擎档：这一份报文**就是那个局面的完整分析**（强权重 + 满搜索量），
+       顺手记进曲线 + 存成快照 —— 解说词卡里「分数 / 胜率 / 目损」要的正是它。
+       为什么必须在这儿存：AI 思考期间分析链是**让路**的（见 runAnalysis 的守卫），
+       不存的话那个局面就再没人算过，卡片会一直「还在算」（正是 2026-10-29 修的那个毛病）。
+       ⚠️ 门槛用 settleThreshold()：这一档每手都够（visits ≥ 500），等同于无条件存；
+          留着这行是为了「计算深度调到 300 以下」那种情况也不塞半成品（纪律：数字不跳）。 */
+    if (strong && res.root && !res.cancelled) {
+      const v = res.root.visits || 0;
+      if (v >= HINT_MIN_VISITS) rememberEval(at, blackWinFrom(res, at), blackLeadFrom(res, at), v);
+      if (v >= settleThreshold() && saveAnaSnapshot(res, at)) renderCommentBox();
     }
 
     const pick = pickAIMove(res);
@@ -9097,14 +9271,13 @@ function renderCurve() {
 
   const isLead = state.curveMode === 'lead';
   const src = isLead ? state.leads : state.history;
-  const pT = 14, pB = 14, pL = 30, pR = 5;     // 上下各留一行：左上角写模式、右上角写量程
+  const pT = 14, pB = 14, pL = 30, pR = 5;     // 上留一行放量程、下留一行放下轴
   const W = Math.max(1, w - pL - pR), H = Math.max(1, h - pT - pB);
 
-  /* 左上角：这图画的是哪条轴（**视角是黑方**，必须写出来） */
-  c.font = '9px "Microsoft YaHei", sans-serif';
-  c.fillStyle = 'rgba(0,0,0,.38)';
-  c.textAlign = 'left'; c.textBaseline = 'top';
-  c.fillText(isLead ? '黑方领先（目）' : '黑方胜率', 2, 1);
+  /* ★ 2026-10-30 用户要求：去掉画在左上角那行「黑方胜率 / 黑方领先（目）」。
+     它和标题「走势（黑方视角）」+ 右上角的「胜率 / 目差」开关说的是同一件事，
+     挤在 76px 高的图里纯属重复（还占了左上角那条线的高点）。
+     ⚠️ pT 不要跟着一起压：右上角那行「本局量程」还在，两条线的高度口径别乱动。 */
 
   const sg = v => (v > 0 ? '+' : (v < 0 ? '\u2212' : '')) + Math.abs(v).toFixed(1);
 
@@ -9928,18 +10101,40 @@ function leadText(lead) {
 
 /* 第 k 手那一块的文字。k = 手数（1 起）。 */
 function moveAnalysisText(k) {
-  return moveAnalysisTextAt(state.moves, state.anaAt, k);
+  /* ★ 2026-10-29：给「界面上这张卡」补一个**兜底数据源**（第 4 个参数）。
+     为什么需要：anaAt 会有缺口（历史上没存上的、换线时被截掉的），
+     而 history / leads 里其实早有这个局面的胜率与目差（补账那一路写的）——
+     于是出现自相矛盾的一幕：右侧曲线有数、卡片却写「还在算」。
+     ⚠️ 导出（curLineAnaAt → moveAnalysisTextAt）**绝不能**走这个兜底：
+        那里读的是别的线的快照，而 state.history 属于当前这条线，
+        混进来就是把 A 分支的数写进 B 分支的解说词。 */
+  return moveAnalysisTextAt(state.moves, state.anaAt, k, postFromHistory);
+}
+
+/* 卡片专用兜底：第 k 手之后那个局面，从走势曲线那两张表里取（都是黑方视角）。
+   只有**算准了**才给（evalSettled）—— 否则卡片会先出一个数、过几秒又变一个。 */
+function postFromHistory(k) {
+  if (!evalSettled(k)) return null;
+  const w = state.history[k];
+  const l = state.leads[k];
+  if (typeof w !== 'number' || typeof l !== 'number') return null;
+  return { blackWin: w, lead: l };
 }
 
 /* 同上，但**数据来源可以指定**（2026-10-22）：
    导出带分支的棋谱时要按「那一条分支自己的手顺 + 自己的分析快照」写 C[]，
    不能再读 state.moves / state.anaAt —— 它们只代表当前这条线（这就是「导出后只有最后
    那条分支有解说词」的根因）。
-   moves = [{color,x,y,pass}]；at = {位置: 快照}（快照形状见 applyAnalysis）。 */
-function moveAnalysisTextAt(moves, at, k) {
+   moves = [{color,x,y,pass}]；at = {位置: 快照}（快照形状见 applyAnalysis）。
+   postFallback（可选，只给界面那张卡用）：at 里没有「走完这一手」的快照时，
+     用 k → {blackWin, lead}（黑方视角）顶上；返回值 null = 也没有。见 moveAnalysisText。 */
+function moveAnalysisTextAt(moves, at, k, postFallback) {
   const mv = (moves || [])[k - 1];
   if (!mv) return '';
-  const post = (at || {})[k] || null;         // 走完这一手之后的局面
+  /* 走完这一手之后的局面。快照优先（那是引擎对**这个局面**的正式读数），
+     没有才用兜底源 —— 兜底只在"算准了"时才有值，所以不会让数字先跳一次。 */
+  let post = (at || {})[k] || null;
+  if (!post && typeof postFallback === 'function') post = postFallback(k) || null;
   const pre = (at || {})[k - 1] || null;      // 走这一手之前的局面（推荐点/直觉/损失都看它）
   const mover = mv.color;                     // 'b' / 'w'
   const sgn = mover === 'b' ? 1 : -1;         // 黑方视角 → 走子方视角

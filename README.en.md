@@ -35,7 +35,10 @@ invents a justification for them. So it never gets to judge — only to explain.
 ## Features
 
 **Play** — human-style opponents rated by amateur rank (20k–9d, plus "pre-AI era" and
-"pro style by year"); **KATAGO vs KATAGO** (tick it in the new-game panel and both colours
+"pro style by year"), or the **strongest-engine** tier at the top of the list (the analysis
+engine's **strong weights**, a full 500 visits per move — deeper if you raise "计算深度" —
+always its top choice, never randomised or human-sampled; same code path as KATAGO's replies
+in tsumego practice, and it will dismantle you on purpose); **KATAGO vs KATAGO** (tick it in the new-game panel and both colours
 are played automatically at the same rank, with a pause/resume button — it never resigns,
 so you get to see the endgame); **per-move analysis** — while playing, the "commentary" box
 shows the move's score, win rate, **points lost**, best move with its expected lead, PV and
@@ -53,11 +56,11 @@ KATAGO takes either colour, and the opponent has **three settings**: **follow th
 deviate it falls back to KATAGO; **SGF variations are now parsed too**, so an alternative
 correct branch is followed instead of being treated as a deviation), **KATAGO** (search
 restricted to **within 2 lines of a stone** — the same band for both sides; it cannot land
-**on the dashed frame line** itself: at frame distance ≥3 that line is
+**on the dashed frame line** itself: at frame distance ≥3 (the default is 3) that line is
 excluded outright, and at 1–2 only the points hugging a stone are kept),
 and **play both sides** (you alternate colours yourself)); in tsumego mode the rules are fixed
 (Chinese), the engine's **analysis scope defaults to "inside the frame only"** — the board sent
-to KataGo is literally cropped to the frame (a corner problem becomes roughly 9×9), so nothing
+to KataGo is literally cropped to the frame (a corner problem becomes a small local board), so nothing
 outside it is computed at all: faster, and the ownership fog only covers the frame; switch it to
 "full board" for the old behaviour (19×19 search with a legal-move whitelist). ★ Cropping does
 **not** make the suggested moves better (8-problem A/B, both balanced: top move identical on
