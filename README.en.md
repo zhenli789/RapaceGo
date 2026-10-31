@@ -51,6 +51,10 @@ standard way; free-placement / two-player mode;
 tsumego practice (set up a problem, or **import an SGF puzzle collection** — one file may
 hold hundreds of problems, paged through with ‹ ›; **reopening a collection jumps straight
 back to the problem you were last on**; fixed local frame and a "show the solution" button —
+**the problem can be rotated while setting it up**: the round-arrow icon at the right end of the
+"place stone" row turns the whole board **90° clockwise** per click (four clicks restore it; a
+problem in a corner moves to the neighbouring corner, keeping its relation to the two edges), and
+the collection's solution is rotated with it so "follow the solution" still answers correctly —
 KATAGO takes either colour, and the opponent has **three settings**: **follow the solution**
 (default for imported collections — it replays the SGF's main line, never tenukis; if you
 deviate it falls back to KATAGO; **SGF variations are now parsed too**, so an alternative
@@ -174,8 +178,17 @@ actions are buttons at the **bottom of the card**: whole-game / this move / cand
 
 ![Whole-game commentary](docs/screenshots/batch-progress.png)
 
-**Game library** — import / export / rename / delete / search SGFs, with badges for
-"reviewed" and "has commentary".
+**Game library** — import / export / note / rename / delete / search SGFs, with badges for
+"reviewed" and "has commentary". Each row shows the **note** on top (the file name if there is
+none) and the real **file name** in grey underneath.
+
+**Note** is written into the game's `GN` field and leaves the file name alone. **Rename** is a
+**double-click on the game's name** (Enter confirms, Esc or clicking elsewhere cancels) and does
+change the real file name on disk: the report files that go with that game
+(`<name>.review.json`, `<name>.coach.json`, `.review.part.json`) are **renamed along with it** —
+they are matched by file name, so renaming only the SGF would leave them orphaned. An existing
+name is never overwritten, and renaming is blocked while a review or commentary run is in
+progress for that game.
 
 **Commentary stored inside the SGF** (many downloaded records carry it, especially pro games
 and problem collections): the **Commentary** box (bottom right) shows the note for the move
@@ -192,6 +205,51 @@ file** (the first edit leaves a `.bak` backup).
 - For problem collections (one file holding several problems) the top bar shows
   **“problem N of M”** — it only *labels* the position, it does **not** jump between
   problems (that would touch the move range, engine requests, history and caches).
+
+**Image-to-record (turn a photo into an SGF)** — point it at a board photo or screenshot and
+it reads the position **on your machine**: the image is never uploaded and never leaves your
+computer (plain JS, no network, no OpenCV). Two entry points: **Recognise image…** in the game
+library's bottom bar, and the same button inside the problem-set panel under Tsumego practice.
+
+- **Whole boards and corner crops both work**: whole 19 / 13 / 9 road boards (whatever road
+  count is detected; 13 / 9 are centred on the 19 road board), and life-and-death diagrams
+  that only show **one corner** — those are anchored to a corner of the 19 road board, so
+  everything imports as a 19 road position.
+- **You can see whether it read correctly**: the panel shows the **de-skewed board** (perspective
+  flattened), and every stone it found is **drawn as a stone** — black is black, white is white, at
+  a glance. Stones you add or recolour by hand look exactly the same; untick **mark the result** to
+  go back to the raw photo for a point-by-point check. Points it is unsure about get an **orange
+  ring**: a **solid** ring means "this stone, not too sure", a **dashed** ring means "this looks
+  empty, but a stone may have been missed". **Hover an intersection** and the line under the board
+  spells out the **board coordinate and the verdict** ("C7 · empty (unsure: a stone may be
+  missing)"). **One click on an intersection fixes it** (black → white → empty → black).
+- **Crooked or mirrored photos are fine**: the **orientation** row rotates 90° / mirrors the
+  image itself and re-reads it; when auto-detection fails, **Frame manually…** lets you drag
+  four handles onto the board corners (it re-reads on release).
+- **For corner crops, say where it goes**: **corner** picks top-left / top-right / bottom-left /
+  bottom-right (defaults to the auto-detected one) and **offset** nudges it further in — the
+  dots on the board follow, so you can align it by eye.
+- Pick **who moves first** (black / white), then **Save to library**, **Practise as a problem**, or
+  **Save into a problem set…** (pick an existing set by name). The file is named
+  `识谱-<image name>-<time>.sgf` and existing records are never overwritten.
+
+**Building your own problem library** (hand-set and image-read problems alike): set a problem up in
+tsumego practice → open the **problem set** panel from the practice card → click **Save current
+problem** on a set, and the problem is **appended to the end of that SGF** (side to move, board size
+and setup all written; if you save while solving, the moves on the board become the **solution**).
+To start a new set, click **New problem set…**, name it (it is an empty file; its **Open** button
+stays greyed out until the first problem lands), then save problems into it one by one. A set is just
+**game trees side by side** — the same format as classic collections like *Xuan Xuan Qi Jing*, so
+other Go software can open it too.
+
+**It reads a position, not a move sequence**: the result is a **static position**, so there is
+no move list to step through — AI review and per-move commentary do not apply (the image simply
+does not contain that information; it is not a bug). The original image is **not kept**; only
+the SGF is.
+
+**Usual reasons for a bad read**: coordinate labels or table rules inside the crop (crop the
+board itself), a corner of the board cut off, or white stones on a white background (scanned
+problem books basically hide white stones — check those point by point).
 
 **Manual engine loading** — the app starts with **no engine loaded** (zero VRAM).
 Click the indicator in the top bar when you want AI:

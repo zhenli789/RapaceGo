@@ -813,7 +813,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .modal h2 { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
 
 /* ---------- 棋谱库弹窗 ---------- */
-.rec-modal { width: 580px; max-height: 78vh; display: flex; flex-direction: column; }
+.rec-modal { width: 620px; max-height: 78vh; display: flex; flex-direction: column; }
 .rec-modal h2 { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .rec-dir { font-size: 11px; font-weight: 400; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 棋谱库标题行：左「棋谱库」、右路径。★ 必须是 flex + 路径 min-width:0 ——
@@ -834,9 +834,11 @@ main { flex: 1; display: flex; min-height: 0; }
 .rec-count { flex: none; font-size: 11.5px; color: var(--text-dim); white-space: nowrap; }
 .reclist li { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 7px; font-size: 12.5px; }
 .reclist li:hover { background: rgba(0, 0, 0, .045); }
-/* 棋谱条目：上行备注名 + 下行真实文件名（用户要求两个都显示） */
+/* 棋谱条目：上行备注名 + 下行真实文件名（用户要求两个都显示）
+   ★ 双击上行名字 = 改文件名（startRecRename）→ 所以名字这行不能随手选中文字，
+     `user-select:none` 让双击不先闪一下蓝底；输入框本身当然还能选中。 */
 .reclist .rec-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.reclist .rec-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reclist .rec-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; user-select: none; }
 .reclist .rec-file { font-size: 10.5px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reclist .rec-meta { flex: none; font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .reclist li button { height: 24px; padding: 0 9px; font-size: 11.5px; flex: none; }
@@ -845,7 +847,8 @@ main { flex: 1; display: flex; min-height: 0; }
 .reclist li button.rec-review { min-width: 68px; }
 .reclist li button.rec-review:not(.primary) { background: #fff; }
 .reclist .empty { display: block; text-align: center; padding: 26px 0; color: var(--text-dim); cursor: default; }
-/* 备注（改名）：就地展开的输入框 */
+/* 备注 / 双击改名：就地展开的输入框
+   （备注时它和「确定 / 取消」并排铺满整行；双击改名时它单独待在上行名字的位置） */
 .reclist li input {
   flex: 1; min-width: 0; height: 24px; font: inherit; font-size: 12.5px;
   padding: 0 7px; border: 1px solid var(--line); border-radius: 6px;
@@ -885,6 +888,11 @@ main { flex: 1; display: flex; min-height: 0; }
   border-top: 1px solid var(--line-soft);
 }
 .mfoot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+/* ★ 底栏按钮**不许被压缩、不许折行**（2026-10-30 踩过）：flex 默认会按比例把按钮压窄，
+   而按钮的高度是固定的 28px —— 一旦文字换成两行，第二行就直接溢出到框外面，
+   看上去像"按钮被劈成两半"（棋谱库底栏加上「识别图片…」后 6 个按钮就超了 14px）。
+   要不折行 + 不压缩，容器真的装不下时就去加宽弹窗（.rec-modal 已从 580 加到 620）。 */
+.mfoot > button { flex: 0 0 auto; white-space: nowrap; }
 
 /* ---------- AI 复盘 ---------- */
 .rv-modal { width: 580px; max-height: 82vh; overflow: auto; }
@@ -1091,35 +1099,38 @@ main { flex: 1; display: flex; min-height: 0; }
    28px = 按钮 26 + 余量；所有行于是恒为 28px。 */
 .ts-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 28px; margin-bottom: 6px; }
 .ts-row:last-of-type { margin-bottom: 0; }
-.ts-label { flex: none; min-width: 38px; font-size: 12px; color: var(--text-dim); }
+/* ★ 2026-10-31（C 方案）：标签列**定宽 44px**，所有整行行的控件都从同一条竖线起步。
+   原来 min-width:38px，「先手」24px、「KATAGO」46px 各按自己内容走 → 两行的控件起点错开，
+   看着就是"没对齐"。定宽之后左边成一条齐刷刷的列。 */
+.ts-label { flex: none; width: 44px; font-size: 12px; color: var(--text-dim); }
 .ts-val { font-size: 12px; color: var(--text); }
 
-/* ---------- 练习卡：框架 + 框距 合并成一行（2026-10-14 用户要求缩减占用）----------
-   四组控件（框架 label + 开关 / 框距 label + − 4 +）要挤在卡片 ~240px 的宽度里。
-   两条一起才放得下，改任何一条都可能把最后的「+」顶到第二行去：
-     · .ts-row-frame → nowrap + 间距 6px（默认是 wrap + 8px）
-     · .seg-mini    → 按钮内边距 10px→7px
-   ⚠️ 这属于"看着差不多、实际卡在临界的排版"，所以 dev/_cdp_tsumego.mjs 里有一条
-      几何断言盯着它（同一行 + 不越卡片右边界）。改文案/字号后必须重跑。 */
-.ts-row-frame { flex-wrap: nowrap; gap: 6px; }
-.ts-row-frame .ts-label { min-width: 0; }
-/* 解题阶段的「对手 [KATAGO|我下两边]」这一行。
-   ★ 2026-10-16 起这一行**只剩 label + 开关**（题目目标挪去了常驻行 .ts-row-first），
-     宽度不再紧张 —— 但 nowrap 与"label 不限宽"照旧留着：
-     这两个按钮的文案（KATAGO / 我下两边）是全卡最长的，将来若再加东西还得靠它兜住。 */
+/* ---------- 双列（C + A 组合，2026-10-31 用户选定）----------
+   「先手 | KATAGO」「框架 | 框距」各占半行：每格 flex:1（等宽），格内 label 定宽 44px、
+   开关组吃掉剩下的宽度 —— 于是两格的按钮起点是对齐的，右侧那半行也不再有空白。
+   ⚠️ 半行只有 ~132px（卡片内容 274 − 格子间距 10）÷2，是**临界**排版：
+      44(label) + 5 + 两个按钮；.seg-mini 的内边距因此收到 4px。
+      改按钮文案 / 字号必须重跑 dev/_cdp_tsumego.mjs 的几何断言（不换行、不越卡片右边界）。 */
+.ts-row-duo { flex-wrap: nowrap; gap: 10px; }
+/* 格子里的 label 收到 10.5px：KATAGO 这个最长标签在 44px 里必须放得下 */
+.ts-row-duo .ts-label { width: 44px; font-size: 10.5px; }
+.ts-cell { display: flex; align-items: center; gap: 5px; flex: 1 1 0; min-width: 0; }
+.ts-cell .seg { flex: 1 1 auto; min-width: 0; }
+.ts-cell .seg button { flex: 1 1 0; min-width: 0; padding: 0 4px; }
+/* 框距那格例外：− 3 + 是三个定宽小件，拉成一个宽条反而难点 */
+.ts-cell-dist { gap: 3px; }
+.ts-cell-dist .ts-label { flex: none; }
+
+/* 开关组铺满剩下的宽度（落子 黑/白/擦、对手 按正解/KATAGO/我下两边）：
+   按钮等分整行 —— 这是 C 方案"点哪儿都算点到"的那一半。 */
+.seg-fill { flex: 1 1 auto; min-width: 0; }
+.seg-fill button { flex: 1 1 0; min-width: 0; }
+
+/* 解题阶段的「对手」那一行（label + 三档开关）*/
 .ts-row-solve { gap: 6px; flex-wrap: nowrap; }
-.ts-row-solve .ts-label { min-width: 0; }
-/* ★ 2026-10-17 对手由 2 档变 3 档（按正解 / KATAGO / 我下两边）：
-   整行只剩 244px，原样的 10px 内边距会挤出去 → 这组收成 7px。
-   实测：label 26 + 按钮 56/66/53 + 两处 3px + 行内 6px ≈ 213px ≤ 244px。 */
 .ts-row-solve .seg { gap: 3px; }
-.ts-row-solve .seg button { padding: 0 7px; }
-/* ---------- 练习卡：先手（常驻一行）----------
-   一列两样（2026-10-17 起只剩一样）：`先手` + [黑先|白先]。
-   ⚠️ nowrap 留着 —— 一换行卡片高度就变（"高度恒定"那条铁律）。
-   （原来的「目标 净杀」那一格连同 #ts-goal-txt.m 随判定 / 提示一起删了。） */
-.ts-row-first { flex-wrap: nowrap; gap: 6px; }
-.ts-row-first .ts-label { min-width: 0; }
+.ts-row-solve .seg button { padding: 0 6px; }
+
 .seg-mini { gap: 3px; }
 .seg-mini button { padding: 0 7px; }
 
@@ -1130,7 +1141,6 @@ main { flex: 1; display: flex; min-height: 0; }
       所以名字按钮 flex:1 + min-width:0 + 省略号，其余三样 flex:none。
    ⚠️ 同样的道理：这一行绝不能 wrap（一换行卡片高度就变，违反"高度恒定"）。 */
 .ts-row-pset { flex-wrap: nowrap; gap: 6px; }
-.ts-row-pset .ts-label { min-width: 0; }
 #btn-pset { flex: 1 1 auto; min-width: 0; max-width: none; padding: 0 8px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
 /* 打开了题集 → 名字按钮用主题绿（一眼看出"这题来自哪本练习册"）。
@@ -1140,13 +1150,25 @@ main { flex: 1; display: flex; min-height: 0; }
 #btn-ts-prev:disabled, #btn-ts-next:disabled { opacity: .4; }
 #pset-pos { flex: none; min-width: 40px; text-align: center; font-size: 11.5px; }
 
-/* ---------- 练习卡：解题阶段那排按钮（2026-10-14 起是 **5 个**）----------
-   加了「正解」之后，五个两字按钮默认内边距（0 10px）刚好卡在卡片宽度上
-   （5×44 + 4×6 = 244 = 内容宽），一有字体差异就会换行 → 卡片变高。
-   所以这一行单独把内边距收到 8px（5×40 + 4×6 = 224），留出 20px 余量。
-   ⚠️ 改了按钮文案（加字/减字）都要重跑 dev/_cdp_tsumego.mjs 里那条"不换行"断言。 */
+/* ---------- 练习卡：操作按钮那一行（摆题：开始解题 / 清空；解题：重来 / 重摆 / 正解）----------
+   ★ 2026-10-31（C 方案）：主按钮**占满**整行、次按钮固定窄宽。
+     原来两个各占一半，最该点的「开始解题」反而不突出；现在它独占一行宽度，
+     「清空」缩到右边 62px（危险操作，本来就该小一点、离主按钮远一点）。 */
+.ts-row-actions { flex-wrap: nowrap; gap: 6px; }
+#btn-ts-start { flex: 1 1 auto; min-width: 0; }
+#btn-ts-clear { flex: none; width: 62px; padding: 0 4px; }
+/* ---------- 练习卡：摆题「落子」那行最右边的**旋转**按钮（2026-10-31 用户要求）----------
+   全卡唯一一个纯图标按钮：没有文字，所以宽度不需要跟着字数走，做成正方小钮。
+   26px 高 = 跟同行的 黑/白/擦（.seg button）一样高，行高仍是 .ts-row 的 28px（卡片高度不变）。
+   margin-left:auto 让它**永远贴最右**：交替摆棋时颜色组被藏起来（#seg-tscolor[hidden]），
+   那时左边只剩「下一子 X」这行小字，没有它就会被顶到中间去。 */
+#btn-ts-rotate { flex: none; width: 28px; height: 26px; padding: 0; margin-left: auto;
+  display: inline-flex; align-items: center; justify-content: center; color: var(--text-dim); }
+#btn-ts-rotate:hover:not(:disabled) { color: var(--text); }
+#btn-ts-rotate svg { display: block; }
+#btn-ts-rotate:disabled:hover { background: var(--panel); }
 .ts-row-btns { flex-wrap: nowrap; gap: 6px; }
-.ts-row-btns button { flex: none; padding: 0 8px; }
+.ts-row-btns button { flex: 1 1 0; min-width: 0; padding: 0 8px; }
 /* 「正解」正在展示时高亮（再按一次就是收起） */
 #btn-ts-answer.on { border-color: var(--accent); color: var(--accent); }
 
@@ -1154,7 +1176,7 @@ main { flex: 1; display: flex; min-height: 0; }
 #row-tsframe #inp-tdist { flex: none; width: 58px; }
 
 /* 练习卡上的「框距 −/+」：只要一个字符的宽度，别把整行撑开、也别抢走 label 的位置 */
-#btn-ts-dist-less, #btn-ts-dist-more { flex: none; min-width: 26px; padding: 0 6px; }
+#btn-ts-dist-less, #btn-ts-dist-more { flex: none; min-width: 24px; padding: 0 5px; }
 #ts-dist-txt { flex: none; min-width: 14px; text-align: center; }
 
 /* 底栏「计算深度」的标签（跟 .toggle 的文字一个观感，且不许被压缩） */
@@ -1250,3 +1272,61 @@ main { flex: 1; display: flex; min-height: 0; }
   background: #fff; border: 1px solid var(--line); border-bottom-width: 2px;
   border-radius: 4px;
 }
+
+/* ==================== 图片识谱面板（2026-10-30）====================
+   左画布 + 右控件。宽度 740 = 画布 452 + 间距 16 + 右栏 240 + 弹窗内边距 44，
+   正好卡在窗口最小宽度 1020 里，不挤压。
+   ⚠️ 画布那块**固定 452px**：app.js 里所有描边宽度/圆半径都按 452 这个显示尺度
+      算过（k = canvas.width / VIS_BOX），改了这里要一起改 VIS_BOX。 */
+.vis-modal { width: 740px; max-height: 92vh; display: flex; flex-direction: column; }
+.vis-body { display: flex; gap: 16px; align-items: flex-start; }
+.vis-stage { flex: none; width: 452px; }
+#vis-canvas {
+  display: block; width: 100%; height: auto;
+  border-radius: 8px; background: #1c1a17;
+  cursor: crosshair;
+}
+/* 画布下面那行操作提示（内容是动的：改子 / 框四角的说明不一样）。
+   ★ 给死 18px 高：两种模式的文案长短不同，不给就会让右栏跟着上下跳。 */
+.vis-tip { height: 18px; margin-top: 6px; font-size: 11.5px; color: var(--text-dim); line-height: 18px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.vis-side { flex: 1; min-width: 0; }
+.vis-info { font-size: 12px; line-height: 1.7; color: var(--text); margin-bottom: 10px; min-height: 40px; }
+.vis-info b { font-variant-numeric: tabular-nums; }
+.vis-info .warn { color: #b4701a; }
+.vis-sec { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+/* ★ 必须显式写：`.vis-sec{display:flex}` 会把 [hidden] 的 UA 样式压掉 ——
+   整盘 19 路时要藏「贴角 / 偏移」两行，漏了这条它们照样显示。
+   （dev/_lint_hidden.mjs 就是专门盯这件事的。） */
+.vis-sec[hidden] { display: none; }
+.vis-lb { flex: none; min-width: 34px; font-size: 12px; color: var(--text-dim); }
+.vis-sec .seg { gap: 3px; }
+.vis-sec .seg button { height: 24px; padding: 0 8px; font-size: 12px; }
+/* 朝向那四个箭头按钮：等宽，否则 ↻ 和 ⇋ 宽窄不一看着像两套控件 */
+#vis-xform button { min-width: 30px; padding: 0; font-size: 14px; line-height: 1; }
+.vis-nbtn { height: 24px; min-width: 24px; padding: 0 5px; }
+.vis-val { min-width: 18px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+.vis-warn { font-size: 11.5px; color: #b4701a; line-height: 1.6; margin-top: 4px; min-height: 18px; }
+.vis-warn:empty { min-height: 0; }
+.vis-chk { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-dim); cursor: pointer; }
+.vis-chk input { margin: 0; }
+/* 标记样张（2026-10-31）：底栏那个复选框右边，用来解释画布上的小点。
+   ★ 必须和 app.js 的 visPaintBoard 画的口径一致 —— 白描边黑心 = 黑子，黑描边白心 = 白子。
+     改了那边记得改这里（dev/_cdp_vision.mjs 会量这两个小圆点的尺寸，别让它被挤没）。 */
+.vis-legend { display: flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--text-dim); margin-left: 10px; }
+.vis-legend i.lg {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  margin-left: 6px; box-sizing: border-box; vertical-align: -1px;
+}
+.vis-legend i.lg-b { background: #14130f; border: 1.5px solid rgba(0,0,0,.55); box-shadow: 0 1px 1px rgba(60,45,25,.35); }
+.vis-legend i.lg-w { background: #fff; border: 1.5px solid rgba(116,108,94,.55); box-shadow: 0 1px 1px rgba(60,45,25,.35); }
+/* 第三项是「待确认」—— 画布上就是套在棋子外面的橙圈；虚线代表"这里可能是空点"，
+   所以图例也画成虚线，跟 .puz-pend / 其它圆点区分开。 */
+.vis-legend i.lg-u { background: transparent; border: 1.5px dashed #e28a14; }
+/* 题集面板顶上那条"手上还有一道待存的题"（2026-10-31，平时 hidden） */
+.puz-pend {
+  margin: 0 0 8px; padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.5;
+  background: rgba(47,111,94,.10); color: var(--text); border: 1px solid rgba(47,111,94,.28);
+}
+.puz-pend[hidden] { display: none; }

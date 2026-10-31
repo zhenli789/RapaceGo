@@ -1748,10 +1748,12 @@ function coachPath(name) {
 }
 
 /* 读一份棋谱的「备注名」—— 就存在 SGF 的 GN（棋局名）字段里，文件名不动。
-   棋谱文件都很小（几 KB），直接整读；取不到就返回空串。 */
+   棋谱文件都很小（几 KB），直接整读；取不到就返回空串。
+   ★ 用 readTextSmart 而不是裸 utf8：GBK 棋谱（占真实棋谱的六成）按 utf8 读进来是乱码，
+     备注在列表里就会显示成一串问号/方块。 */
 function readNote(file) {
   try {
-    const text = fs.readFileSync(file, 'utf8');
+    const text = readTextSmart(file);
     const m = /GN\[([^\]]*)\]/.exec(text);
     return m ? m[1] : '';
   } catch (e) { return ''; }
@@ -1873,23 +1875,76 @@ ipcMain.handle('records:save', (_e, name, text) => {
   } catch (e) { return { error: String((e && e.message) || e) }; }
 });
 
+/* 备注：**只写 SGF 里的 GN 字段，文件名一个字节都不动**（2026-10-31 用户要求改回来）。
+   当天早些时候这里被换成了「改名」（records:rename），用户随后要求：
+   备注归备注、改名改成「双击棋谱名」。两条从现在起各管一件事。
+   ★ 必须走 readTextSmart / writeTextSmart：GBK 棋谱写回不能变成 UTF-8
+     （用户下载来的棋谱不可再生，编码一改别的软件打开就是乱码）。
+   ★ 覆盖前留一份 `.bak`（和 records:save 同一套、只在第一次留），GN 写坏了还能捞回来。 */
+ipcMain.handle('records:setNote', (_e, name, note) => {
+  try {
+    const full = path.join(RECORDS_DIR, safeRecName(name));
+    let text = readTextSmart(full);
+    /* GN 的值里不能出现 ] 和 \，先把它们换成空格（SGF 语法要求） */
+    const clean = String(note || '').replace(/[\[\]\\]/g, ' ').trim();
+    if (/GN\[[^\]]*\]/.test(text)) {
+      text = text.replace(/GN\[[^\]]*\]/, () => 'GN[' + clean + ']');
+    } else {
+      text = text.replace(/^\(\s*;/, m => m + 'GN[' + clean + ']');   // 没有 GN 就插在第一个 ; 后面
+    }
+    if (!fs.existsSync(full + '.bak')) {
+      try { fs.copyFileSync(full, full + '.bak'); } catch (e2) { /* 备份失败不阻止写，但别静默报成功 */ }
+    }
+    const wr = writeTextSmart(full, text);
+    return { ok: true, note: clean, enc: wr.enc };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+/* 改名：改的是**文件名**，并把「跟着这份棋谱的三份 JSON」一起改名。
+   ★ 为什么必须一起改：复盘报告 / 逐手讲解 / 复盘中间结果都是**按文件名配对**的
+     （`<棋谱名>.review.json` 等，见 reviewPath/coachPath/reviewPartPath）。
+     只改 .sgf → 打开后「复盘报告」「带讲解」全都找不到，报告还在盘上却像丢了。
+   ★ 不覆盖任何已有文件：目标名已存在就直接拒绝（宁可让人换个名字，也不悄悄顶掉一份棋谱）。
+   ★ 不动 SGF 里的 GN（棋局名）：那是棋谱自带的信息（职业棋谱里写的是对局双方、赛事），
+     改名去改它等于改别人的棋谱内容。 */
 ipcMain.handle('records:rename', (_e, oldName, newName) => {
   try {
+    const from = safeRecName(oldName);
     const to = safeRecName(newName);
-    fs.renameSync(path.join(RECORDS_DIR, safeRecName(oldName)), path.join(RECORDS_DIR, to));
-    try {                                       // 复盘结果跟着改名（没复盘过就跳过）
-      const ro = reviewPath(oldName), rn = reviewPath(newName);
-      if (fs.existsSync(ro)) fs.renameSync(ro, rn);
-    } catch (e2) { }
-    try {                                       // 逐手讲解也跟着改名（没讲过就跳过）
-      const co = coachPath(oldName), cn = coachPath(newName);
-      if (fs.existsSync(co)) fs.renameSync(co, cn);
-    } catch (e2) { }
-    try {                                       // 复盘中间结果也跟着改名（没算过就跳过）
-      const po = reviewPartPath(oldName), pn = reviewPartPath(newName);
-      if (fs.existsSync(po)) fs.renameSync(po, pn);
-    } catch (e2) { }
-    return { ok: true, name: to };
+    const srcFull = path.join(RECORDS_DIR, from);
+    const dstFull = path.join(RECORDS_DIR, to);
+    if (!fs.existsSync(srcFull)) return { error: '找不到这份棋谱：' + from };
+    if (to === from) return { ok: true, name: to, unchanged: true };
+    /* 目标已存在 → 拒绝。唯一放行的情况是「只改大小写」—— 同一份文件在 macOS/Windows
+       的不区分大小写磁盘上 existsSync 也会成 true，那种改名是合法的。 */
+    if (fs.existsSync(dstFull) && to.toLowerCase() !== from.toLowerCase()) {
+      return { error: '已经有「' + to + '」这份棋谱了' };
+    }
+    fs.renameSync(srcFull, dstFull);
+
+    /* 三份侧车文件：**存在才改名**，目标位置已有同名文件就跳过并如实报回去 */
+    const rel = [
+      { k: 'review', label: '复盘报告', a: reviewPath(from), b: reviewPath(to) },
+      { k: 'coach', label: '逐手讲解', a: coachPath(from), b: coachPath(to) },
+      { k: 'part', label: '复盘进度', a: reviewPartPath(from), b: reviewPartPath(to) },
+    ];
+    const moved = {}, conflicted = [], failed = [];
+    for (const it of rel) {
+      try {
+        if (!fs.existsSync(it.a)) continue;                 // 没有这份就跳过（正常情况）
+        if (fs.existsSync(it.b)) { conflicted.push(it.label); continue; }
+        fs.renameSync(it.a, it.b);
+        moved[it.k] = true;
+      } catch (e2) { failed.push(it.label); }
+    }
+    /* 顺手搬 `<名>.sgf.bak`（备注 / 编辑解说词前留的那份原样备份）。
+       它不是「报告」，不参与上面的提示文案；但同样按文件名配对，不搬就成了孤儿。 */
+    try {
+      if (fs.existsSync(srcFull + '.bak') && !fs.existsSync(dstFull + '.bak')) {
+        fs.renameSync(srcFull + '.bak', dstFull + '.bak');
+      }
+    } catch (e2) { /* 搬不动就算了，不影响棋谱本体 */ }
+    return { ok: true, name: to, moved: moved, conflicted: conflicted, failed: failed };
   } catch (e) { return { error: String((e && e.message) || e) }; }
 });
 
@@ -2151,6 +2206,122 @@ ipcMain.handle('puzzles:delete', async (_e, name) => {
   try {
     await shell.trashItem(path.join(PUZZLES_DIR, safePuzName(name)));   // 进回收站，可恢复
     return { ok: true };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+/* ---------- 往题集里「存一道题」（2026-10-31 用户要求）----------
+   用户的原话：「无论是自由摆题，或是图片识别的题，多个题目可以保存到同一个 sgf 文件，
+   也可以提前新建 sgf 文件，将题目存进去」。
+   ★ 格式上**不需要新容器**：题集的既有约定就是「一棵棵树并排」(见 xxqj.sgf，
+     解析走 splitSgfGames)，所以"多题存一个文件" = 往文件末尾再串一棵树。
+     ❗ 别发明什么 <SET> 包装或 JSON —— 那样别的软件打不开，用户书里的题集也读不进来。
+   ★ 两个 handler：
+     · puzzles:append(name, text)  追加一道题；文件不存在就当新建
+     · puzzles:create(name)        只建一个空的题集文件（"提前新建，慢慢往里存"）
+   ★ 重名策略与其它入口**相反**，这点要看清：import/vision:save 是「加 (2) 绝不覆盖」，
+     而 append 是**用户明确点名要写进这一份**，所以必须写进去，不能悄悄另存一份
+     （否则用户点了三次「存进 xxqj」，会多出 xxqj(2)(3)，比覆盖更糟）。
+     防呆只做一件事：**一模一样的一道题已经在里面了 → 不再写**（连点两次不该多一份）。 */
+ipcMain.handle('puzzles:append', (_e, name, text) => {
+  try {
+    const t = String(text || '').trim();
+    if (!/^\(\s*;/.test(t)) return { error: '这段内容不像一道题（SGF 得从 (; 开头）' };
+    const file = path.join(PUZZLES_DIR, safePuzName(name));
+    let old = '';
+    try { if (fs.existsSync(file)) old = readTextSmart(file); } catch (e) { old = ''; }
+    if (old && old.indexOf(t) >= 0) {
+      return { ok: true, name: path.basename(file), added: false, dup: true };
+    }
+    /* 末尾统一补一个换行再串下一棵 —— 不补的话两份 SGF 会粘成 `)(`，
+       虽然大多数解析器能忍，但人打开看就是一行糊在一起。 */
+    const head = old.trim() ? old.replace(/\s+$/, '') + '\n' : '';
+    fs.writeFileSync(file, head + t + '\n', 'utf8');
+    return { ok: true, name: path.basename(file), added: true };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+/* 新建一份**空题集**：写一段说明当文件头（SGF 允许棋局之外有文字 ——
+   用户手里那份 xxqj.sgf 开头就是一段英文说明），里面暂时一棵树都没有。
+   界面上它会显示「0 题」，点「打开」会被挡住（见 refreshPuzzles），
+   直到存进第一道题为止。 */
+ipcMain.handle('puzzles:create', (_e, name) => {
+  try {
+    const want = safePuzName(String(name || '').trim() || '新题集.sgf');
+    if (fs.existsSync(path.join(PUZZLES_DIR, want))) return { error: '这个文件名已经有了' };
+    fs.writeFileSync(path.join(PUZZLES_DIR, want),
+      '这是 RapaceGo 新建的空白题集。\n'
+      + '在「习题练习」里摆好一道题（或识别一张图片）后，点这份题集右边的「存当前题…」\n'
+      + '就能把题目存进来 —— 一道挨着一道，都在这一个文件里。\n', 'utf8');
+    return { ok: true, name: want };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+/* ==================== 图片识谱（2026-10-30）====================
+   ★★ 这一段的唯一职责是「把图片搬进渲染进程」和「把认出来的局面写成 SGF」。
+      **识别本身一行都不在这里** —— 全在 renderer/vision.js（纯 JS，无第三方库）。
+      为什么强调：用户的原话是「不上传图片」，而"不上传"能不能兑现，
+      取决于主进程有没有偷偷把图送出去。这里只读本机文件、只回 base64。
+
+   两个 handler：
+     · vision:pick  弹系统文件框挑一张图 → { ok, name, dataUrl }
+     · vision:save  把渲染进程拼好的 SGF 落盘 → { ok, name, dest }
+   ★ 图片格式交给 Chromium 自己解（jpg/png/webp/bmp/gif 全支持）——
+     主进程不引解码库，渲染进程用 <img> + canvas 取 ImageData 即可。 */
+
+/* 图片体积上限（不是像素上限 —— 像素上限由渲染进程量，见 app.js 的 VISION_MAX_PX）。
+   32 MB 的 jpg 已经是手机原图的好几倍；超了多半是误选了 RAW/PSD 或整屏截图，
+   与其让它把内存吃爆，不如直说。 */
+const VISION_MAX_BYTES = 32 * 1024 * 1024;
+
+ipcMain.handle('vision:pick', async () => {
+  try {
+    const r = await dialog.showOpenDialog(win, {
+      title: '选一张棋盘图片',
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tif', 'tiff'] }],
+      properties: ['openFile'],
+    });
+    if (!r || r.canceled || !r.filePaths || !r.filePaths.length) return { canceled: true };
+    const src = r.filePaths[0];
+    const st = fs.statSync(src);
+    if (st.size > VISION_MAX_BYTES) {
+      return { error: '这张图太大了（' + Math.round(st.size / 1048576) + ' MB）—— 请先裁到棋盘本体再试' };
+    }
+    const buf = fs.readFileSync(src);
+    /* 扩展名 -> MIME。认不出扩展名就照 jpg 报（Chromium 会按内容自己判，MIME 只是个提示） */
+    const ext = String(path.extname(src) || '').toLowerCase().replace('.', '');
+    const mime = ext === 'png' ? 'image/png'
+      : (ext === 'webp' ? 'image/webp'
+        : (ext === 'bmp' ? 'image/bmp'
+          : (ext === 'gif' ? 'image/gif'
+            : ((ext === 'tif' || ext === 'tiff') ? 'image/tiff' : 'image/jpeg'))));
+    return {
+      ok: true,
+      name: path.basename(src),
+      /* 大小原样带上：面板上要显示"这张图多大"，用户能判断是不是选错了图 */
+      bytes: st.size,
+      dataUrl: 'data:' + mime + ';base64,' + buf.toString('base64'),
+    };
+  } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+
+/* 存：dest = 'record'（棋谱库）| 'puzzle'（题集）。
+   ★ 重名一律加 (2)(3)…，**绝不覆盖** —— 这两处的既有铁律（见 records:import / uniquePuzName）。
+   ★ 一律写 UTF-8：内容是我们自己生成的 SGF（ASCII + 可能的中文注释），
+     没有"原编码"要照顾 —— 这点和 records:save 不同，那里是覆盖用户的原文件。 */
+ipcMain.handle('vision:save', (_e, dest, name, text) => {
+  try {
+    const isPuz = dest === 'puzzle';
+    const dir = isPuz ? PUZZLES_DIR : RECORDS_DIR;
+    const safe = isPuz ? safePuzName(name) : safeRecName(name);
+    let final = safe;
+    if (fs.existsSync(path.join(dir, final))) {
+      const stem = safe.replace(/\.sgf$/i, '');
+      let i = 2;
+      while (fs.existsSync(path.join(dir, stem + ' (' + i + ').sgf'))) i += 1;
+      final = stem + ' (' + i + ').sgf';
+    }
+    fs.writeFileSync(path.join(dir, final), String(text || ''), 'utf8');
+    return { ok: true, name: final, dest: isPuz ? 'puzzle' : 'record' };
   } catch (e) { return { error: String((e && e.message) || e) }; }
 });
 
@@ -2661,19 +2832,10 @@ ipcMain.handle('records:setDir', (_e, dir) => {
   return { ok: true, dir: RECORDS_DIR, moved, isDefault: !want };
 });
 
-/* 写「备注名」：改 SGF 里的 GN 字段（**不动文件名** —— 用户要求文件名照原样显示）。
-   SGF 属性值里不能出现 ] 和 \\，先替换掉。没有 GN 就在开头插一个。 */
-ipcMain.handle('records:setNote', (_e, name, note) => {
-  try {
-    const full = path.join(RECORDS_DIR, safeRecName(name));
-    let text = fs.readFileSync(full, 'utf8');
-    const clean = String(note || '').replace(/[\[\]\\]/g, ' ').trim();
-    if (/GN\[[^\]]*\]/.test(text)) text = text.replace(/GN\[[^\]]*\]/, 'GN[' + clean + ']');
-    else text = text.replace(/^\(\s*;/, m => m + 'GN[' + clean + ']');
-    fs.writeFileSync(full, text, 'utf8');
-    return { ok: true, note: clean };
-  } catch (e) { return { error: String((e && e.message) || e) }; }
-});
+/* ★ 2026-10-31 两件事归一：
+   · 「备注」= records:setNote，只写 GN、不动文件名（列表上行显示它，文件名降为灰字第二行）；
+   · 「改名」= records:rename，真改文件名 + 三份侧车 JSON 一起改（界面入口改成**双击棋谱名**）。
+   同一天里这两个功能来回搬过一次，别再合并 —— 用户明确要的是"备注归备注、改名靠双击"。 */
 
 /* ★★ 应用菜单（2026-10-09 为 macOS 加）。
    为什么必须有它：

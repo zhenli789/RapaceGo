@@ -396,9 +396,10 @@ const out = await js(`(async function(){
       'ts-note=' + document.querySelectorAll('#ts-card .ts-note').length + ' 条 · '
       + 'solve-note=' + !!$('ts-solve-note') + ' · setup-note=' + !!$('ts-setup-note')
       + ' · hint-sm=' + document.querySelectorAll('#ts-card .ts-hint-sm').length);
-    /* 框架与框距合并成一行：量它们**同一行**（top 差 < 2）且整行没越出卡片。 */
+    /* 框架与框距在同一行（2026-10-31 起是「双列」的右半格）：量它们**同一行**（top 差 < 2）
+       且整行没越出卡片。 */
     const frSeg = $('seg-tsframe').getBoundingClientRect();
-    const rowF = document.querySelector('#ts-card .ts-row-frame');
+    const rowF = $('seg-tsframe').closest('.ts-row');
     const rowFR = rowF ? rowF.getBoundingClientRect() : null;
     step('框架与框距并成一排（同一行、且没溢出卡片）',
       !!rowFR && Math.abs(frSeg.top - mi.top) < 2
@@ -414,7 +415,7 @@ const out = await js(`(async function(){
        用户 2026-10-16 报"卡片上看不到这道题谁先走"→ 做成常驻行。
        判据全用**量出来的几何**与**真读到的文字**，不查"某个 id 还在不在"。 */
     {
-      const rowF1 = document.querySelector('#ts-card .ts-row-first');
+      const rowF1 = $('seg-tsfirst').closest('.ts-row');
       const segF = $('seg-tsfirst');
       const cd1 = $('ts-card').getBoundingClientRect();
       const rr = rowF1 ? rowF1.getBoundingClientRect() : null;
@@ -438,14 +439,56 @@ const out = await js(`(async function(){
         !$('ts-goal-txt') && !/目标/.test($('ts-card').textContent || ''),
         'ts-goal-txt=' + !!$('ts-goal-txt') + ' 卡正文含「目标」=' + /目标/.test($('ts-card').textContent || ''));
     }
+    /* ★ 2026-10-31 用户选「C + A 组合」→ 双列：两格等宽、两格开关组左边缘对齐、
+       都不越卡片右边界。只数行数不够 —— "看着对齐"必须量出来。 */
+    {
+      const cd2 = $('ts-card').getBoundingClientRect();
+      const c0 = $('seg-tsfirst').closest('.ts-cell').getBoundingClientRect();
+      const c1 = $('ts-row-aicolor').getBoundingClientRect();
+      const s0 = $('seg-tsfirst').getBoundingClientRect();
+      const s1 = $('seg-tsaicolor').getBoundingClientRect();
+      step('双列·左格与右格等宽（差 ≤ 2px）',
+        Math.abs(c0.width - c1.width) <= 2, '左格=' + Math.round(c0.width) + ' 右格=' + Math.round(c1.width));
+      /* ★ 别拿两格的绝对 left 比 —— 右格本来就在右半边，比出来永远差一个格宽（我第一版就这么写错了）。
+         要比的是**组相对自己格子左边缘的偏移**：两格的 label 等宽，这个偏移就必须相等。 */
+      const off0 = s0.left - c0.left, off1 = s1.left - c1.left;
+      step('双列·两格的开关组相对格子起点同偏移（差 ≤ 1px）—— 这就是"表格感"的来源',
+        Math.abs(off0 - off1) <= 1,
+        '左格偏移=' + Math.round(off0) + ' 右格偏移=' + Math.round(off1)
+        + '（绝对 left ' + Math.round(s0.left) + ' / ' + Math.round(s1.left) + '）');
+      step('双列·两个开关组都没溢出卡片右边界',
+        s0.right <= cd2.right + 0.5 && s1.right <= cd2.right + 0.5,
+        '左组右=' + Math.round(s0.right) + ' · 右组右=' + Math.round(s1.right) + ' · 卡右=' + Math.round(cd2.right));
+    }
+    /* ★ C 方案另外两条：落子那组开关拉满整行、「开始解题」独占一行宽度（清空缩在右边）。
+       这两条是"右侧不再留白 + 主操作突出"的判据。
+       ★ 2026-10-31 晚：落子那行最右边多了一个**纯图标**的旋转按钮（用户要求），
+         所以"铺满"不能再拿 seg 的右边缘量（它现在离卡片右边还有 36px = 按钮 + 间距），
+         改量**这一行最右边那个元素**（= 旋转按钮）。 */
+    {
+      const cd3 = $('ts-card').getBoundingClientRect();
+      const sc = $('seg-tscolor').getBoundingClientRect();
+      const rt = $('btn-ts-rotate').getBoundingClientRect();
+      const st = $('btn-ts-start').getBoundingClientRect();
+      const cl = $('btn-ts-clear').getBoundingClientRect();
+      step('落子那一行铺满整行（最右边的旋转按钮离卡片右边 ≤ 16px）',
+        cd3.right - rt.right <= 16, '差=' + Math.round(cd3.right - rt.right));
+      step('旋转按钮在「擦」右边、且同一行（不是被挤到第二行去了）',
+        rt.left >= sc.right - 0.5 && Math.abs(rt.top - sc.top) <= 2,
+        '按钮 left=' + Math.round(rt.left) + ' · 开关组右=' + Math.round(sc.right)
+        + ' · top 差=' + Math.round(Math.abs(rt.top - sc.top)));
+      step('「开始解题」明显宽于「清空」（主操作占满一行，次按钮缩窄）',
+        st.width > cl.width * 2, '开始=' + Math.round(st.width) + ' 清空=' + Math.round(cl.width));
+    }
     /* ★ 每个阶段各自的控件行数固定 —— 这是"高度不变"的结构基础，所以直接量它。
        （原先「目标」单占一行 → 摆题 4 行/解题 5 行，卡片会差 34px。）
        ★ 2026-10-14 加「题集」行、2026-10-16 加「先手 + 目标」行 → 都常驻、两阶段仍相等。
-       ★ 2026-10-17 删掉「题目目标」后**行数不变**（那一行还在，只是少了一格内容）→ 仍是 6。 */
+       ★ 2026-10-17 删掉「题目目标」后**行数不变**（那一行还在，只是少了一格内容）→ 6。
+       ★ 2026-10-31 用户选「C + A 组合」：先手/KATAGO、框架/框距 各并成一行双列 → **5 行**。 */
     const visRows = [...document.querySelectorAll('#ts-card .ts-row')]
       .filter(r => r.offsetHeight > 0).length;
-    step('摆题阶段：可见的控件行 = 6（题集 / 先手 / 框架 / KATAGO / 落子 / 按钮）',
-      visRows === 6, '可见行数=' + visRows);
+    step('摆题阶段：可见的控件行 = 5（题集 / 先手+KATAGO / 框架+框距 / 落子 / 按钮）',
+      visRows === 5, '可见行数=' + visRows);
     snapCardH('摆题');
   }
 
@@ -818,12 +861,12 @@ const out = await js(`(async function(){
         'settings.visits=' + settings.visits + ' ANALYZE_VISITS=' + ANALYZE_VISITS);
     }
 
-    /* ★ 「先手」那一行现在只有 label + 一组开关（2026-10-17 起；原来还挂着「目标 净杀」）。
+    /* ★ 「先手 | KATAGO」这一行（2026-10-31 起是双列的一行，原来各占一行）。
        仍然量一次：nowrap + 不出卡片 —— 这一行是"卡片高度恒定"里最容易变异的一行。 */
     {
-      const rowF2 = document.querySelector('#ts-card .ts-row-first');
+      const rowF2 = $('seg-tsfirst').closest('.ts-row');
       const r2 = rowF2.getBoundingClientRect();
-      step('「先手」那一行（解题阶段同样）不换行、也没溢出卡片',
+      step('「先手 | KATAGO」那一行（解题阶段同样）不换行、也没溢出卡片',
         Math.round(r2.height) <= 32 && r2.right <= cdR.right + 0.5,
         '行高=' + Math.round(r2.height) + ' 行右=' + Math.round(r2.right)
         + ' 卡右=' + Math.round(cdR.right));
@@ -868,8 +911,8 @@ const out = await js(`(async function(){
     /* ★ 每个阶段各自的控件行数固定 —— 同上，只数可见行。 */
     const visRows2 = [...document.querySelectorAll('#ts-card .ts-row')]
       .filter(r => r.offsetHeight > 0).length;
-    step('解题阶段：可见的控件行 = 6（题集 / 先手 / 框架 / KATAGO / 对手 / 按钮）',
-      visRows2 === 6, '可见行数=' + visRows2);
+    step('解题阶段：可见的控件行 = 5（题集 / 先手+KATAGO / 框架+框距 / 对手 / 按钮）',
+      visRows2 === 5, '可见行数=' + visRows2);
     snapCardH('解题');
   }
 

@@ -10,7 +10,7 @@
 <header class="topbar">
   <!-- ★ 2026-10-24 用户要求：顶栏左侧原来挂着一行「玄清围弈」字样，**删掉**。
        窗口标题（标题栏 / 任务栏）仍然带着它，见 main.js 的 BrowserWindow.title。 -->
-  <button id="btn-records" title="棋谱库：打开 / AI 复盘 / 备注 / 删除棋谱">棋谱库</button>
+  <button id="btn-records" title="棋谱库：打开 / AI 复盘 / 备注 / 删除棋谱（双击名字可改名）">棋谱库</button>
   <button id="btn-settings" title="设置：选择 KataGo 程序和权重文件（改完自动重启引擎）">设置</button>
   <button id="btn-help" title="帮助：这个软件能做什么、各功能在哪儿、快捷键一览">帮助</button>
 
@@ -98,7 +98,7 @@
               改了这里的文案要重跑 dev/_cdp_tsumego.mjs 里那条几何断言。 -->
       <div class="ts-row ts-row-pset">
         <span class="ts-label">题集</span>
-        <button id="btn-pset" class="pset-name" title="打开「习题题集」面板：导入 SGF 题集 / 打开已存的题集 / 改名 / 删除。再打开同一份题集会直接回到上次练到的那一题。">未打开</button>
+        <button id="btn-pset" class="pset-name" title="打开「习题题集」面板：导入 SGF 题集 / 打开已存的题集 / 删除（双击题集名可以改名），也可以把一张死活题图片识别成一道题（「识别图片…」）。再打开同一份题集会直接回到上次练到的那一题。">未打开</button>
         <button id="btn-ts-prev" class="ts-nav" title="上一题（当前只在导入的题集里可用）">‹</button>
         <span class="ts-val" id="pset-pos">—</span>
         <button id="btn-ts-next" class="ts-nav" title="下一题（当前只在导入的题集里可用）">›</button>
@@ -107,14 +107,32 @@
       <!-- ★ 先手（2026-10-16 用户要求加、2026-10-17 精简）—— **常驻行**，摆题 / 解题都看得见。
            它是**这道题的属性**，同时是发给引擎的 initialPlayer（也决定「KATAGO 执哪一方」的默认值）——
            摆题时就该核对得到、也该改得了。
-           ⚠️ 这一行现在是 nowrap（见 style.css 的 .ts-row-first）：改文案/字号要重跑
-              dev/_cdp_tsumego.mjs 里那条几何断言。
+           ★ 2026-10-31 用户选「C + A 组合」：**先手 与 KATAGO 并成一行两列**（.ts-row-duo / .ts-cell），
+             卡片从 6 行变 5 行（241 → 约 215px）。两列各占一半、标签定宽 44px，
+             所以两列按钮的起点是对齐的 —— 这正是 C 方案要的"表格感"。
+           ⚠️ 双列宽度是**临界**的（每列 132px 里要塞 label 44 + 两个按钮）：
+             改文案/字号必须重跑 dev/_cdp_tsumego.mjs 的几何断言（不换行、不越卡片右边界）。
            ★ 原来自这里还挂着「目标 净杀」——和「判定 / 提示」一起删掉了（用户 2026-10-17 要求）。 -->
-      <div class="ts-row ts-row-first">
-        <span class="ts-label">先手</span>
-        <div class="seg seg-mini" id="seg-tsfirst" title="这道题该谁先走。它同时是发给引擎的 initialPlayer；改它会把盘上的手顺清掉（第一手的颜色变了，旧手顺不再成立）。想练防守：把下面「KATAGO」那一行改成它执先手这一方。">
-          <button data-v="b">黑先</button>
-          <button data-v="w">白先</button>
+      <div class="ts-row ts-row-duo">
+        <div class="ts-cell">
+          <span class="ts-label">先手</span>
+          <div class="seg seg-mini" id="seg-tsfirst" title="这道题该谁先走。它同时是发给引擎的 initialPlayer；改它会把盘上的手顺清掉（第一手的颜色变了，旧手顺不再成立）。想练防守：把右边「KATAGO」改成它执先手这一方。">
+            <button data-v="b">黑先</button>
+            <button data-v="w">白先</button>
+          </div>
+        </div>
+        <!-- ★ KATAGO 执哪一方（2026-10-14 用户要求）—— 放在**两组之外**是有意的：
+             它是"谁坐哪一边"，摆题阶段就该能先定下来，不该等到解题才给看。
+             ★ 2026-10-14 第二版：原来「我下两边」时这一行会**藏起来** —— 那会让卡片高度跳一下。
+               现在改成**置灰**（按钮 disabled，见 setTkaicolorEnabled）：不上场的意思一样，
+               但卡片高度任何时刻不变。
+             ★ 2026-10-31：并入「先手」那一行的右半格（#ts-row-aicolor 这个 id 留在格子上）。 -->
+        <div class="ts-cell" id="ts-row-aicolor">
+          <span class="ts-label">KATAGO</span>
+          <div class="seg seg-mini" id="seg-tsaicolor" title="KATAGO 执黑还是执白。默认它执「先手」的对方 —— 也就是你来解题（黑先的题你走黑）。想练防守（让它先动手、你来守），就把它改成先手那一方。「我下两边」时 KATAGO 不上场，这一项暂时无效。">
+            <button data-v="b">执黑</button>
+            <button data-v="w" class="on">执白</button>
+          </div>
         </div>
       </div>
 
@@ -123,32 +141,23 @@
            （人和 AI 都只能在框内落子），所以放在两组之外常驻。
            ★ 为什么要在这里也放一份：「新对局」面板里那份点「开始」会把题目重置；
              做题中途发现框太小想调大，只有这里能改。两处写的是同一对 settings 值。
-           ⚠️ 一行塞四组控件在 ~240px 宽里是**紧**的：靠 .ts-row-frame（不换行 + 小间距）
-             和 .seg-mini（按钮内边距减半）才放得下。改了按钮文案/字号要重跑
-             dev/_cdp_tsumego.mjs 里那条"同一行、不溢出卡片"的几何断言。 -->
-      <div class="ts-row ts-row-frame">
-        <span class="ts-label">框架</span>
-        <div class="seg seg-mini" id="seg-tsframe" title="死活框架：把题目范围圈出来，AI 也只在这个范围里找点。关掉则是全盘找点（空盘上的小题会推荐「脱先走大场」这类没用的点）。">
-          <button data-v="auto" class="on">开</button>
-          <button data-v="off">关</button>
+           ★ 2026-10-31（C + A）：改成两列 —— 左格「框架 开/关」、右格「框距 − 3 +」，
+             和上面那行同一套 .ts-row-duo / .ts-cell，卡片左边因此成了一条整齐的两列网格。
+           ⚠️ 一格 132px 里塞 label + 两个按钮，是**紧**的：靠 .seg-mini（内边距 7px→4px）
+             和 .ts-cell 的 5px 间距才放得下。改文案/字号要重跑 dev/_cdp_tsumego.mjs 的几何断言。 -->
+      <div class="ts-row ts-row-duo">
+        <div class="ts-cell">
+          <span class="ts-label">框架</span>
+          <div class="seg seg-mini" id="seg-tsframe" title="死活框架：把题目范围圈出来，AI 也只在这个范围里找点。关掉则是全盘找点（空盘上的小题会推荐「脱先走大场」这类没用的点）。">
+            <button data-v="auto" class="on">开</button>
+            <button data-v="off">关</button>
+          </div>
         </div>
-        <span class="ts-label">框距</span>
-        <button id="btn-ts-dist-less" title="框边离题目棋子近一点（框变小，AI 的搜索更集中）。★ 框距 1~2 路时框比引擎的贴身半径还窄，它的应手会看起来贴着框线 —— 想要视觉余量就把框距加到 4 路">−</button>
-        <span class="ts-val" id="ts-dist-txt">3</span>
-        <button id="btn-ts-dist-more" title="框边离题目棋子远一点（框变大，范围外的落子也允许）">+</button>
-      </div>
-
-      <!-- ★ KATAGO 执哪一方（2026-10-14 用户要求）—— 放在**两组之外**是有意的：
-           它是"谁坐哪一边"，摆题阶段就该能先定下来，不该等到解题才给看。
-           ★ 2026-10-14 第二版：原来「我下两边」时这一行会**藏起来** —— 那会让卡片高度跳一下。
-             现在改成**置灰**（按钮 disabled）：不上场的意思一样，但卡片高度任何时刻不变。
-           （更早还踩过：用户报「习题模式没看到执黑/执白」—— 原来它在解题组里，
-             摆题阶段看不到；现在「新对局」面板里也有一份。） -->
-      <div class="ts-row" id="ts-row-aicolor">
-        <span class="ts-label">KATAGO</span>
-        <div class="seg" id="seg-tsaicolor" title="KATAGO 执黑还是执白。默认它执「先手」的对方 —— 也就是你来解题（黑先的题你走黑）。想练防守（让它先动手、你来守），就把它改成先手那一方。「我下两边」时 KATAGO 不上场，这一项暂时无效。">
-          <button data-v="b">执黑</button>
-          <button data-v="w" class="on">执白</button>
+        <div class="ts-cell ts-cell-dist">
+          <span class="ts-label">框距</span>
+          <button id="btn-ts-dist-less" title="框边离题目棋子近一点（框变小，AI 的搜索更集中）。★ 框距 1~2 路时框比引擎的贴身半径还窄，它的应手会看起来贴着框线 —— 想要视觉余量就把框距加到 4 路">−</button>
+          <span class="ts-val" id="ts-dist-txt">3</span>
+          <button id="btn-ts-dist-more" title="框边离题目棋子远一点（框变大，范围外的落子也允许）">+</button>
         </div>
       </div>
 
@@ -160,14 +169,28 @@
       <div class="ts-group" id="ts-setup-group">
         <div class="ts-row">
           <span class="ts-label">落子</span>
-          <div class="seg" id="seg-tscolor" title="点棋盘落子。自由摆棋：先选颜色（同色再点 = 撤掉）。交替摆棋：黑白自动轮换。右键点棋盘可直接擦子。">
+          <div class="seg seg-fill" id="seg-tscolor" title="点棋盘落子。自由摆棋：先选颜色（同色再点 = 撤掉）。交替摆棋：黑白自动轮换。右键点棋盘可直接擦子。">
             <button data-v="b" class="on">黑</button>
             <button data-v="w">白</button>
             <button data-v="erase" title="擦子（右键点棋盘也能擦）">擦</button>
           </div>
           <span class="ts-val" id="ts-alt-next" hidden></span>
+          <!-- ★ 旋转（2026-10-31 用户要求）：摆在「落子」这一行的最右边（「擦」的右侧），
+               **只有图标、没有文字** —— 所以 title / aria-label 必须写全，否则悬停说不出它是干什么的。
+               顺时针转 90°，转的是**摆子**（解题阶段那一组里没有它：手顺已经按初始局面走了）。
+               ⚠️ 图标是 inline SVG（stroke 用 currentColor）—— 换图标只要改这段 path，
+                  别去引外部图片：这里没有网络、也没有打包资源目录。 -->
+          <button id="btn-ts-rotate" title="顺时针旋转 90°：把题目的朝向转过来（整盘绕棋盘中心转，角上的题会转到相邻的角）。题集里的题连正解一起转；只改这次练习，不动磁盘上的题集文件。" aria-label="顺时针旋转 90 度">
+            <!-- 图标：270° 弧 + 顶部的实心箭头（朝右 = 顺时针）。
+                 弧从右侧(13,8)顺时针绕到底 → 左 → 顶(8,3)，箭头接在弧的末端继续朝右。
+                 ⚠️ 箭头用 <polygon> 填实心，别用两条描边拼"V"：14px 下描边会糊成一团。 -->
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+              <path d="M13 8A5 5 0 1 1 8 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              <polygon points="10.5,3 8,1.4 8,4.6" fill="currentColor"/>
+            </svg>
+          </button>
         </div>
-        <div class="ts-row">
+        <div class="ts-row ts-row-actions">
           <button id="btn-ts-start" class="primary" title="题目摆好了 —— 进入解题阶段，此后落子会记入手顺；想改初始局面随时按「重摆」">开始解题</button>
           <button id="btn-ts-clear" title="清空棋盘上的摆子（只想擦一颗：右键点它）">清空</button>
         </div>
@@ -185,7 +208,7 @@
       <div class="ts-group" id="ts-solve-group" hidden>
         <div class="ts-row ts-row-solve">
           <span class="ts-label">对手</span>
-          <div class="seg seg-mini" id="seg-tsdefend" title="按正解：对手照题集自带的正解应对，一手不脱先（你下对，它才按正解应；你走偏了就改用 KATAGO）。KATAGO：由强引擎应对 —— 搜索被限在「棋子 2 路内」，不会再跑到远处大场。我下两边：黑白交替、两边都由你走，自己推演变化。">
+          <div class="seg seg-mini seg-fill" id="seg-tsdefend" title="按正解：对手照题集自带的正解应对，一手不脱先（你下对，它才按正解应；你走偏了就改用 KATAGO）。KATAGO：由强引擎应对 —— 搜索被限在「棋子 2 路内」，不会再跑到远处大场。我下两边：黑白交替、两边都由你走，自己推演变化。">
             <button data-v="solution" class="on">按正解</button>
             <button data-v="ai">KATAGO</button>
             <button data-v="both">我下两边</button>
@@ -639,6 +662,7 @@
     </div>
     <ul class="reclist" id="reclist"></ul>
     <div class="mfoot">
+      <button id="rec-vision" title="从电脑里挑一张棋盘图片，本地认出局面（死活题那种局部图也行），存成一份棋谱。图片不出本机。">识别图片…</button>
       <button id="rec-import" title="从电脑里挑 SGF 棋谱文件，复制进棋谱库（可以多选；重名不会覆盖）">导入棋谱…</button>
       <button id="rec-save-now">把当前对局存进来</button>
       <button id="rec-change-dir" title="把棋谱库换到别的文件夹（比如数据盘）。已有的棋谱会复制一份过去，老位置的不动 —— 宁可你自己多删一次，也不会悄悄弄丢。">更改文件夹…</button>
@@ -657,9 +681,16 @@
 <div class="modal-mask" id="puzzles">
   <div class="modal rec-modal">
     <h2>习题题集 <span class="rec-dir" id="puz-dir"></span></h2>
+    <!-- 手上拿着一道待存的题时（识谱面板「存进题集…」交过来的）才露出来，
+         告诉用户"这一步该点哪儿"。平时 hidden，不占高度。 -->
+    <p class="puz-pend" id="puz-pend" hidden></p>
     <ul class="reclist" id="puzlist"></ul>
     <div class="mfoot">
-      <button id="puz-import" class="primary" title="从电脑里挑一份 SGF 题集，复制进 puzzles/（重名不会覆盖）">导入题集…</button>
+      <!-- ★ 2026-10-31 用户要求：识别图片…改成**白底**，与同排其他按钮一致
+           （原来带 primary，是全排唯一的绿按钮，看着像"必须点这个"）。 -->
+      <button id="puz-vision" title="从电脑里挑一张死活题图片，本地认出局面（可以只截局部），存成一道题并直接开始练。图片不出本机。">识别图片…</button>
+      <button id="puz-new" title="先建一个空的题集文件，之后可以把好几道题一道道存进去（都在这一个 SGF 里）">新建题集…</button>
+      <button id="puz-import" title="从电脑里挑一份 SGF 题集，复制进 puzzles/（重名不会覆盖）">导入题集…</button>
       <button id="puz-open-dir" title="在文件管理器里打开题集文件夹">打开文件夹</button>
       <div class="spacer"></div>
       <button id="puz-close">关闭</button>
@@ -876,8 +907,11 @@
           <b>接着当前局面下</b>：面板里勾上这一项，就<b>不开新棋</b> —— 盘面和手顺原样保留，只把模式换成上面选的那个（研究到一半想接着跟 AI 下，用这个）。棋盘 / 让子 / 贴目 这时不生效。<br>
           <span class="dim">★ 这一项只在「已经在下棋」且目标是人机对弈 / 双人摆棋 时出现 —— 习题练习永远从空盘开始摆题。面板里的对局类型改成「人机对弈」时，<b>「我执」那一行</b>就是原来的「AI 执哪一方」—— 你执黑，AI 就执白。</span></span></li>
         <li><b>习题练习</b><span>顶栏对局模式 → 下拉选「<b>习题练习</b>」→ 选好摆子方式 / 先手 / <b>KATAGO 执哪一方</b> / 死活框架 / 分析范围 →「开始」→ 在棋盘上摆出题目 →「开始解题」。<br>
+          <b>摆题时可以转题目</b>：练习卡「落子」那一行最右边那个<b>圆形箭头</b>（只有图标，鼠标停上去有说明）→ 每次顺时针转 <b>90°</b>，点四次回到原样。转的是<b>整盘</b>（绕棋盘中心）：原来在左上角的题会转到右上角，形状和两条边的相对位置不变 —— 所以转完还是一道角上的题，框和引擎的搜索范围都会跟着走。题集里的题<b>连正解一起转</b>（只转摆子的话「按正解」会应到别处）；只改这次练习里的摆法，不动磁盘上的题集文件。<br>
           <b>对手三档</b>：<b>按正解</b>（默认，题集自带的正解应对，走偏了就自动改用 KATAGO）· <b>KATAGO</b>（强引擎应对）· <b>我下两边</b>（黑白交替，自己推演变化）。<br>
-          <b>题集</b>：点击练习卡上的「题集」→「导入题集…」。棋谱库的「当题练」也能把棋谱收进题集。<br>
+          <b>题集</b>：点击练习卡上的「题集」→「导入题集…」。棋谱库的「当题练」也能把棋谱收进题集。<b>双击题集名</b>就能给它改名（回车确认，Esc 或点到别处取消 —— 和棋谱库双击棋谱名同一套，练到第几题的进度会跟着走）。<br>
+          <b>自己攒题</b>：摆好一道题（或者识别一张图片），点练习卡上的「<b>题集</b>」→ 点某份题集右边的「<b>存当前题</b>」，这道题就<b>加在那份文件的末尾</b> —— 一个 SGF 里可以累积很多题，用 ‹ › 翻着练。想从零攒一份：先点「<b>新建题集…</b>」起个名字（这时是个空文件，那行的「打开」是灰的），再一道道存进去。<b>存的时候会带上先手</b>（黑先/白先）、棋盘路数、摆子；如果是在解题阶段存的，盘上那串手顺会一起存成<b>正解</b>。<br>
+          <span class="dim">★ 题集的格式就是「一棵棵树并排」（和《玄玄棋经》那种题集一样），所以别的围棋软件也打得开；正在练的那道题再点「存当前题」会被拦住，不会存出重复的一题。</span><br>
           <b>「正解」按钮</b>：答案，用 ← → 回看，再次点击收起。<br>
           <b>死活框架</b>：你和 KATAGO 都只能在框内落子；引擎的候选点再收紧到「离棋子 2 路内」（<b>两方同一档</b> —— 曾经给对手用「贴身 1 路」，实测会把 3.5% 题目的正解挡在范围外，2026-10-27 统一成 2 路）。<b>引擎的点不会落在那条虚线框上</b>（框距 ≥3 时框线一律不踩；框距 1~2 时只留紧贴棋子的框线点）—— 所以框距调小也不会看见它贴着框线走。框距<b>默认 3 路</b>（框边比最外沿的棋子再多留 3 路），练习卡上随时可调；固定中国规则。<br>
           <span class="dim">★ <b>引擎算的就是框内那张小棋盘</b>（「分析范围 = 只算框内」，默认，2026-10-27 起）：发给 KataGo 的是「框这么大的一张盘」（一道角上小题也就是一块很小的局部盘），<b>框外根本不参与计算</b> —— 所以胜负、目差、归属（形势雾）都是框内口径，形势雾也只铺在框内。画面仍是 19 路，只是后台换了张盘。<br>
@@ -914,10 +948,21 @@
           <span class="dim">★ 「<b>复盘这条分支</b>」这个面板只在<b>这份棋谱已经有某条线的报告</b>时出现（入口就是棋谱库那行的「复盘报告」）；
           还<b>一份报告都没有</b>的时候走「AI 复盘」，面板里同样是这三颗范围按钮。
           <b>换线</b>：跳到分叉的那一手，按 <b>Alt+← / Alt+→</b>（手数列表里带「变」标记的就是分叉点）。</span></span></li>
-        <li><b>棋谱库</b><span>顶栏「棋谱库」打开：每一行就是一份棋谱，可<b>打开 / 当题练 / 复盘 / 备注 / 改名 / 删除</b>，上面有搜索框；顶部还有「导入棋谱」和「更改文件夹…」（把棋谱库换到别的盘）。<br>
+        <li><b>棋谱库</b><span>顶栏「棋谱库」打开：每一行就是一份棋谱，可<b>打开 / 当题练 / 复盘 / 备注 / 删除</b>，上面有搜索框（<b>备注名 + 文件名</b>都能搜）；顶部还有「导入棋谱」和「更改文件夹…」（把棋谱库换到别的盘）。<br>
+          ★ <b>备注</b>写进棋谱的 <code>GN</code>（棋局名）字段，<b>文件名一个字节都不动</b>，列表上行显示的就是它。<b>要改文件名，双击这一行的名字</b>（回车确认，Esc 或点到别处取消）—— 备注和改名是两件事，别混在一起。<br>
+          ★ <b>改名</b>改的是<b>盘上真实的文件名</b>。如果这份棋谱有<b>复盘报告</b>或<b>讲解报告</b>（<code>棋谱名.review.json</code> / <code>棋谱名.coach.json</code>，还有没算完的 <code>.review.part.json</code>），它们会<b>跟着一起改名</b> —— 这三份是按文件名配对的，只改棋谱本身，报告就会"找不到"。棋谱库里已经有一份同名棋谱时<b>不会覆盖</b>，会直接告诉你换个名字。跑着复盘 / 讲解时不让改名（等它跑完）。<br>
           ★ <b>复盘按钮只有一个</b>：<b>没复盘过</b>时它写「AI 复盘」（点开会先让你选搜索量）；<b>复盘过</b>之后它变成「复盘报告」，点一下直接看那一份。新复盘<b>算完整盘</b>才会覆盖旧的 —— 中途停下的不算，旧报告原样留着。<br>
-          ★ 列表里只显示<b>文件名</b>（大小 / 时间 / 已复盘都不再显示）—— 文件名本身就带上了<b>双方 + 棋力 + 时间</b>（例：<code>P1 vs AI(3段)-202610190823</code>；PLAYER1→P1、PLAYER2→P2、KATAGO→AI，<b>段位用括号跟在 AI 那一方的名字后面</b>，双方都是 AI 就两边都带）。只有「带讲解」还会单独标一下。棋谱存在<b>数据目录</b>的 <b>records/</b> 里（Windows = 软件目录；macOS = <code>~/Library/Application Support/RapaceGo/</code>；位置也能在「设置 → 数据 → 棋谱库文件夹」里改）。<br>
+          ★ 列表上行是<b>备注名</b>（没写过备注就显示文件名），下行是<b>灰色的真实文件名</b>，两者一样时不重复显示；大小 / 时间 / 已复盘都不再显示 —— 文件名本身就带上了<b>双方 + 棋力 + 时间</b>（例：<code>P1 vs AI(3段)-202610190823</code>；PLAYER1→P1、PLAYER2→P2、KATAGO→AI，<b>段位用括号跟在 AI 那一方的名字后面</b>，双方都是 AI 就两边都带）。只有「带讲解」还会单独标一下。棋谱存在<b>数据目录</b>的 <b>records/</b> 里（Windows = 软件目录；macOS = <code>~/Library/Application Support/RapaceGo/</code>；位置也能在「设置 → 数据 → 棋谱库文件夹」里改）。<br>
           <span class="dim">★ 「<b>当题练</b>」= 把这份棋谱当成习题练（会复制一份到题集里，原棋谱不动）。如果它里面没有摆子（普通对局），会直接告诉你"不像习题集"而不复制 —— 习题的初始局面是摆子写出来的。</span></span></li>
+        <li><b>图片识谱（把照片变成棋谱）</b><span><b>两个入口</b>：棋谱库底栏的「<b>识别图片…</b>」，和习题练习 →「题集」面板里的「<b>识别图片…</b>」。选一张棋盘照片 / 截图，软件<b>在本机</b>把它读成盘面 —— <b>图片不上传、不出这台电脑</b>。<br>
+          ★ <b>整盘、局部都能认</b>：整盘（19 / 13 / 9 路都行，认出来几路就是几路）和死活题那种<b>只拍一角</b>的。局部图会<b>贴到 19 路棋盘的某个角上</b>，所以导入后统一是一盘 19 路的棋（13 / 9 路的整盘图默认<b>摆正中间</b>，天元对齐）。<br>
+          ★ <b>读得对不对，当场看得见</b>：面板里铺的是<b>矫正后的棋盘</b>（拍歪的透视已经拉平），算出来的每颗子<b>直接画成一颗棋子</b> —— 黑就是黑、白就是白，扫一眼就知道；<b>手改过的、在空点上补进去的也长一样</b>（把「<b>标出识别结果</b>」勾掉就回到原图，方便逐点核对）。底栏图例就是这几个样张：黑子 / 白子 / 待确认。拿不准的点套<b>橙圈</b>：<b>实线</b> = 这颗子没太大把握，<b>虚线</b> = 这里像空点、但可能漏了一颗子。<b>鼠标停在交叉点上</b>，画布下面那行字会写出这一格的<b>棋盘坐标和判定</b>（「C7 · 空点（待确认：可能漏了一颗子）」）；<b>点一下交叉点就能改</b> —— 黑 → 白 → 空 → 黑，改过的点不再标橙圈。信息栏里的「<b>待确认</b>」就是还剩几个橙圈。<br>
+          ★ <b>拍歪了、反着拍都能救</b>：「<b>朝向</b>」那排在识别之前把图片转 90° / 镜像（转的是图片本身，转完重新认一遍）；自动找不到棋盘时点「<b>手动框…</b>」，把<b>四个圆点</b>拖到棋盘四角上（松手自动重认，框好了点「返回校正」回来）。<br>
+          ★ <b>局部图要告诉它贴哪</b>：「<b>贴角</b>」选左上 / 右上 / 左下 / 右下（默认用自动判出来的那个）；「<b>偏移</b>」是再往棋盘中心缩几路 —— 调的时候棋盘上的点跟着动，对上了就是对的。<br>
+          ★ 最后选<b>先手</b>（黑先 / 白先），再点「<b>存进棋谱库</b>」、「<b>当习题练</b>」或「<b>存进题集…</b>」。前两个各存成<b>一份新文件</b>（题集那个还会直接进练习模式解题）；「存进题集…」会打开题集面板、让你点名存进<b>已有</b>的那份（一次识别只存一道题，攒题见上面「习题练习」那条）。存下来的文件叫 <code>识谱-&lt;图名&gt;-&lt;时间&gt;.sgf</code>，<b>不会覆盖已有的棋谱</b>。<br>
+          <span class="dim">★ <b>只认盘面，不认手顺</b>：读出来的是一张<b>静态局面</b>（该谁走由你选的那项决定），所以进去以后<b>没有"第几手"可翻</b> —— 手数列表是空的，AI 复盘和逐手讲解也用不上。图里本来就没有过程信息，这不是坏了。<br>
+          ★ 原图<b>不保存</b>：只留读出来的 SGF，想再核对就重新识别一次。<br>
+          ★ 读不准的常见原因：图里带了坐标数字 / 表格线（只截棋盘本体）、棋盘被裁掉一角、白子压在白底上（白底棋谱书的扫描件几乎认不出白子，那种要逐点核对）。</span></span></li>
         <li><b>对局计时</b><span>新对局里可选超快棋 / 快棋 / 慢棋 / 职业赛 / 世界大赛；右侧两块表显示双方用时，读秒会变色。</span></li>
         <li><b>改名字</b><span>右侧的名字<b>点一下就能改</b>（比如把 PLAYER 改成你的名字），导出的棋谱会把名字写进去；打开带名字的棋谱（如古谱）也会自动显示。</span></li>
         <li><b>设置</b><span>换 KataGo 程序或权重路径，保存后引擎自动重启，不用重开软件。里面还有「<b>关于与更新</b>」：看当前版本号、<b>检查更新</b>（问一下 GitHub 上有没有新版）、以及一个<b>去下载页</b>的按钮（用浏览器打开最新版的发布页）。</span></li>
@@ -978,6 +1023,116 @@
   <button id="mv-del">删除这一手及以后</button>
 </div>
 
+<!-- ==================== 图片识谱（2026-10-30）====================
+     两个入口都打开这一个面板：
+       · 棋谱库底栏「识别图片…」→ 认完「存进棋谱库」就是一份棋谱
+       · 练习卡「图片识谱」     → 认完「当习题练」就是一道题
+     ★ 图片不出本机：主进程只把它读成 dataUrl 交给这里，识别全在 renderer/vision.js
+       （纯 JS、无第三方库、不发网络请求）。这是用户明确的要求，别改。
+     ★ 画布只有一块，两种用法（见 app.js 的 visPaint）：
+         board   = 透视矫正后的棋盘 + 识别结果小点（点一下改一颗）
+         corners = 原图 + 四个可拖的角手柄（自动找错了时手动框）
+     为什么贴着 .modal-mask 这套既有骨架写：项目里所有弹窗都长这样，
+     另发明一套会让 ESC / 点外面关闭 / 主题色全都对不上。 -->
+<div class="modal-mask" id="vision">
+  <div class="modal vis-modal">
+    <h2 class="rec-head">
+      <span class="rec-title">图片识谱</span>
+      <span class="rec-dir" id="vis-file"></span>
+    </h2>
+
+    <div class="vis-body">
+      <div class="vis-stage">
+        <canvas id="vis-canvas" width="452" height="452"></canvas>
+        <p class="vis-tip" id="vis-tip"></p>
+      </div>
+
+      <div class="vis-side">
+        <p class="vis-info" id="vis-info">—</p>
+
+        <!-- 朝向：四个按钮都是「再叠一次」的意思（点两下 ↻ = 转 180°）。
+             ★ 转的是**图片本身**，转完会重新识别一遍 —— 这样网格/角点/矫正图
+               全都跟着重算，不必手工去同步三套坐标（见 app.js 的 visApplyXform）。 -->
+        <div class="vis-sec">
+          <span class="vis-lb">朝向</span>
+          <div class="seg seg-mini" id="vis-xform">
+            <button data-v="rot90" title="顺时针转 90°（转完会重新识别一遍）">↻</button>
+            <button data-v="rot270" title="逆时针转 90°">↺</button>
+            <button data-v="flipH" title="左右镜像（图拍反了、或从书背面扫进来的）">⇋</button>
+            <button data-v="flipV" title="上下镜像">⇅</button>
+          </div>
+        </div>
+
+        <!-- 贴角：**只对局部图有用**（整盘 19 路自己就占满了，贴哪儿都一样）。
+             自动判角可信时这一行会显示它判出的那个角；判错就手动改。
+             「偏移」= 整体往棋盘中心挪几路 —— 局部图往往连边都没拍到，
+             判角仍然能对上，但可能差一两路，靠它微调。 -->
+        <div class="vis-sec" id="vis-corner-sec">
+          <span class="vis-lb">贴角</span>
+          <div class="seg seg-mini" id="vis-corner">
+            <button data-v="tl">左上</button>
+            <button data-v="tr">右上</button>
+            <button data-v="bl">左下</button>
+            <button data-v="br">右下</button>
+          </div>
+        </div>
+        <div class="vis-sec" id="vis-off-sec">
+          <span class="vis-lb">偏移</span>
+          <button id="vis-off-less" class="vis-nbtn" title="整体往外挪一路（更贴角）">−</button>
+          <span class="vis-val" id="vis-off-txt">0</span>
+          <button id="vis-off-more" class="vis-nbtn" title="整体往棋盘中心挪一路">+</button>
+        </div>
+
+        <!-- 先手：识别不出来的东西，必须由人来定 —— 这就是用户要求的「明确选择当前黑方或白方落子」。
+             它同时决定存进棋谱库后「该谁走」，以及习题的「先手」。 -->
+        <div class="vis-sec">
+          <span class="vis-lb">先手</span>
+          <div class="seg" id="vis-pl">
+            <button data-v="b">黑先</button>
+            <button data-v="w">白先</button>
+          </div>
+        </div>
+
+        <div class="vis-sec">
+          <span class="vis-lb">四角</span>
+          <button id="vis-mc" title="自动找的四个角不对时，手动在原图上框四个角（左上→右上→右下→左下）">手动框…</button>
+          <button id="vis-re" title="按当前的朝向/四角重新识别一遍">重认</button>
+        </div>
+
+        <p class="vis-warn" id="vis-warn"></p>
+      </div>
+    </div>
+
+    <div class="mfoot">
+      <!-- 「标出识别结果」= 在每个交叉点上把判定**画成一颗棋子**（关掉就只看原图）。
+           ★ 2026-10-31 用户两次报障都指向"标记到底长什么样"：
+             ① 一开始所有点都是灰圈 → 因为代码里写错了取值（`m[i]` 而 visMatrix() 返回对象）；
+             ② 改成"缩小的棋子小点"后，手改的点 / 空点上加的子看着和识别出来的子**不一样**
+                —— 因为小点压在照片的棋子上，底下有子没子看起来两回事。
+             现在一律画**整颗棋子**（0.44 格），识别出来的、手改的、空点上加的都长一样。
+             图例就在说这件事，样式见 style.css 的 .vis-legend，**必须和 app.js 的
+             visPaintBoard 保持一致**。 -->
+      <label class="vis-chk" title="在交叉点上把识别结果画成棋子（黑子 / 白子）。关掉就只看原图，方便核对">
+        <input type="checkbox" id="vis-dot" checked> 标出识别结果
+      </label>
+      <span class="vis-legend" id="vis-legend" title="画出来的就是判定结果：黑子、白子各是一颗棋子；橙色圈 = 待确认（实线：这颗子没太大把握；虚线：这里是空点，但可能漏了一颗子）">
+        <i class="lg lg-b"></i>黑子
+        <i class="lg lg-w"></i>白子
+        <i class="lg lg-u"></i>待确认
+      </span>
+      <div class="spacer"></div>
+      <button id="vis-close">取消</button>
+      <button id="vis-to-set" title="把认出来的局面当成一道题，存进已有的题集（不新建文件）—— 会打开题集面板让你点名存进哪一份">存进题集…</button>
+      <button id="vis-to-puz" title="存成一份新的题集（puzzles/）并直接进练习模式解题">当习题练</button>
+      <button id="vis-to-rec" class="primary" title="存成一份棋谱（records/）并打开它">存进棋谱库</button>
+    </div>
+  </div>
+</div>
+
+<!-- ★★ 必须在 app.js **之前**：app.js 里那段面板代码直接引用全局 Vision，
+   反过来（app.js 先跑）会在第一次打开面板时炸 "Vision is not defined"。
+   vision.js 自己也不碰 DOM —— 它只是把算法挂到 globalThis 上。 -->
+<script src="vision.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -237,7 +237,14 @@ const state = {
   histVisits: [],
   showPV: false,         // 变化图：鼠标停在推荐点上满 1 秒 → 显示后续变化（底栏「变化图」，快捷键 B）
   pv: null,              // 当前正在显示的变化：{ x, y, list: ['Q16','D4',...] }；null = 不显示
-  setup: [],         // 让子 / 座子
+  setup: [],
+  /* ★★ 这份棋谱自己声明的「该谁先走」（SGF 根节点的 PL[]）—— null = 没说。
+     2026-10-30 加，为图片识谱服务：一张**静态局面**图（死活题、棋谱书上的图）
+     只有 AB/AW 没有手顺，靠 `state.setup.length ? 'w' : 'b'` 猜是猜不准的
+     （有摆子就一律猜白 —— 而题目往往黑先）。所以有 PL 就照它来。
+     ★ 只在「盘上还没有手」时才影响 sideToMove；一旦下了手，颜色由手顺自己说。
+     ★ 由 applyRecord 置值、applyNewGame / enterTsumego 清掉。 */
+  firstPlayer: null,
   myColor: 'b',
   /* 双方名字 —— 右侧 ID 栏显示、导出棋谱时写进 SGF 的 PB / PW。
      '' = 没设过 → 按模式回落到 PLAYER / KATAGO / PLAYER1 / PLAYER2。
@@ -1680,6 +1687,11 @@ function buildSGF() {
   }
   /* 试下（草稿）里的手**不写进棋谱** —— 那是草稿，不是这一局 */
   const upto = state.draft ? state.draft.from : state.moves.length;
+  /* ★ 2026-10-30：**只有摆子、没有手顺**的局面要写 PL[]，否则别的软件打开只能猜
+     （多数会按“有摆子 = 让子 = 白先”猜，而图片识谱认出来的死活题常常是黑先）。
+     ★ 只在真的读到过 PL、且盘上一手都还没下时写 —— 有手顺时颜色由第一手自己说，
+       再写一个 PL 只会制造两处可能互相矛盾的声明。 */
+  if (!upto && state.firstPlayer) s += 'PL[' + (state.firstPlayer === 'w' ? 'W' : 'B') + ']';
   /* 终局结果写进 RE[] —— 棋谱软件（围棋APP、CGoban 等）能直接读到胜负 */
   const r = state.result;
   if (r) {
@@ -1787,7 +1799,7 @@ function analysisNoteFor(k) {
   return moveAnalysisText(k);
 }
 
-/* ---------------- 棋谱库（打开 / 存进来 / 备注 / 删除） ----------------
+/* ---------------- 棋谱库（打开 / 存进来 / 备注 / 双击改名 / 删除） ----------------
    位置：软件目录下的 records/（见 main.js 的 RECORDS_DIR）。
    为什么不放用户的「我的棋谱」：那是他自己的目录，不该由软件往里写。
    删除一律走系统回收站（主进程里的 shell.trashItem），误删能捞回来。 */
@@ -2280,6 +2292,10 @@ function applyRecord(rec, srcName) {
     ...rec.aw.map(p => ({ x: p.x, y: p.y, color: 'w' })),
   ];
   state.moves = rec.moves.slice();
+  /* ★ 2026-10-30：棋谱自己声明了先手（PL[]）就照它 —— 静态局面图（图片识谱、
+     死活题图）只有摆子没有手顺，靠“有摆子就白先”猜会把黑先的题猜成白先。
+     没有 PL 就是 null，sideToMove 仍走老规则，行为与以前一模一样。 */
+  state.firstPlayer = rec.firstPlayer || null;
   /* ★ 变化树（2026-10-17）：只有棋谱会带它。手数列表的分支标记、Alt+←/→ 切换都靠它；
      没有分支的棋谱是 null，行为与以前完全一样。 */
   state.varRoot = rec.tree || null;
@@ -2433,19 +2449,81 @@ $('btn-save').onclick = () => { saveToRecords(); };   // 原先下载到系统�
 /* ---------- 棋谱库弹窗 ---------- */
 const REC_MASK = $('records');
 
-const fmtRecTime = ms => {
-  const d = new Date(ms), p = n => String(n).padStart(2, '0');
-  return `${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}`;
-};
+/* ★ 2026-10-31：fmtRecTime（「10月31日 13:20」那种时间串）删掉了 ——
+   棋谱库早就不显示时间（只留文件名），题集面板这轮也按用户要求去掉了大小/时间，
+   于是它没有任何调用点。留着一个没人用的函数，只会让人以为哪里还在显示时间。 */
 
 /* 棋谱库的搜索词 —— 纯前端过滤（列表本来就在内存里，不必再读盘）。
    打开面板时**不清空**：连着看好几份棋谱时，搜索词留着更方便。 */
 let recFilter = '';
 
+/* ★ 双击棋谱名 → 就地改文件名（2026-10-31 用户要求：改名不占按钮，双击名字触发）。
+   改的是**盘上真实的文件名**，主进程顺手把 `<棋谱名>.review.json`（复盘报告）/
+   `.coach.json`（逐手讲解）/ `.review.part.json`（复盘进度）一起改名 —— 这三份都是
+   按文件名配对的，只改 .sgf 会让报告留在盘上、界面上却「找不到」。
+   交互：回车确认 · **Esc / 点到别处（失焦）都算取消** —— 手滑点一下不该把棋谱改名。
+   （「备注」是另一件事：只写 SGF 的 GN，文件名不动，见那行的「备注」按钮。） */
+function startRecRename(li, it, info) {
+  if (info.querySelector('input')) return;            // 已经在改了，别再叠第二个框
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.value = it.name.replace(/\.sgf$/i, '');
+  inp.placeholder = '新的棋谱名…';
+  inp.title = '回车确认 · Esc 或点别处取消（复盘报告 / 讲解 / 复盘进度会跟着改名）';
+  let closed = false;
+  const done = async ok => {
+    if (closed) return;
+    closed = true;
+    if (!ok) { refreshRecords(); return; }            // 取消：整行重画回原样
+    const nv = (inp.value || '').trim();
+    if (!nv) { flash('名字不能空着'); refreshRecords(); return; }
+    /* 正在给这份棋谱复盘/讲解 → 别改名：跑到一半它会按**老名字**存报告，
+       结果就是一份对不上任何棋谱的孤儿 JSON。等它跑完（或先停止）再改。 */
+    if (rvRun && rvRun.name === it.name) {
+      flash('这份棋谱正在复盘/讲解 —— 等它跑完再改名');
+      refreshRecords();
+      return;
+    }
+    const r = await window.api.records.rename(it.name, nv);
+    if (!r || r.error) { flash('改名失败：' + ((r && r.error) || '未知')); refreshRecords(); return; }
+    const nn = r.name || nv;
+    if (r.unchanged) { refreshRecords(); return; }
+    /* 现在打开的就是这份 → 内存里记住的文件名也跟着换。
+       不改的话，后面的复盘 / 讲解 / 导出写回还会往**老名字**的侧车文件里写。 */
+    if (state.recName === it.name) state.recName = nn;
+    for (const o of [state.review, state.reviewDoc]) {
+      if (o && o.file === it.name) o.file = nn;
+    }
+    /* 提示按「顶栏一行放得下」写：正常情况 ≈300px，最长 ≈430px（预算 449px）。
+       确有同名冲突 / 搬家失败时才追加一句，那两种情况很少见，超了也只是尾巴省略。 */
+    let tip = '已改名为「' + nn.replace(/\.sgf$/i, '') + '」';
+    const mv = r.moved || {}, extra = [];
+    if (mv.review) extra.push('复盘报告');
+    if (mv.coach) extra.push('讲解');
+    if (mv.part) extra.push('复盘进度');
+    if (extra.length) tip += '（' + extra.join('、') + '跟着改名）';
+    if ((r.conflicted || []).length) tip += '；' + r.conflicted.join('、') + '有同名，没搬';
+    if ((r.failed || []).length) tip += '；' + r.failed.join('、') + '改名失败';
+    flash(tip);
+    refreshRecords();
+  };
+  inp.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); done(true); }
+    if (e.key === 'Escape') { e.preventDefault(); done(false); }
+    e.stopPropagation();                              // 别让按键冒到全局快捷键上
+  };
+  inp.onblur = () => done(false);
+  info.textContent = '';
+  info.appendChild(inp);
+  inp.focus();
+  inp.select();
+}
+
 async function refreshRecords() {
   const ul = $('reclist');
   const all = (await window.api.records.list()) || [];
-  /* ★ 搜索/筛选（2026-10-04 用户要求）：备注名 + 文件名 一起模糊匹配 */
+  /* ★ 搜索/筛选（2026-10-04 用户要求）：备注名 + 文件名一起模糊匹配。
+     备注名本来就写在 GN 里，所以职业棋谱里写的双方 / 赛事也能搜到 —— 用那个找反而快。 */
   const kw = recFilter.toLowerCase();
   const list = kw ? all.filter(it => ((it.note || '') + ' ' + it.name).toLowerCase().includes(kw)) : all;
   const cnt = $('rec-count');
@@ -2480,21 +2558,25 @@ async function refreshRecords() {
     };
     /* 两行显示（用户要求「显示备注名和文件名」）：
        上行 = 备注名（存在 SGF 的 GN 字段里）；下行 = **真实文件名**（灰色小字）。
-       没写过备注时就只显示文件名一行，免得两行是同一串东西。 */
+       没写过备注时就只显示文件名一行，免得两行是同一串东西。
+       ★ 2026-10-31：改名不再占一个按钮 —— **双击这行名字**就改文件名（startRecRename）。 */
     const info = document.createElement('div');
     info.className = 'rec-info';
+    const base = it.name.replace(/\.sgf$/i, '');
     const hasNote = !!(it.note && it.note.trim());
     const nm = document.createElement('span');
     nm.className = 'rec-name';
-    nm.textContent = hasNote ? it.note : it.name.replace(/\.sgf$/i, '');
-    nm.title = hasNote ? (it.note + '\n文件：' + it.name) : it.name;
+    nm.textContent = hasNote ? it.note : base;
+    nm.title = (hasNote ? it.note + '\n文件：' + it.name : it.name) + '\n（双击这里可以改文件名）';
     info.appendChild(nm);
     if (hasNote) {
       const fn = document.createElement('span');
       fn.className = 'rec-file';
       fn.textContent = it.name;
+      fn.title = '真实文件名 —— 双击上面的名字可以改它';
       info.appendChild(fn);
     }
+    info.ondblclick = () => startRecRename(li, it, info);
     /* ★ 2026-10-18 用户要求：这一行**只留文件名**（原来看大小 / 时间 / 已复盘）。
        理由：文件名现在带上了双方名字+棋力+时间（recordFileName），信息已经够；
        那一串元信息占掉半行，把文件名挤成省略号，反倒看不见了。
@@ -2549,9 +2631,10 @@ async function refreshRecords() {
         if (!it.hasReview) b.classList.add('primary');
         return b;
       })(),
-      /* 备注：写在 SGF 的 GN 字段里，**不改文件名**。
-         （Electron 里 window.prompt() 用不了 → 就地展开一个输入框） */
-      mk('备注', '写一个备注名（存进棋谱的 GN 字段，文件名不动）', () => {
+      /* 备注（2026-10-31 用户要求改回来）：写在 SGF 的 GN 字段里，**文件名不动**。
+         改名**不在这里** —— 双击这一行的棋谱名就能改（见 startRecRename）。
+         Electron 里 window.prompt() 用不了 → 就地展开一个输入框。 */
+      mk('备注', '写一个备注名（存进棋谱的 GN 字段，文件名不动；要改文件名就双击棋谱名）', () => {
         const inp = document.createElement('input');
         inp.type = 'text';
         inp.value = it.note || '';
@@ -2669,7 +2752,7 @@ $('rec-import').onclick = async () => {
 };
 REC_MASK.addEventListener('click', e => { if (e.target === REC_MASK) REC_MASK.classList.remove('open'); });
 
-/* HTML 转义：棋谱备注名是用户输入，塞进 innerHTML 前必须转义 */
+/* HTML 转义：棋谱名 / 棋局名都是用户或文件带来的字符串，塞进 innerHTML 前必须转义 */
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ));
@@ -4705,6 +4788,9 @@ $('btn-ts-back').onclick = () => tsBackToSetup();
 $('btn-ts-clear').onclick = () => tsClearSetup();
 $('btn-ts-reset').onclick = () => tsResetSolve();
 $('btn-ts-answer').onclick = () => tsToggleAnswer();
+/* 摆题阶段最右边那个纯图标按钮：顺时针转 90°（2026-10-31 用户要求）。
+   不给 flash —— 盘面整个转过去了，本来就是"看得见的结果"，再冒一句反而挡视线。 */
+$('btn-ts-rotate').onclick = () => tsRotateSetup();
 
 /* ==================== 习题题集 · 控件接线（2026-10-14）==================== */
 /* 弹窗遮罩。⚠️ 这个 const 必须在使用它的那些函数**被调用之前**初始化 ——
@@ -4712,11 +4798,18 @@ $('btn-ts-answer').onclick = () => tsToggleAnswer();
    所以安全。 */
 const PUZ_MASK = $('puzzles');
 
+/* 面板关掉就把"手上那道待存题"丢掉：它只是为了一次操作而存在的，
+   留着会让下一次开面板又冒出一句莫名其妙的提示。 */
+function closePuzzles() {
+  PUZ_MASK.classList.remove('open');
+  puzPending = null;
+}
 $('btn-pset').onclick = () => openPuzzles();
 $('btn-ts-prev').onclick = () => tsGotoProblem(-1);
 $('btn-ts-next').onclick = () => tsGotoProblem(1);
-$('puz-close').onclick = () => PUZ_MASK.classList.remove('open');
-PUZ_MASK.addEventListener('click', e => { if (e.target === PUZ_MASK) PUZ_MASK.classList.remove('open'); });
+$('puz-close').onclick = () => closePuzzles();
+PUZ_MASK.addEventListener('click', e => { if (e.target === PUZ_MASK) closePuzzles(); });
+$('puz-new').onclick = () => puzNewSetPrompt();
 $('puz-open-dir').onclick = () => window.api.puzzles.openDir();
 $('puz-import').onclick = async () => {
   const btn = $('puz-import');
@@ -5017,6 +5110,7 @@ function applyNewGame(idle) {
   state.quizTips = [];           // 也不是题集，没有「第几题」
   state.recName = '';           // ★ 也不是某份棋谱了 —— 讲解没有存放处（全盘讲解按钮会收起）
   state.exportName = '';        // 新局 → 下次导出该新起名字（别覆盖上一局那份）
+  state.firstPlayer = null;     // ★ 新局没有"棋谱声明的先手"（先手由座子/让子定，见下）
   clearCoachPanels();           // 讲解只在对局期间保留（用户要求：开新局就清）
   const R = RULES[settings.rules] || RULES.chinese;
 
@@ -6099,6 +6193,7 @@ function enterTsumego() {
   state.quizTips = [];
   state.recName = '';           // 不是某份棋谱 → 没地方存全盘讲解（按钮会收起）
   state.exportName = '';        // 换到习题 → 上一局的导出目标作废
+  state.firstPlayer = null;     // ★ 习题的先手是 settings.tfirst（题目的属性），不是棋谱的 PL
   clearCoachPanels();
   state.setup = [];             // 空盘开始摆题
   state.myColor = tsMyColor();   // 你执 KATAGO 的另一方（见 settings.taicolor）
@@ -6449,6 +6544,47 @@ function tsClearSetup() {
   syncBalToSetup();               // 空盘 = 另一个局面 → 旧贴目作废（见 syncBalToSetup）
   draw();
   syncTsumegoUI();
+}
+
+/* ★ 顺时针转 90°（2026-10-31 用户要求；按钮在「落子」那行最右边，纯图标、无文字）。
+
+   为什么绕**棋盘中心**转，而不是"就地把形状转一下"：
+     · 绕棋盘中心：角上的题会转到**相邻的角**（左上 → 右上），形状与两条边的关系原样保留
+       —— 转到哪儿都还是同一道角上的题，框架与引擎约束照样成立；
+     · 绕题目自己的外接框中心：棋子原地打转，可"角"是两条边给的 —— 一转棋子就和边脱开，
+       变成浮在角上的怪形状（角上的题基本都贴着边，这条很容易踩）。
+   坐标换算（y 向下，y = 0 是顶行）：(x, y) → (N−1−y, x)。
+
+   ★★ 题集里的题**连正解一起转**：`p.setup` / `p.answer` / `p.tree` 是同一套坐标，
+      只转盘上的摆子的话，「按正解」那一档会应到别处、「正解」摆出来也不对。
+      改动只落在**内存里这份题**上，磁盘文件一个字节都不动 —— 重新打开题集就回到原朝向。
+   ⚠️ pass 的手没有坐标，别转（undefined 会算出 NaN）。
+   摆子一变 = 另一个局面：候选 / 形势 / 配平 / 在飞的分析全作废，和 placeSetupStone 同一套口径。 */
+function tsRotateSetup() {
+  const t = state.tsumego;
+  if (!t || t.phase !== 'setup') return false;
+  if (!state.setup.length) return false;              // 空盘没得转（按钮此时也是置灰的）
+  const rot = o => { const x = o.x; o.x = N - 1 - o.y; o.y = x; };
+  for (const s of state.setup) rot(s);
+  const pb = tsSetProblem();
+  if (pb) {
+    for (const s of (pb.setup || [])) rot(s);
+    for (const m of (pb.answer || [])) if (!m.pass) rot(m);
+    const walk = nd => {
+      if (nd.move && !nd.move.pass) rot(nd.move);
+      for (const c of (nd.children || [])) walk(c);
+    };
+    if (pb.tree) walk(pb.tree);
+  }
+  state.candidates = []; state.candAt = -1;
+  state.ownership = null; state.ownAt = -1;
+  state.anaAt = {};                  // 第 0 手的逐手快照属于**转之前**那个局面
+  syncBalToSetup();                  // 签名变了 → 旧贴目作废（见 syncBalToSetup）
+  resetAnalysisState();              // 在飞的那趟算的是旧局面（gameGen +1 会把它丢掉）
+  draw();
+  syncTsumegoUI();
+  scheduleAnalysis(280);             // 和摆完一颗子一样：让引擎跟着看新局面
+  return true;
 }
 
 /* 摆题阶段落子 —— **写 state.setup，不写 moves**（见本节开头）。 */
@@ -6831,7 +6967,190 @@ function syncPsetUI() {
   if (next) next.disabled = !s || !s.list.length || s.idx >= s.list.length - 1;
 }
 
-/* ---------- 习题题集面板（导入 / 打开 / 改名 / 删除） ----------
+/* ---------- 「把一道题存进题集」（2026-10-31）----------
+   用户要求：自由摆的题、图片认出来的题，都能**一道道存进同一个 SGF**；
+   也可以先新建一份空题集，再慢慢往里存。
+   ★ 格式不需要发明容器：题集的既有约定就是「一棵棵树并排」（xxqj.sgf 就是这样，
+     解析走 splitSgfGames）。所以"多题一个文件" = 往文件末尾再串一棵树，
+     其它围棋软件也照样打得开。
+   ★★ `PL` 必须写 —— 它就是"先手"，题目的一半信息。不写的话别的软件按
+     "有摆子 = 让子 = 白先"猜，黑先的死活题一打开就反了（buildSGF 里踩过同一个坑）。 */
+function buildProblemSGF(o) {
+  const cols = SGF_COLS;
+  const pt = (x, y) => '[' + cols[x] + cols[y] + ']';
+  const esc = v => String(v == null ? '' : v).replace(/[\[\]\\]/g, ' ');   // SGF 值里不能有 ] 和 \
+  const R = RULES[settings.rules] || RULES.chinese;
+  const size = o.size || N;
+  let s = '(;GM[1]FF[4]SZ[' + size + ']CA[UTF-8]AP[RapaceGo:0.3]'
+    + 'KM[' + (o.komi == null ? (R.komi || 0) : o.komi) + ']RU[' + R.sgf + ']'
+    + 'PL[' + (o.first === 'w' ? 'W' : 'B') + ']';
+  const bs = (o.setup || []).filter(x => x.color === 'b').map(x => pt(x.x, x.y)).join('');
+  const ws = (o.setup || []).filter(x => x.color === 'w').map(x => pt(x.x, x.y)).join('');
+  if (bs) s += 'AB' + bs;
+  if (ws) s += 'AW' + ws;
+  if (o.comment) s += 'C[' + esc(o.comment) + ']';
+  /* 主变化 = 正解（题集里"主变化就是做者写进去的正解"，见 parseProblemSet） */
+  for (const m of (o.moves || [])) {
+    s += ';' + (m.color === 'w' ? 'W' : 'B') + (m.pass ? '[]' : pt(m.x, m.y));
+  }
+  return s + ')';
+}
+
+/* 识谱面板「存进题集…」交过来的题目。**只活到题集面板关掉为止**
+   （见 puz-close / PUZ_MASK 的点击），不做持久化 —— 它只是一段 sgf 文本。 */
+let puzPending = null;
+
+/* 盘上现在这一道题 → 一段 SGF。没摆子返回 null（调用方负责说人话）。
+   ★ 解题阶段盘上有手顺 → 一并存成**正解**（那是用户刚推出来的答案，比丢掉有用）；
+     摆题阶段没有手顺，就是一道纯局面题。 */
+function puzCurrentSGF() {
+  const t = state.tsumego;
+  if (!t || !state.setup.length) return null;
+  const first = settings.tfirst === 'w' ? 'w' : 'b';
+  const moves = t.phase === 'solve'
+    ? state.moves.map(m => ({ color: m.color, x: m.x, y: m.y, pass: !!m.pass }))
+    : [];
+  const from = tsSet() ? '来自题集「' + tsSet().name.replace(/\.sgf$/i, '') + '」' : '手摆';
+  return {
+    sgf: buildProblemSGF({
+      setup: state.setup, first, moves, size: N,
+      comment: 'RapaceGo · ' + from + ' · ' + (first === 'b' ? '黑先' : '白先')
+        + ' · ' + state.setup.length + ' 子' + (moves.length ? ' · 正解 ' + moves.length + ' 手' : ''),
+    }),
+    label: (first === 'b' ? '黑先' : '白先') + ' · ' + state.setup.length + ' 子'
+      + (moves.length ? ' · 正解 ' + moves.length + ' 手' : ''),
+  };
+}
+
+/* 题集文件变了（刚存进一道题）→ 把内存里那份的题目表重读一遍。
+   ★ 只换 list，**不调 tsLoadProblem**（那会把盘面重摆、手顺清掉、还重新配平）。
+     `›` 能不能翻到刚存进去的那一题，全靠这里 list 有没有换。 */
+async function puzReloadSet(name) {
+  const s = tsSet();
+  if (!s || s.name !== name) return;
+  const r = await window.api.puzzles.read(name);
+  if (!r || !r.text) return;
+  const { list, skipped } = parseProblemSet(r.text);
+  if (!list.length) return;
+  s.list = list;
+  s.skipped = skipped;
+  s.idx = Math.max(0, Math.min(s.idx, list.length - 1));
+  syncTsumegoUI();
+}
+
+/* 把手上这道题存进 `name` 这一份题集（不存在就当新建）。
+   ★ 与「导入」的重名策略相反：用户是**点名**要存进这一份，必须写进去，
+     不能像 import 那样悄悄另存成 xxqj(2).sgf。重复存档由主进程按内容判重。 */
+async function puzAppendTo(name) {
+  const payload = puzPending || puzCurrentSGF();
+  if (!payload) {
+    flash('盘上还没有题目 —— 先在「习题练习」里摆一道题（或先识别一张图片）');
+    return;
+  }
+  /* 这道题本来就在这份题集里（正在练它）→ 直接说清，别存出一份重复的 */
+  if (!puzPending && tsSet() && tsSet().name === name) {
+    flash('这道题已经在「' + name.replace(/\.sgf$/i, '') + '」里了 —— 换个文件名，或先「清空」再摆新题');
+    return;
+  }
+  const r = await window.api.puzzles.append(name, payload.sgf);
+  if (!r || r.error) { flash('存不进去：' + ((r && r.error) || '未知')); return; }
+  puzPending = null;
+  await puzReloadSet(name);
+  await refreshPuzzles();
+  flash(r.dup
+    ? '这道题早就在「' + name.replace(/\.sgf$/i, '') + '」里了（没重复存）'
+    : '已存进「' + name.replace(/\.sgf$/i, '') + '」· ' + (payload.label || '1 题'));
+}
+
+/* 「新建题集…」：在列表顶上就地要一个名字（照抄改名的做法，不另做弹窗）。 */
+function puzNewSetPrompt() {
+  const ul = $('puzlist');
+  if (!ul) return;
+  const li = document.createElement('li');
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.placeholder = '新题集的名字（不用写 .sgf）';
+  inp.value = '我的题集';
+  const ok = document.createElement('button');
+  ok.textContent = '新建';
+  ok.className = 'primary';
+  const no = document.createElement('button');
+  no.textContent = '取消';
+  no.onclick = () => refreshPuzzles();
+  const commit = async () => {
+    const nv = (inp.value || '').trim();
+    if (!nv) { refreshPuzzles(); return; }
+    const r = await window.api.puzzles.create(nv);
+    if (!r || r.error) { flash('新建失败：' + ((r && r.error) || '未知')); refreshPuzzles(); return; }
+    const stem = String(r.name).replace(/\.sgf$/i, '');
+    /* 手上有待存的题（识谱交过来的 / 盘上摆着的）→ 顺手存进去 ——
+       这正是「先新建、再把题目存进去」最短的那条路。没有题就只建一个空文件。 */
+    const payload = puzPending || puzCurrentSGF();
+    if (payload) {
+      const a = await window.api.puzzles.append(r.name, payload.sgf);
+      puzPending = null;
+      if (a && !a.error) flash('已新建「' + stem + '」并存入 1 题');
+      else flash('已新建「' + stem + '」，但题目没存进去：' + ((a && a.error) || '未知'));
+    } else {
+      flash('已新建空白题集「' + stem + '」—— 摆好题后点它的「存当前题」');
+    }
+    refreshPuzzles();
+  };
+  ok.onclick = commit;
+  inp.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    if (e.key === 'Escape') refreshPuzzles();
+  };
+  li.append(inp, ok, no);
+  ul.insertBefore(li, ul.firstChild);
+  inp.focus();
+  inp.select();
+}
+
+/* ★ 双击题集名 → 就地改名（2026-10-31 用户要求：和棋谱库一致，改名不占按钮）。
+   只改**文件名**；题集进度是**按名字**记的，改完得把那条记录跟着搬（psetProgRename），
+   否则下次打开会从第 1 题开始。回车确认，Esc / 点到别处取消。 */
+function startPuzRename(li, it, info) {
+  if (info.querySelector('input')) return;            // 已经在改了，别叠第二个框
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.value = it.name.replace(/\.sgf$/i, '');
+  inp.placeholder = '题集名字…';
+  inp.title = '回车确认 · Esc 或点别处取消（只改文件名，练到第几题会跟着记）';
+  let closed = false;
+  const done = async ok => {
+    if (closed) return;
+    closed = true;
+    if (!ok) { refreshPuzzles(); return; }
+    const nv = (inp.value || '').trim();
+    if (!nv) { refreshPuzzles(); return; }
+    const r = await window.api.puzzles.rename(it.name, nv);
+    if (r && r.error) flash('改名失败：' + r.error);
+    else {
+      flash('题集已改名为「' + String((r && r.name) || nv).replace(/\.sgf$/i, '') + '」');
+      if (r && r.name) psetProgRename(it.name, r.name);
+      /* 正在练的就是这份 → 内存里那份的名字也跟着改（否则卡片上还是老名字） */
+      if (tsSet() && tsSet().name === it.name && r && r.name) {
+        tsSet().name = r.name;
+        if (state.tsumego) state.tsumego.source = r.name + ' · 第 ' + (tsSet().idx + 1) + ' 题';
+        syncTsumegoUI();
+      }
+    }
+    refreshPuzzles();
+  };
+  inp.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); done(true); }
+    if (e.key === 'Escape') { e.preventDefault(); done(false); }
+    e.stopPropagation();                              // 别让按键冒到全局快捷键上
+  };
+  inp.onblur = () => done(false);
+  info.textContent = '';
+  info.appendChild(inp);
+  inp.focus();
+  inp.select();
+}
+
+/* ---------- 习题题集面板（导入 / 打开 / 双击改名 / 删除） ----------
    结构照抄棋谱库那个弹窗，不另发明一套。
    ★ 题数（一份题集里有几道题）在这里现算 —— 读一遍文件、数顶层树。
      为什么不由主进程给：**"怎么把 SGF 切成一道道的题"只允许有一处实现**
@@ -6840,6 +7159,15 @@ function syncPsetUI() {
 async function refreshPuzzles() {
   const ul = $('puzlist');
   if (!ul) return;
+  /* 顶上那条"手上还拿着一道题"的提示（识谱面板交过来的，见 puzPending）。
+     没有待存题就整条藏起来 —— 常驻一行空提示只会占地方。 */
+  const pendEl = $('puz-pend');
+  if (pendEl) {
+    pendEl.hidden = !puzPending;
+    pendEl.textContent = puzPending
+      ? '手上有一道待存的题（' + (puzPending.label || '识谱结果') + '）—— 点某份题集右边的「存当前题」存进去，或先「新建题集…」'
+      : '';
+  }
   const all = (await window.api.puzzles.list()) || [];
   ul.textContent = '';
   const cnt = $('puz-count');
@@ -6858,11 +7186,14 @@ async function refreshPuzzles() {
     const nm = document.createElement('span');
     nm.className = 'rec-name';
     nm.textContent = it.name.replace(/\.sgf$/i, '');
-    nm.title = it.name;
+    nm.title = it.name + '\n（双击这里可以改题集名）';
     info.appendChild(nm);
+    /* ★ 2026-10-31 用户要求：改名不再占一个按钮 —— **双击题集名**就改（和棋谱库同一套）。 */
+    info.ondblclick = () => startPuzRename(li, it, info);
+    /* ★ 2026-10-31 用户要求：这一行**只留题数**。原来后面还挂着「多少 KB · 时间」，
+       对"挑哪份题集练"毫无用处，还把题数挤成了省略号。 */
     const meta = document.createElement('span');
     meta.className = 'rec-meta';
-    meta.textContent = Math.max(1, Math.round(it.size / 1024)) + ' KB · ' + fmtRecTime(it.mtime);
     li.append(info, meta);
 
     /* 题数：读一遍文件数顶层树。读不出来（文件被删/没权限）就标一下，不静默。 */
@@ -6872,8 +7203,7 @@ async function refreshPuzzles() {
       if (r && r.text) games = splitSgfGames(r.text).length;
       else readErr = (r && r.error) || '读不出来';
     } catch (e) { readErr = String((e && e.message) || e); }
-    meta.textContent = (readErr ? '（' + readErr + '）' : games + ' 题')
-      + ' · ' + Math.max(1, Math.round(it.size / 1024)) + ' KB · ' + fmtRecTime(it.mtime);
+    meta.textContent = readErr ? '（' + readErr + '）' : games + ' 题';
 
     const isCur = !!(tsSet() && tsSet().name === it.name);
     const mk = (label, title, fn, cls) => {
@@ -6892,44 +7222,16 @@ async function refreshPuzzles() {
         await openPuzzleSet(it.name);
       });
     if (isCur) openBtn.classList.add('primary');
+    /* 空白题集（刚新建、还没存题）：打开它没意义，直接禁用并说明原因，
+       否则点了只会弹一句"没解析出题目"，像是坏了。 */
+    if (!games && !readErr) {
+      openBtn.disabled = true;
+      openBtn.title = '这是一份空白题集 —— 点右边的「存当前题」把题目存进来';
+    }
     li.append(openBtn,
-      mk('改名', '给题集换个名字（只改文件名）', () => {
-        const inp = document.createElement('input');
-        inp.type = 'text';
-        inp.value = it.name.replace(/\.sgf$/i, '');
-        inp.placeholder = '题集名字…';
-        const ok = document.createElement('button');
-        ok.textContent = '确定';
-        const no = document.createElement('button');
-        no.textContent = '取消';
-        const commit = async () => {
-          const nv = (inp.value || '').trim();
-          if (!nv) { refreshPuzzles(); return; }
-          const r = await window.api.puzzles.rename(it.name, nv);
-          if (r && r.error) flash('改名失败：' + r.error);
-          else {
-            flash('题集已改名为「' + String((r && r.name) || nv).replace(/\.sgf$/i, '') + '」');
-            /* 进度是**按名字**记的 → 改名了得把那条记录跟着搬，否则下次打开会从第 1 题开始 */
-            if (r && r.name) psetProgRename(it.name, r.name);
-            /* 正在练的就是这份 → 把内存里那份的名字也跟着改（否则卡片上还是老名字） */
-            if (tsSet() && tsSet().name === it.name && r && r.name) {
-              tsSet().name = r.name;
-              if (state.tsumego) state.tsumego.source = r.name + ' · 第 ' + (tsSet().idx + 1) + ' 题';
-              syncTsumegoUI();
-            }
-          }
-          refreshPuzzles();
-        };
-        ok.onclick = commit;
-        no.onclick = () => refreshPuzzles();
-        inp.onkeydown = e => {
-          if (e.key === 'Enter') { e.preventDefault(); commit(); }
-          if (e.key === 'Escape') refreshPuzzles();
-        };
-        li.textContent = '';
-        li.append(inp, ok, no);
-        inp.focus(); inp.select();
-      }),
+      /* ★ 2026-10-31：把手上这道题存进**这一份**（多题共用一个文件，见 buildProblemSGF） */
+      mk('存当前题', '把盘上现在这道题（摆子 + 先手，解题阶段连手顺一起）存进这份题集 —— 一道挨着一道，都在同一个文件里',
+        () => puzAppendTo(it.name)),
       /* 删除：和棋谱库同一套（就地变「确认删除？」，3 秒后自动还原；进系统回收站） */
       mk('删除', '移到系统回收站（可以恢复）', function () {
         if (this.dataset.armed !== '1') {
@@ -7034,6 +7336,10 @@ function syncTsumegoUI() {
     const altTxt = $('ts-alt-next');
     altTxt.hidden = !alt;
     if (alt) altTxt.textContent = '下一子 ' + (t.nextColor === 'b' ? '黑' : '白');
+    /* 旋转按钮（2026-10-31）：空盘没得转 → 置灰。别让它"点了没反应"：
+       纯图标按钮本来就只能靠灰不灰来告诉人"现在能不能按"。 */
+    const rotBtn = $('btn-ts-rotate');
+    if (rotBtn) rotBtn.disabled = !state.setup.length;
   } else {
     setSeg('seg-tsdefend', t.defend);
   }
@@ -7192,9 +7498,13 @@ function fromGTP(s) {
      连自己的落子都会被"只能下自己那方"那条守卫挡掉（实测就是这个连锁）。
      → 习题模式下先手一律取 settings.tfirst。 */
 function sideToMove(n) {
+  /* ★ 2026-10-30：中段多了一档 `state.firstPlayer`（棋谱的 PL[]）。
+     原来只有「有摆子 → 白先 / 没摆子 → 黑先」这条经验规则 —— 它对**静态局面图**
+     （图片识谱认出来的死活题）是错的：盘上有摆子、但题目是黑先。
+     优先级：习题模式（题目的先手是显式属性）→ 棋谱 PL → 经验规则。 */
   const first = tsOn()
     ? (settings.tfirst === 'w' ? 'w' : 'b')
-    : (state.setup.length ? 'w' : 'b');
+    : (state.firstPlayer || (state.setup.length ? 'w' : 'b'));
   return (n % 2 === 0) ? first : (first === 'b' ? 'w' : 'b');
 }
 
@@ -8822,7 +9132,7 @@ function renderNames() {
   }
 }
 
-/* 点名字就地改名（回车 / 失焦确认，Esc 取消）—— 像棋谱库的「备注」那样。
+/* 点名字就地改名（回车 / 失焦确认，Esc 取消）—— 和棋谱库双击名字改名同一套交互。
    改完立刻生效：右侧显示、导出棋谱写进 PB/PW 都用它。 */
 function bindClockName(color) {
   const el = $('cid-' + color);
@@ -12502,6 +12812,850 @@ $('explain-body').addEventListener('click', e => {
   const at = +row.dataset.at;
   if (at > 0) gotoView(at);
 });
+/* ==================== 图片识谱（静态棋局，2026-10-30）====================
+
+   一句话：一张棋盘图片 → 一个 19 路静态局面 → 存成棋谱 / 当习题练。
+
+   ★★ 识别算法**全在 renderer/vision.js**（纯 JS、不碰 DOM、不发网络请求、不写盘）。
+      这一段只管界面：读图、画图、点着改、旋转镜像、贴角、先手、落盘。
+      两边靠 `Vision.*` 那几个纯函数通信 —— 别把识别逻辑搬回这里，
+      那样一来就没法用 dev/_vision_test.mjs 单独回归它了。
+
+   三个必须记住的口径：
+     ① **静态局面没有手顺**：输出的是根节点 AB/AW + PL[]，不是一手手下出来的。
+        所以打开后手数列表是空的、「逐手讲解 / AI 复盘」也没东西可算 ——
+        这是信息缺失，不是 bug（见 图片识谱方案.md §7）。
+     ② **两套「四角」别混**：`corners`（透视用的四个角点，**原图坐标**）
+        和 `corner`（这块局部图贴在 19 路的**哪个角**）是两件事。
+        界面上前者叫「手动框…」，后者叫「贴角」。
+     ③ **旋转/镜像转的是图片本身**，转完重新识别一遍。反过来"只转矩阵"就得手工
+        同步「矫正图 / 网格坐标 / 判角」三套东西，实测很容易错半个格子。
+        代价是每转一次多花一次识别时间（~0.2 秒），值。
+
+   ★ 为什么先选图再开面板：选图是系统对话框（挡住整个窗口），
+     先弹面板再弹对话框的话，用户一取消就留下一个空面板。 */
+
+const VIS = $('vision');
+const VIS_BOX = 452;        // 画布显示宽度，必须和 style.css 的 .vis-stage 一致
+/* 原图像素上限。超了不认 —— prep() 要开三个 Float32Array（每像素 12 字节），
+   4000 万像素就是 480MB，先爆内存再谈准确率没有意义。 */
+const VIS_MAX_PX = 40e6;
+
+const vis = {
+  name: '',            // 图片文件名（用来起棋谱名、也显示在标题旁）
+  src: null,           // ImageData：原图（旋转/镜像会整个换掉）
+  _sc: null,           // src 的离屏 canvas 缓存（画 corners 视图用）
+  _scFor: null,        // 上面那个缓存是为哪一份 src 建的（对象身份比对）
+  res: null,           // Vision.analyze() 的返回值
+  edits: new Map(),    // 逐点校正：'c,r' → Vision.EMPTY/BLACK/WHITE（覆盖识别结果）
+  cornerManual: null,  // 用户手点的「贴角」；null = 跟着自动判角走
+  off: 0,              // 贴角偏移（往棋盘中心挪几路）
+  pl: 'b',             // 先手：'b' | 'w'
+  view: 'board',       // 'board' = 看矫正图改子 / 'corners' = 在原图上拖四角
+  mc: null,            // 手动四角 [[x,y]×4]（tl,tr,br,bl，**原图坐标**）；null = 自动
+  drag: -1,            // 正拖着的手柄序号（-1 = 没在拖）
+  cvMap: null,         // corners 视图下「原图坐标 ↔ 画布坐标」的映射（画和点共用，见 visPaintCorners）
+  hover: null,         // 鼠标所在交叉点 [i,j]
+  dots: true,          // 要不要在交叉点上标识别结果
+  busy: false,         // 识别中（挡住重复点击）
+};
+
+/* ---------- 小工具 ---------- */
+
+/* 视觉稿上写的「显示像素」↔ canvas 实际像素。cv.width 可能是 836（矫正图原尺寸），
+   而被 CSS 缩到 452 —— 所以描边宽度、圆半径都要乘这个 k，否则线粗得看不下去。 */
+const visK = cv => cv.width / VIS_BOX;
+
+/* 鼠标事件 → canvas 像素坐标。两个视图通用（都是按 rect 与实际像素的比换算）。 */
+function visPos(e, cv) {
+  const rc = cv.getBoundingClientRect();
+  const kx = rc.width ? cv.width / rc.width : 1;
+  const ky = rc.height ? cv.height / rc.height : 1;
+  return { x: (e.clientX - rc.left) * kx, y: (e.clientY - rc.top) * ky };
+}
+
+/* 当前该用哪个「贴角」：手点过就用手点的，没点过就跟着自动判角。 */
+function visCorner() {
+  return vis.cornerManual || (vis.res && vis.res.corner) || 'tl';
+}
+
+/* 把逐点校正叠到识别结果上，得到"眼前这张盘"。 */
+function visMatrix() {
+  const r = vis.res;
+  const b = Int8Array.from(r.board);
+  for (const [k, v] of vis.edits) {
+    const [c, rr] = k.split(',');
+    const i = +c, j = +rr;
+    if (i >= 0 && i < r.nx && j >= 0 && j < r.ny) b[j * r.nx + i] = v;
+  }
+  return { board: b, conf: r.conf, nx: r.nx, ny: r.ny, corner: r.corner };
+}
+
+/* 眼前这张盘锚到 19 路之后的样子 → { stones, bad } */
+function visStones() {
+  if (!vis.res) return { stones: [], bad: [] };
+  return Vision.toBoard19(visMatrix(), { corner: visCorner(), off: vis.off });
+}
+
+/* src 的离屏 canvas（画 corners 视图要按显示尺寸缩放 drawImage，ImageData 不能直接缩放） */
+function visSrcCanvas() {
+  if (vis._sc && vis._scFor === vis.src) return vis._sc;
+  const c = document.createElement('canvas');
+  c.width = vis.src.width; c.height = vis.src.height;
+  c.getContext('2d').putImageData(vis.src, 0, 0);
+  vis._sc = c; vis._scFor = vis.src;
+  return c;
+}
+
+/* ==================== 画 ==================== */
+
+function visPaint() {
+  const cv = $('vis-canvas');
+  if (!cv) return;
+  if (!vis.src) return;
+  if (vis.view === 'corners' || !vis.res) visPaintCorners(cv);
+  else visPaintBoard(cv);
+  visPaintChrome();
+}
+
+/* 看矫正图：底图 = warpQuad 出来的方图，上面叠网格线 + 识别结果小点 + 待确认圈。 */
+function visPaintBoard(cv) {
+  const r = vis.res;
+  const S = r.warped.width;                       // 836
+  if (cv.width !== S || cv.height !== S) { cv.width = S; cv.height = S; }
+  const g = cv.getContext('2d');
+  const k = Math.max(1, visK(cv));
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, S, S);
+  g.putImageData(new ImageData(r.warped.data, S, S), 0, 0);
+
+  const { xs, ys } = r.grid;
+  const cell = r.cell;
+  const x0 = xs[0], x1 = xs[xs.length - 1];
+  const y0 = ys[0], y1 = ys[ys.length - 1];
+
+  /* 网格线：底图上本来就有线，这里叠一层很淡的主题色 ——
+     作用是"告诉你算法认为的格线在哪"。warp 偏了时能一眼看出漂移。 */
+  g.strokeStyle = 'rgba(47,111,94,.35)';
+  g.lineWidth = k;
+  g.beginPath();
+  for (const x of xs) { g.moveTo(x, y0); g.lineTo(x, y1); }
+  for (const y of ys) { g.moveTo(x0, y); g.lineTo(x1, y); }
+  g.stroke();
+
+  const m = visMatrix();
+
+  /* 悬停：**只铺一块淡绿底**（约一格见方），不画点、不画环。
+     ★ 2026-10-31 用户把 C7 中心的那个绿点当成了"这一格还没定" —— 其实绿点是**照片里**
+       那颗白子上印着的（别的围棋 App 的"最后一手"标记）。悬停原来还在中心画一个绿点、
+       外面再套一圈绿环，两件事叠在一起谁也说不清。
+       现在底纹画在棋子**之前**，被棋子压住的部分根本看不见，也就不会去污染"黑还是白"。 */
+  if (vis.hover) {
+    const [hi, hj] = vis.hover;
+    const hw = cell * 0.48;
+    g.fillStyle = 'rgba(47,111,94,.16)';
+    g.fillRect(xs[hi] - hw, ys[hj] - hw, hw * 2, hw * 2);
+  }
+
+  if (vis.dots) {
+    /* ★★ 标记 = **一颗棋子**（2026-10-31 第二次报障后的口径；上一版是"缩小的棋子"小点）。
+       小点本意是"小一点才能看见底下的照片"，但用户连着踩了两个坑，根子是同一件事：
+       小点压在照片的棋子上，**底下有子 / 没子看起来完全两样** ——
+         ① 照片里那颗白子被认成空点，点一下改成黑：小黑点套在白子上，和真黑子
+            （黑点套黑子）完全不像；再点一下改成白，正好盖住白子，又"像"了。
+         ② 直接在空点上加子：一个小黑点悬在木纹上，没有棋子那一圈边，
+            和识别出来的子看哪儿都不一样 —— 用户直接问"这是故意区分吗"。
+       画成整颗棋子（0.44 格，比真棋子略小一圈）以后，**识别出来的 / 手改的 / 空点上加的**
+       都长成同一颗子：这一格看起来是什么，判定结果就是什么。
+       想核对该点与照片是否一致，把左边「标出识别结果」勾掉就是原图。
+       ★ 底下 `.vis-legend` 的三个样张必须跟这里一致（图例说的就是"画出来长什么样"）。
+       ★★ 另一个根因（2026-10-31 上午）：这里原来写的是 `m[j * r.nx + i]`，而 `visMatrix()`
+          返回的是**对象** `{board, conf, nx, ny, corner}` —— 取到的全是 undefined，
+          于是**每个交叉点（含空点）都画成了灰点**。正确写法是 `m.board[...]`。 */
+    const rd = cell * 0.44;
+    const lw = Math.max(1, Math.round(1.2 * k));
+    for (let j = 0; j < r.ny; j++) {
+      for (let i = 0; i < r.nx; i++) {
+        const v = m.board[j * r.nx + i];
+        if (v === Vision.EMPTY) continue;
+        const cx = xs[i], cy = ys[j];
+        /* 径向渐变当高光（光源在左上，和照片里的棋子一致），描边给一点点边界 ——
+           白子落在浅木色上不描边会"化"开，黑子不描边会和深色阴影连成一片。 */
+        const gr = g.createRadialGradient(cx - rd * 0.34, cy - rd * 0.38, rd * 0.08, cx, cy, rd * 1.02);
+        let edge;
+        if (v === Vision.BLACK) {
+          gr.addColorStop(0, '#4e4c47');
+          gr.addColorStop(0.42, '#1e1d19');
+          gr.addColorStop(1, '#0a0a08');
+          edge = 'rgba(0,0,0,.55)';
+        } else if (v === Vision.WHITE) {
+          gr.addColorStop(0, '#ffffff');
+          gr.addColorStop(0.55, '#fbfaf6');
+          gr.addColorStop(1, '#e9e4da');
+          edge = 'rgba(116,108,94,.55)';
+        } else {                                    // UNKNOWN：取不到样本的点，画成灰子
+          gr.addColorStop(0, '#c2c2c2');
+          gr.addColorStop(1, '#8f8f8f');
+          edge = 'rgba(255,255,255,.85)';
+        }
+        /* 阴影只给填充那一下，描边不要带阴影（否则描边会糊成一圈灰） */
+        g.save();
+        g.shadowColor = 'rgba(60,45,25,.28)';
+        g.shadowBlur = cell * 0.10;
+        g.shadowOffsetY = cell * 0.03;
+        g.beginPath();
+        g.arc(cx, cy, rd, 0, Math.PI * 2);
+        g.fillStyle = gr;
+        g.fill();
+        g.restore();
+        g.beginPath();
+        g.arc(cx, cy, rd, 0, Math.PI * 2);
+        g.strokeStyle = edge;
+        g.lineWidth = lw;
+        g.stroke();
+      }
+    }
+  }
+
+  /* 待确认圈：**套在棋子外面**（半径 0.50 格 ≈ 棋子边），这样不会盖住棋子本体，
+     "黑还是白"永远看得见。两类共用一个颜色，靠**线型**分：
+       · 实线 = 这颗子判出来了，但没太大把握
+       · 虚线 = 这里是空点，但算法觉得"可能漏了一颗子"
+     ★ UNKNOWN（灰子）不再套圈：它本来就是"取不到样"，再套一圈只是噪音。
+     ★ 手改过的点不再标 —— 那已经是人定的了。 */
+  if (vis.dots) {
+    const rr = cell * 0.50;
+    for (const [i, j] of r.uncertain) {
+      if (vis.edits.has(i + ',' + j)) continue;
+      const v = m.board[j * r.nx + i];
+      if (v === Vision.UNKNOWN) continue;
+      g.beginPath();
+      g.arc(xs[i], ys[j], rr, 0, Math.PI * 2);
+      g.strokeStyle = 'rgba(226,138,20,.95)';
+      g.lineWidth = Math.max(1.4, 1.6 * k);
+      g.setLineDash(v === Vision.EMPTY
+        ? [Math.max(3, 3.4 * k), Math.max(2.2, 2.6 * k)]
+        : []);
+      g.stroke();
+    }
+    g.setLineDash([]);
+  }
+}
+
+/* 看原图：四个角手柄。角放满 4 个之后**每次松手都会重新识别一遍**，
+   所以调角是"拖一下看结果"的循环，不用再点确认。 */
+const VIS_CPAD = 12;         // 原图四周留白：手柄画在棋盘角上，不留白会被画布边缘切掉一半
+function visPaintCorners(cv) {
+  const src = vis.src;
+  const w = src.width, h = src.height;
+  const s = Math.min(1, (VIS_BOX - VIS_CPAD * 2) / Math.max(w, h));
+  const iw = Math.max(1, Math.round(w * s)), ih = Math.max(1, Math.round(h * s));
+  const cw = iw + VIS_CPAD * 2, ch = ih + VIS_CPAD * 2;
+  if (cv.width !== cw || cv.height !== ch) { cv.width = cw; cv.height = ch; }
+  /* 原图坐标 → 画布坐标的映射（画和点共用一份，免得两处各算一遍差半个像素） */
+  vis.cvMap = { s: iw / w, ox: VIS_CPAD, oy: VIS_CPAD };
+  const g = cv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, cw, ch);
+  g.fillStyle = '#efece6';
+  g.fillRect(0, 0, cw, ch);
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(visSrcCanvas(), 0, 0, w, h, VIS_CPAD, VIS_CPAD, iw, ih);
+
+  const sx = iw / w, sy = ih / h;                   // 原图坐标 → 显示坐标
+  const toD = (x, y) => [VIS_CPAD + x * sx, VIS_CPAD + y * sy];
+  const mc = vis.mc || (vis.res && vis.res.corners) || null;
+  if (!mc) return;
+
+  /* 四边形：四条边 + 半透明填充，一眼看出框住的是哪块 */
+  g.beginPath();
+  mc.forEach(([x, y], i) => { const p = toD(x, y); if (i) g.lineTo(p[0], p[1]); else g.moveTo(p[0], p[1]); });
+  g.closePath();
+  g.fillStyle = 'rgba(47,111,94,.12)';
+  g.fill();
+  g.strokeStyle = 'rgba(47,111,94,.95)';
+  g.lineWidth = 2;
+  g.stroke();
+
+  /* 手柄：白心绿边 + 序号。序号顺序就是 corners 的约定（左上→右上→右下→左下），
+     顺序错了透视会扭成蝴蝶结 —— 数字标出来比文字说明管用。 */
+  mc.forEach(([x, y], i) => {
+    const p = toD(x, y);
+    g.beginPath();
+    g.arc(p[0], p[1], vis.drag === i ? 10 : 8, 0, Math.PI * 2);
+    g.fillStyle = '#fff';
+    g.fill();
+    g.strokeStyle = vis.drag === i ? 'rgba(226,138,20,1)' : 'rgba(47,111,94,1)';
+    g.lineWidth = vis.drag === i ? 3 : 2;
+    g.stroke();
+    g.fillStyle = 'rgba(47,111,94,1)';
+    g.font = 'bold 11px "PingFang SC", system-ui, sans-serif';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(String(i + 1), p[0], p[1] + 0.5);
+  });
+}
+
+/* 画布坐标 → 原图坐标（corners 视图用） */
+function visCanvasToSrc(p) {
+  const m = vis.cvMap;
+  if (!m) return p;
+  return { x: (p.x - m.ox) / m.s, y: (p.y - m.oy) / m.s };
+}
+/* 原图坐标 → 画布坐标（手柄命中判定用） */
+function visSrcToCanvas(x, y) {
+  const m = vis.cvMap;
+  if (!m) return { x: x, y: y };
+  return { x: m.ox + x * m.s, y: m.oy + y * m.s };
+}
+
+/* 画布下方那行提示。**默认文案**与**悬停时的这一格是什么**分开写 ——
+   悬停信息直接改 textContent（不重画整块右侧栏：鼠标一动就重排 DOM 太吵）。 */
+function visTipBase() {
+  return vis.view === 'corners'
+    ? '在原图上拖动四个圆点框住棋盘（顺序：左上→右上→右下→左下），松手就会重新识别'
+    : '点交叉点改子：黑 → 白 → 空 → 黑；拖动不了的格子说明有偏差，先看「手动框…」';
+}
+
+/* 悬停到某一格时，把那一点的判定**用文字说出来** —— "哪些是黑子/白子"这件事，
+   光靠看画是让用户猜，鼠标划过一句"C7 · 黑子"则没有歧义。
+   ★ 2026-10-31 用户问「点 C7 代表的是不确定吗」：那一格其实是**空点**，只是算法觉得
+     "可能漏了一颗子"，所以套了虚线圈。所以这里必须把"待确认"的**哪一种**说出来，
+     不能只留一个圈让人猜（也顺便说清楚：圈是提示，不是一种新的棋子）。 */
+const VIS_NAME = { '-1': '取不到样', '0': '空点', '1': '黑子', '2': '白子' };
+function visHoverTip(hit) {
+  const tip = $('vis-tip');
+  if (!tip) return;
+  if (!hit || !vis.res) { tip.textContent = visTipBase(); return; }
+  const m = visMatrix();
+  const v = m.board[hit[1] * vis.res.nx + hit[0]];
+  let name = VIS_NAME[String(v)] || '空点';
+  const ed = vis.edits.has(hit[0] + ',' + hit[1]) ? '（手改）' : '';
+  const unc = vis.res.uncertain.some(u => u[0] === hit[0] && u[1] === hit[1]);
+  if (unc && !ed) {
+    name += v === Vision.EMPTY ? '（待确认：可能漏了一颗子）' : '（待确认：没太大把握）';
+  }
+  /* ★ 坐标要走**棋盘坐标**（C7 这种），不能按"图的第几行"报：整盘图上 C7 会报成
+     "第 13 行"，而棋盘左边印的就是 7 —— 2026-10-31 实测发现的，换成 anchorTo19 换算，
+     换贴角 / 偏移时它也跟着变；算出盘外（bad）就退回"图第几行第几列"。 */
+  let at;
+  try {
+    const a = Vision.anchorTo19(hit[0], hit[1], visCorner(), vis.off);
+    at = (a && a[0] >= 0 && a[0] < 19 && a[1] >= 0 && a[1] < 19)
+      ? GTP_COLS[a[0]] + (19 - a[1])
+      : ('图第 ' + (hit[1] + 1) + ' 行第 ' + (hit[0] + 1) + ' 列');
+  } catch (e) {
+    at = '图第 ' + (hit[1] + 1) + ' 行第 ' + (hit[0] + 1) + ' 列';
+  }
+  tip.textContent = at + ' · ' + name + ed;
+}
+
+/* 右侧信息 + 各控件的状态。**所有状态都从这里写**（别在事件里零散改 DOM），
+   否则"改了贴角但数字没变"这类不一致迟早出现。 */
+function visPaintChrome() {
+  const r = vis.res;
+  const info = $('vis-info');
+  const warnEl = $('vis-warn');
+
+  $('vis-file').textContent = vis.name
+    ? vis.name + (vis.src ? ' · ' + vis.src.width + '×' + vis.src.height : '')
+    : '';
+
+  $('vis-tip').textContent = visTipBase();
+
+  setSeg('vis-pl', vis.pl);
+  setSeg('vis-corner', visCorner());
+  $('vis-off-txt').textContent = String(vis.off);
+  $('vis-dot').checked = !!vis.dots;
+  $('vis-mc').textContent = vis.view === 'corners' ? '返回校正' : '手动框…';
+  $('vis-mc').classList.toggle('primary', vis.view === 'corners');
+
+  /* 贴角 / 偏移只对**局部图**有意义：整盘 19 路自己就占满了，贴哪儿都一样，
+     偏移反而会把棋子推出棋盘（bad 计数会飙）。所以整盘时直接藏起来。
+     ★ 「整盘」的判据是**没找到真边**（`res.corner` 为空）—— 图里就是整块棋盘，
+       不存在"贴哪个角"的问题；13 / 9 路的整盘图同样是整盘。
+     ★ 用「手动框…」框出来的一律按局部算（`vis.mc` 有值）：那是用户指定的区域，
+       哪怕框得刚好 19 路，也得让他能调贴角/偏移。 */
+  const whole = !!r && !r.corner && !vis.mc;
+  $('vis-corner-sec').hidden = whole && r.nx === 19 && r.ny === 19;
+  $('vis-off-sec').hidden = whole && r.nx === 19 && r.ny === 19;
+
+  if (!r) {
+    info.textContent = vis.busy ? '识别中…' : '—';
+    warnEl.textContent = '';
+    $('vis-to-rec').disabled = true;
+    $('vis-to-puz').disabled = true;
+    return;
+  }
+
+  const { bad } = visStones();
+  /* 待确认数：**手改过的点不再算**（那已经是人定的结论）。
+     ★ 必须按 uncertain 里的条目逐个数 —— 用「uncertain.length − edits.size」是错的，
+       edits 里可能有一条改在根本不属于 uncertain 的点上。 */
+  let pend = 0;
+  for (const [i, j] of r.uncertain) if (!vis.edits.has(i + ',' + j)) pend++;
+  const bits = [];
+  bits.push('路数 <b>' + r.nx + '×' + r.ny + '</b>' + (whole ? '（整盘）' : '（局部）'));
+  bits.push('棋子 <b>' + r.stoneCount + '</b>');
+  bits.push('待确认 <b>' + pend + '</b>');
+  bits.push('用时 <b>' + r.ms + 'ms</b>');
+  if (vis.edits.size) bits.push('手改 <b>' + vis.edits.size + '</b>');
+  if (bad.length) bits.push('<span class="warn">有 ' + bad.length + ' 颗超出 19 路</span>');
+  info.innerHTML = bits.join(' · ');
+
+  /* 警告：去重 + 滤掉纯诊断的那一条。
+     ★「丢弃 N 条不在等距阵列上的伪线（木纹/棋子边缘/文字）」是给调参用的内部信息，
+       两条轴各来一条，界面上就是两句一模一样的噪音 —— 用户既看不懂也不需要。
+       真有问题时，网格错位在画面上看得见（小点落在空格上），另有「手动框…」兜底。 */
+  const ws = [];
+  for (const w of (r.warnings || [])) {
+    if (/伪线/.test(w)) continue;
+    if (ws.indexOf(w) < 0) ws.push(w);
+  }
+  if (bad.length) ws.push('贴角/偏移把这 ' + bad.length + ' 颗推到棋盘外了 —— 把偏移调小');
+  if (vis.view === 'corners') ws.push('正在手动框角：拖完松手会自动重新识别');
+  warnEl.textContent = ws.join('；');
+
+  $('vis-to-rec').disabled = !r.stoneCount;
+  $('vis-to-puz').disabled = !r.stoneCount;
+}
+
+/* ==================== 识别 ==================== */
+
+/* 重跑一遍识别。**异步**是故意的：大图要 1~2 秒，不给浏览器一次重绘的机会，
+   面板会像卡死一样停在旧画面上（"点了没反应"）。双 rAF 保证"识别中…"真的画出来了。 */
+async function visAnalyze() {
+  if (!vis.src) return;
+  const info = $('vis-info');
+  if (info) info.textContent = '识别中…';
+  /* 双 rAF 保证"识别中…"真的画出来了（单 rAF 只保证这一帧的样式算完）。
+     ★ 但 rAF 在窗口被挡住/最小化时可能**根本不触发** —— 那就把整个面板卡死在这里。
+       所以配一个 120ms 的兜底：宁可少画一帧，也不能让按钮点了没反应。 */
+  await new Promise(res => {
+    let done = false;
+    const go = () => { if (!done) { done = true; res(); } };
+    requestAnimationFrame(() => requestAnimationFrame(go));
+    setTimeout(go, 120);
+  });
+  let res = null, err = null;
+  try {
+    /* ★ 只在**四个角齐全**时才把 corners 传下去：拖到一半（比如刚框了 2 个点）
+       传进去会让 perspCoeffs 算不出单应矩阵，直接抛"四角无效" —— 那种报错对用户毫无意义。 */
+    const useMc = vis.mc && vis.mc.length === 4;
+    res = Vision.analyze(vis.src, useMc ? { corners: vis.mc } : {});
+  } catch (e) {
+    err = (e && e.message) || String(e);
+  }
+  if (err || !res) {
+    /* 上一次认出来的结果**留着** —— 拖角拖歪了一下就把好结果清掉，等于白认一遍。 */
+    if (vis.res) { flash('这次识别失败：' + (err || '未知') + ' —— 保住了上一次的结果'); visPaint(); return; }
+    vis.res = null;
+    /* 从没认出来过（常见：截图边界不清）→ 直接把用户带到"手动框角"，
+       而不是留一句错误信息让他自己找入口。 */
+    vis.view = 'corners';
+    visPaint();
+    flash('识别失败：' + (err || '未知') + ' —— 请手动框出四个角');
+    return;
+  }
+  vis.res = res;
+  vis.hover = null;
+  /* 刚认完的图，偏移取什么值（用户随时能在面板上改）。 */
+  vis.off = visAutoOff(res);
+  visPaint();
+}
+
+/* 一个刚认完的结果，默认该往内缩几路：
+   · 整盘 19 路 → 0（自己就占满 19 路）
+   · 整盘 13 / 9 路 → **居中**（13 路缩 3、9 路缩 5，天元对齐）
+   · 局部图（判出了真边 / 手动框的）→ 0，贴角用判出来的那个，偏移交给用户
+   ★ 为什么 13 / 9 路要居中，而不是贴在左上角：那是一整盘棋，贴在角上等于整盘棋
+     歪在棋盘一角，跟"这是整盘棋"的直觉不符；居中之后和 19 路一样是"摆在正中间"。
+   ★ 只影响**界面里的默认值**，锚定本身仍是 Vision.toBoard19(+off)，改这里不改算法。 */
+function visAutoOff(r) {
+  if (!r) return 0;
+  if (r.corner || vis.mc) return 0;            // 局部图：角 + 用户手里的偏移说了算
+  const n = Math.min(r.nx, r.ny);
+  if (n >= 19 || n < 2) return 0;
+  return Math.floor((19 - n) / 2);
+}
+
+/* ==================== 变换（旋转 / 镜像）====================
+
+   ★ 做法：把**图片本身**转过去，然后重新识别。
+   ★ 逐点校正和手动四角也得跟着转 —— 否则"转过 90° 之后我刚才改的那颗跑到别处去了"。
+     三者的坐标口径不同（矩阵是 (col,row)、四角是原图像素），所以下面各有各的映射。 */
+
+function visXformPoint(x, y, kind, w, h) {
+  if (kind === 'rot90') return [h - y, x];
+  if (kind === 'rot270') return [y, w - x];
+  if (kind === 'flipH') return [w - x, y];
+  return [x, h - y];                        // flipV
+}
+/* 矩阵格点：与 vision.js 的 applyXform 严格同一套（那里有推导注释）。
+   ★ 非方阵转 90° 会交换 nx↔ny —— 这里必须跟着交换，写死 nx 就会静默错位。 */
+function visXformCell(c, r, kind, nx, ny) {
+  if (kind === 'rot90') return [ny - 1 - r, c];
+  if (kind === 'rot270') return [r, nx - 1 - c];
+  if (kind === 'flipH') return [nx - 1 - c, r];
+  return [c, ny - 1 - r];                   // flipV
+}
+
+function visXformImage(src, kind) {
+  const w = src.width, h = src.height;
+  const swap = (kind === 'rot90' || kind === 'rot270');
+  const c = document.createElement('canvas');
+  c.width = swap ? h : w;
+  c.height = swap ? w : h;
+  const g = c.getContext('2d');
+  /* 变换按「旧像素 (x,y) → 新像素」推：rot90 = (h-1-y, x)、rot270 = (y, w-1-x)、
+     flipH = (w-1-x, y)、flipV = (x, h-1-y)。下面四组 translate/scale 就是它们的矩阵形式。 */
+  if (kind === 'rot90') { g.translate(h, 0); g.rotate(Math.PI / 2); }
+  else if (kind === 'rot270') { g.translate(0, w); g.rotate(-Math.PI / 2); }
+  else if (kind === 'flipH') { g.translate(w, 0); g.scale(-1, 1); }
+  else if (kind === 'flipV') { g.translate(0, h); g.scale(1, -1); }
+  g.drawImage(visSrcCanvas(), 0, 0);
+  return g.getImageData(0, 0, c.width, c.height);
+}
+
+async function visApplyXform(kind) {
+  if (!vis.src || vis.busy) return;
+  vis.busy = true;
+  try {
+    const w = vis.src.width, h = vis.src.height;
+    const r = vis.res;
+    const before = { nx: r ? r.nx : 0, ny: r ? r.ny : 0 };
+    vis.src = visXformImage(vis.src, kind);
+    vis._sc = null; vis._scFor = null;            // 缓存跟着作废
+    if (vis.mc) vis.mc = vis.mc.map(([x, y]) => visXformPoint(x, y, kind, w, h));
+    if (vis.edits.size && before.nx && before.ny) {
+      const next = new Map();
+      for (const [k, v] of vis.edits) {
+        const [i, j] = k.split(',');
+        const [nc, nr] = visXformCell(+i, +j, kind, before.nx, before.ny);
+        next.set(nc + ',' + nr, v);
+      }
+      vis.edits = next;
+    }
+    await visAnalyze();
+  } finally {
+    vis.busy = false;
+  }
+}
+
+/* ==================== 打开 / 关闭 ==================== */
+
+function visReset() {
+  vis.res = null;
+  vis.edits = new Map();
+  vis.cornerManual = null;
+  vis.off = 0;
+  vis.view = 'board';
+  vis.mc = null;
+  vis.drag = -1;
+  vis.hover = null;
+  /* 换图后画布→原图的映射必须作废：宽高比变了，旧比例会把点击算到别处。
+     置 null 时 visCanvasToSrc/visSrcToCanvas 走恒等兜底，不会算出 NaN。 */
+  vis.cvMap = null;
+}
+
+function visClose() {
+  VIS.classList.remove('open');
+  REC_MASK.classList.remove('open');
+  const puz = $('puzzles');
+  if (puz) puz.classList.remove('open');
+  /* 释放大图（一张 1200 万像素的图光 ImageData 就 48MB） */
+  vis.src = null; vis._sc = null; vis._scFor = null; vis.res = null;
+  vis.edits = new Map(); vis.mc = null; vis.hover = null; vis.drag = -1;
+  vis.name = '';
+}
+
+function visLoadImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = () => reject(new Error('这张图打不开（格式可能不被支持）'));
+    im.src = dataUrl;
+  });
+}
+
+function visToImageData(im) {
+  const w = im.naturalWidth || im.width, h = im.naturalHeight || im.height;
+  if (!w || !h) throw new Error('这张图读不出尺寸');
+  if (w * h > VIS_MAX_PX) {
+    throw new Error('这张图太大了（' + w + '×' + h + '）—— 请先裁到棋盘本体再试');
+  }
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  /* ★ 先铺一层白：带透明通道的 png 直接 drawImage 会留下 a=0 的像素，
+     读出来的 rgb 是 0（纯黑）—— 那在 prep() 眼里就是"整片黑"，网格一条都找不到。 */
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, w, h);
+  g.drawImage(im, 0, 0);
+  return g.getImageData(0, 0, w, h);
+}
+
+/* 两个入口（棋谱库「识别图片…」/ 题集面板「识别图片…」）都走它 */
+async function visStart() {
+  if (vis.busy) return;
+  const picked = await window.api.vision.pick();
+  if (!picked || picked.canceled) return;
+  if (picked.error) { flash('读图失败：' + picked.error); return; }
+  vis.busy = true;
+  try {
+    const im = await visLoadImage(picked.dataUrl);
+    visReset();
+    vis.name = picked.name || '';
+    vis.src = visToImageData(im);
+    vis.pl = 'b';                 // 先手默认黑先（识别不出谁走，这是最常用的一档）
+    vis.dots = $('vis-dot') ? $('vis-dot').checked : true;
+    VIS.classList.add('open');
+    visPaint();
+    await visAnalyze();
+  } catch (e) {
+    visClose();
+    flash('读图失败：' + ((e && e.message) || e));
+  } finally {
+    vis.busy = false;
+  }
+}
+
+/* ==================== 落盘 ==================== */
+
+function visFileName() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  const stamp = String(d.getFullYear()).slice(2)
+    + p(d.getMonth() + 1) + p(d.getDate()) + p(d.getHours()) + p(d.getMinutes());
+  const stem = String(vis.name || '图片').replace(/\.[^.]+$/, '')
+    .replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 40) || '图片';
+  /* 前缀「识谱-」：棋谱库里一眼能看出这份是从图片认出来的，
+     而不是自己下出来的对局（那种是「A vs B-时间」）。 */
+  return '识谱-' + stem + '-' + stamp + '.sgf';
+}
+
+async function visSave(dest) {
+  const r = vis.res;
+  if (!r || vis.busy) return;
+  const { stones } = visStones();
+  if (!stones.length) { flash('盘上一颗子都没有 —— 先核对一下识别结果'); return; }
+  const R = RULES[settings.rules] || RULES.chinese;
+  const sgf = Vision.toSGF(stones, {
+    cols: SGF_COLS,
+    size: 19,
+    komi: R.komi,
+    ru: R.sgf,
+    pl: vis.pl,
+    comment: '图片识谱：' + (vis.name || '未命名图片')
+      + '（' + stones.length + ' 子 · ' + (vis.pl === 'b' ? '黑先' : '白先') + '）',
+  });
+  vis.busy = true;
+  try {
+    const out = await window.api.vision.save(dest, visFileName(), sgf);
+    if (!out || out.error) { flash('存不进去：' + ((out && out.error) || '未知')); return; }
+    visClose();
+    if (dest === 'puzzle') {
+      /* 存成题集 → 走既有的开题集那条路（它会进练习模式、停在摆题阶段）。
+         用户还能在练习卡上核对摆子、调框距，再按「开始解题」。 */
+      await openPuzzleSet(out.name, '已从图片认出 ' + stones.length + ' 颗子 —— 核对无误就按「开始解题」');
+    } else {
+      REC_MASK.classList.remove('open');
+      await openRecord(out.name);
+    }
+  } finally {
+    vis.busy = false;
+  }
+}
+
+/* 识谱结果**直接存进已有的题集**（2026-10-31 用户要求：多道题存同一个 sgf）。
+   面板里没有"选文件"的位置，所以把这道题先交到题集面板手上（puzPending）——
+   用户点某份题集右边的「存当前题」就落盘。一条路，不另做一套文件选择器。
+   ★ visClose() 会把图片内存放掉，所以 sgf 必须在它之前拼好（拼完就不需要图了）。 */
+function visToSet() {
+  const r = vis.res;
+  if (!r || vis.busy) return;
+  const { stones } = visStones();
+  if (!stones.length) { flash('盘上一颗子都没有 —— 先核对一下识别结果'); return; }
+  const R = RULES[settings.rules] || RULES.chinese;
+  puzPending = {
+    sgf: buildProblemSGF({
+      setup: stones,
+      first: vis.pl,
+      size: 19,
+      komi: R.komi,
+      comment: 'RapaceGo 图片识谱 · ' + (vis.name || '未命名图片') + ' · '
+        + (vis.pl === 'b' ? '黑先' : '白先') + ' · ' + stones.length + ' 子',
+    }),
+    label: (vis.pl === 'b' ? '黑先' : '白先') + ' · ' + stones.length + ' 子',
+  };
+  visClose();
+  openPuzzles();
+  flash('这道题拿着了 —— 点某份题集右边的「存当前题」存进去（也可以「新建题集…」）');
+}
+
+/* ==================== 绑定 ==================== */
+
+$('rec-vision').onclick = () => visStart();
+$('puz-vision').onclick = () => visStart();
+$('vis-close').onclick = () => visClose();
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && VIS.classList.contains('open')) { e.preventDefault(); visClose(); }
+});
+
+/* 朝向：四个按钮都是「再叠一次」（点两下 ↻ = 转 180°） */
+$('vis-xform').addEventListener('click', e => {
+  const b = e.target.closest ? e.target.closest('button[data-v]') : null;
+  if (!b) return;
+  visApplyXform(b.dataset.v);
+});
+
+/* 贴角：**不改矩阵、不用重新识别** —— 它只在"锚到 19 路"这一步起作用（见 visStones） */
+$('vis-corner').addEventListener('click', e => {
+  const b = e.target.closest ? e.target.closest('button[data-v]') : null;
+  if (!b) return;
+  vis.cornerManual = b.dataset.v;
+  visPaint();
+});
+
+$('vis-off-less').onclick = () => {
+  if (vis.off <= 0) return;
+  vis.off -= 1; visPaint();
+};
+$('vis-off-more').onclick = () => {
+  if (vis.off >= 18) return;
+  vis.off += 1; visPaint();
+};
+
+$('vis-pl').addEventListener('click', e => {
+  const b = e.target.closest ? e.target.closest('button[data-v]') : null;
+  if (!b) return;
+  vis.pl = b.dataset.v;
+  visPaint();
+});
+
+$('vis-dot').onchange = e => { vis.dots = !!e.target.checked; visPaint(); };
+
+/* 「手动框…」/「返回校正」：**进 corners 视图时把手柄预置成当前用的四个角** ——
+   不然用户得从零开始点四次，而他要做的往往只是"挪两像素"。
+   要回到纯自动：点「重认」（它会把 mc 清掉）。 */
+$('vis-mc').onclick = () => {
+  if (vis.view === 'corners') { vis.view = 'board'; visPaint(); return; }
+  if (!vis.mc) vis.mc = (vis.res && vis.res.corners ? vis.res.corners : []).map(p => [p[0], p[1]]);
+  vis.view = 'corners';
+  vis.hover = null;
+  visPaint();
+};
+
+/* 「重认」：清掉手动四角、贴角改选和逐点校正，回到全自动。**不清图片朝向** ——
+   用户转过 90° 是为了让图摆正，重认不该把它转回去。
+   ★ 偏移也要一起归零：它的默认值是 0，"回到全自动"却留着一个手调过的偏移，
+     会让人以为自动判角判歪了（实测就踩过：重认之后 off 还是 3）。 */
+$('vis-re').onclick = async () => {
+  if (!vis.src || vis.busy) return;
+  vis.mc = null; vis.drag = -1;
+  vis.cornerManual = null;
+  vis.off = 0;
+  vis.edits = new Map();
+  vis.view = 'board';
+  await visAnalyze();
+};
+
+$('vis-to-rec').onclick = () => visSave('record');
+$('vis-to-puz').onclick = () => visSave('puzzle');
+$('vis-to-set').onclick = () => visToSet();
+
+/* ---- 画布交互 ---- */
+(function visBindCanvas() {
+  const cv = $('vis-canvas');
+
+  cv.addEventListener('mousedown', e => {
+    if (vis.view !== 'corners' || !vis.mc || !vis.src) return;
+    const p = visPos(e, cv);
+    let best = -1, bd = 1e9;
+    vis.mc.forEach(([x, y], i) => {
+      const q = visSrcToCanvas(x, y);
+      const d = Math.hypot(q.x - p.x, q.y - p.y);
+      if (d < bd) { bd = d; best = i; }
+    });
+    /* 14px 以内算点中（比手柄本身大一圈，手指/触控板都够得着） */
+    if (bd <= 14) { vis.drag = best; visPaint(); e.preventDefault(); }
+  });
+
+  cv.addEventListener('mousemove', e => {
+    if (!vis.src) return;
+    const p = visPos(e, cv);
+    if (vis.view === 'corners') {
+      if (vis.drag < 0 || !vis.mc) return;
+      const q = visCanvasToSrc(p);
+      vis.mc[vis.drag] = [
+        Math.max(0, Math.min(vis.src.width - 1, q.x)),
+        Math.max(0, Math.min(vis.src.height - 1, q.y)),
+      ];
+      visPaintCorners(cv);
+      return;
+    }
+    const hit = visHitBoard(p);
+    const same = (hit && vis.hover && hit[0] === vis.hover[0] && hit[1] === vis.hover[1])
+      || (!hit && !vis.hover);
+    if (same) return;
+    vis.hover = hit;
+    visPaintBoard(cv);
+    visHoverTip(hit);
+  });
+
+  cv.addEventListener('mouseleave', () => {
+    vis.drag = -1;
+    if (!vis.hover) return;
+    vis.hover = null;
+    visHoverTip(null);
+    if (vis.view === 'board' && vis.res) visPaintBoard(cv);
+  });
+
+  /* 松手：拖过角 → 用新的四个角重新识别 */
+  cv.addEventListener('mouseup', async () => {
+    if (vis.view !== 'corners' || vis.drag < 0) return;
+    vis.drag = -1;
+    if (!vis.mc || vis.mc.length !== 4) return;
+    await visAnalyze();
+  });
+
+  /* 点交叉点改子：黑 → 白 → 空 → 黑。改回原值时把那条校正删掉（保持 edits 干净，
+     "手改 N 处"那个计数才有意义）。 */
+  cv.addEventListener('click', e => {
+    if (vis.view !== 'board' || !vis.res || vis.busy) return;
+    const hit = visHitBoard(visPos(e, cv));
+    if (!hit) return;
+    const [i, j] = hit;
+    const k = i + ',' + j;
+    const base = vis.res.board[j * vis.res.nx + i];
+    const cur = vis.edits.has(k) ? vis.edits.get(k) : base;
+    const next = cur === Vision.BLACK ? Vision.WHITE
+      : (cur === Vision.WHITE ? Vision.EMPTY : Vision.BLACK);
+    if (next === base) vis.edits.delete(k); else vis.edits.set(k, next);
+    visPaint();
+  });
+})();
+
+/* 画布坐标 → 最近的交叉点；离得太远（超过半格）就算没点中。 */
+function visHitBoard(p) {
+  const r = vis.res;
+  if (!r) return null;
+  const { xs, ys } = r.grid;
+  let i = -1, j = -1, bi = 1e9, bj = 1e9;
+  for (let k = 0; k < xs.length; k++) {
+    const d = Math.abs(xs[k] - p.x);
+    if (d < bi) { bi = d; i = k; }
+  }
+  for (let k = 0; k < ys.length; k++) {
+    const d = Math.abs(ys[k] - p.y);
+    if (d < bj) { bj = d; j = k; }
+  }
+  if (i < 0 || j < 0) return null;
+  const lim = Math.max(r.grid.dx, r.grid.dy) * 0.5;
+  if (bi > lim || bj > lim) return null;
+  return [i, j];
+}
+
 /* ★ 启动初始化放在**最后**：applyNewGame 内部会调 clearCoachPanels()，
    它要用上面那些模块里的东西 —— 放前面会踩 const 的暂时性死区（TDZ）。 */
 applyNewGame(true);

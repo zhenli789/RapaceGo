@@ -95,7 +95,9 @@ contextBridge.exposeInMainWorld('api', {
     /* 导入棋谱：弹系统文件框（可多选）→ 复制进棋谱库
        → { canceled:true } | { ok:true, imported:[文件名], failed:[原因] } | { error } */
     importSgf: ()     => ipcRenderer.invoke('records:import'),
+    /* 备注：只写 SGF 的 GN 字段，**不动文件名**（改名走 rename，界面入口是双击棋谱名） */
     setNote: (name, note) => ipcRenderer.invoke('records:setNote', name, note),
+    /* 改名：真改文件名，复盘报告 / 讲解 / 复盘进度会跟着一起改名（main.js 的 records:rename） */
     saveReview: (name, json) => ipcRenderer.invoke('records:saveReview', name, json),
     readReview: name => ipcRenderer.invoke('records:readReview', name),
     /* ★ 复盘**中间结果**（<棋谱名>.review.part.json）—— 断点续算用：
@@ -125,8 +127,25 @@ contextBridge.exposeInMainWorld('api', {
     importRecord: name    => ipcRenderer.invoke('puzzles:importRecord', name),
     rename: (a, b)        => ipcRenderer.invoke('puzzles:rename', a, b),
     remove: name          => ipcRenderer.invoke('puzzles:delete', name),
+    /* ★ 2026-10-31：往一份题集里再加一道题 / 新建一份空题集（见 main.js 那段注释）。
+       append 与 import 的重名策略**相反**：import 加 (2) 不覆盖，append 必须写进点名那一份。 */
+    append: (name, text)  => ipcRenderer.invoke('puzzles:append', name, text),
+    create: name          => ipcRenderer.invoke('puzzles:create', name),
     dir:    ()            => ipcRenderer.invoke('puzzles:dir'),
     openDir: ()           => ipcRenderer.invoke('puzzles:openDir'),
+  },
+
+  /* ★ 图片识谱（2026-10-30）：
+       pick() → 弹系统文件框挑一张图
+                → { canceled:true } | { ok:true, name, bytes, dataUrl } | { error }
+                图片**只到渲染进程为止**（dataUrl 在内存里，不上传、不落盘）——
+                识别全在 renderer/vision.js 里做，纯 JS、无第三方库。
+       save(dest, name, text) → 把认出来的局面写成 SGF
+                dest: 'record'（棋谱库 records/）| 'puzzle'（题集 puzzles/）
+                → { ok:true, name, dest } | { error }；重名加 (2)(3)…，不覆盖 */
+  vision: {
+    pick: ()              => ipcRenderer.invoke('vision:pick'),
+    save: (dest, name, t) => ipcRenderer.invoke('vision:save', dest, name, t),
   },
 
   /* 关于与更新（2026-10-08 用户要求，放在设置面板里）
